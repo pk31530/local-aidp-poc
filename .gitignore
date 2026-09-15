@@ -1,0 +1,17 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.DS_Store
+data/seed/*.parquet
+data/seed/*.csv
+data/batch/*.parquet
+data/output/**
+data/models/**
+!data/output/.gitkeep
+!data/models/.gitkeep
+mlruns/
+*.log
+.ipynb_checkpoints/

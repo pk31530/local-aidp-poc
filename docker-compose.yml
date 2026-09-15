@@ -1,0 +1,188 @@
+name: aidp-poc
+
+networks:
+  aidp-network:
+    name: aidp-network
+
+volumes:
+  postgres_data:
+  minio_data:
+  redpanda_data:
+
+services:
+  # ---------------------------------------------------------------------
+  # PostgreSQL — operational DB (aidp), MLflow backend store (mlflow db),
+  # and isolated integration-test DB (aidp_test, fix H4). Data persisted on
+  # the postgres_data volume (fix C5).
+  # ---------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: aidp-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT}:5432"   # fix H1: bind localhost only
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infrastructure/postgres:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - aidp-network
+
+  # ---------------------------------------------------------------------
+  # MinIO — S3-compatible object storage. Data persisted on minio_data
+  # volume (fix C5), so MLflow artifacts and the RAW/CLEAN/CURATED/FEATURES
+  # data lake buckets survive a restart.
+  # ---------------------------------------------------------------------
+  minio:
+    image: quay.io/minio/minio:RELEASE.2024-10-13T13-34-11Z
+    container_name: aidp-minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
+    command: server /data --console-address ":9001"
+    ports:
+      - "127.0.0.1:9000:9000"   # fix H1
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - aidp-network
+
+  # One-shot job: creates the data-lake buckets + MLflow artifact bucket.
+  # Idempotent (--ignore-existing), so safe to run on every `docker compose up`.
+  createbuckets:
+    image: quay.io/minio/mc:RELEASE.2024-10-08T09-37-26Z
+    container_name: aidp-createbuckets
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+    entrypoint: >
+      sh -c "
+      mc alias set local http://minio:9000 $$MINIO_ACCESS_KEY $$MINIO_SECRET_KEY &&
+      mc mb --ignore-existing local/aidp-raw &&
+      mc mb --ignore-existing local/aidp-clean &&
+      mc mb --ignore-existing local/aidp-curated &&
+      mc mb --ignore-existing local/aidp-features &&
+      mc mb --ignore-existing local/aidp-model-output &&
+      mc mb --ignore-existing local/mlflow-artifacts
+      "
+    networks:
+      - aidp-network
+
+  # ---------------------------------------------------------------------
+  # Redpanda — single-node, Kafka-API-compatible event streaming.
+  # ---------------------------------------------------------------------
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v25.2.1
+    container_name: aidp-redpanda
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --memory=1G
+      - --reserve-memory=0M
+      - --overprovisioned
+      - --node-id=0
+      - --check=false
+      - --kafka-addr internal://0.0.0.0:29092,external://0.0.0.0:9092
+      - --advertise-kafka-addr internal://redpanda:29092,external://127.0.0.1:9092
+      - --pandaproxy-addr internal://0.0.0.0:28082,external://0.0.0.0:8082
+      - --advertise-pandaproxy-addr internal://redpanda:28082,external://127.0.0.1:8082
+      - --schema-registry-addr internal://0.0.0.0:28081,external://0.0.0.0:8081
+      - --rpc-addr redpanda:33145
+      - --advertise-rpc-addr redpanda:33145
+    ports:
+      - "127.0.0.1:9092:9092"    # Kafka API (external, host)  — fix H1
+      - "127.0.0.1:8081:8081"    # Schema registry
+      - "127.0.0.1:8082:8082"    # Pandaproxy (REST)
+      - "127.0.0.1:9644:9644"    # Admin API
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+      start_period: 15s
+    networks:
+      - aidp-network
+
+  redpanda-console:
+    image: docker.redpanda.com/redpandadata/console:v2.7.2
+    container_name: aidp-redpanda-console
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKERS: redpanda:29092
+    ports:
+      - "127.0.0.1:8080:8080"    # fix H1
+    networks:
+      - aidp-network
+
+  # One-shot job: creates the streaming topics (idempotent).
+  create-topics:
+    image: docker.redpanda.com/redpandadata/redpanda:v25.2.1
+    container_name: aidp-create-topics
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: >
+      sh -c "
+      rpk topic create transactions fraud-decisions dead-letter-transactions transactions-test --brokers redpanda:29092 || true
+      "
+    networks:
+      - aidp-network
+
+  # ---------------------------------------------------------------------
+  # MLflow — experiment tracking + model registry.
+  # Port 5001 on the host (not 5000) to avoid the macOS AirPlay Receiver
+  # conflict (fix C4). Backend store = Postgres db "mlflow"; artifact store =
+  # MinIO bucket "mlflow-artifacts" (fix C5: both persisted, registry
+  # survives a restart).
+  # ---------------------------------------------------------------------
+  mlflow:
+    build:
+      context: ./infrastructure/mlflow
+    container_name: aidp-mlflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      createbuckets:
+        condition: service_completed_successfully
+    environment:
+      MLFLOW_BACKEND_STORE_URI: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${MLFLOW_BACKEND_DB}
+      MLFLOW_DEFAULT_ARTIFACT_ROOT: s3://${MLFLOW_ARTIFACT_BUCKET}/
+      AWS_ACCESS_KEY_ID: ${MINIO_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_SECRET_KEY}
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      MLFLOW_S3_IGNORE_TLS: "true"
+    ports:
+      - "127.0.0.1:5001:5000"    # fix C4 (host port) + fix H1 (localhost bind)
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:5000/health')\" || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+      start_period: 15s
+    networks:
+      - aidp-network

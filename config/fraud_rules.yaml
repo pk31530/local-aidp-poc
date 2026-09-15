@@ -1,0 +1,24 @@
+# Fraud decision thresholds and reason-code rules.
+# The model score alone is never the final business decision — this config maps
+# a fraud_probability to a risk_level/decision and attaches explainable reason codes.
+
+decisioning:
+  approve_max: 0.40
+  monitor_max: 0.75
+  review_max: 0.90
+  # 0.00-0.40 APPROVE, 0.40-0.75 MONITOR, 0.75-0.90 REVIEW, 0.90-1.00 BLOCK
+
+reason_codes:
+  # code: condition (evaluated against computed features, informational — actual
+  # evaluation logic lives in src/decisioning)
+  NEW_DEVICE: "is_new_device == true"
+  NEW_COUNTRY: "is_new_country == true"
+  HIGH_AMOUNT_VS_AVERAGE: "amount_vs_customer_average >= 5.0"
+  MULTIPLE_RECENT_ATTEMPTS: "failed_attempts_last_1h >= 2"
+  NIGHT_TRANSACTION: "night_transaction_flag == true"
+  HIGH_VELOCITY: "transactions_last_10m >= 3"
+
+# Night window is evaluated in the pinned APP_TIMEZONE (config/settings.yaml), not UTC (fix M2).
+night_window:
+  start_hour: 23
+  end_hour: 5

@@ -1,0 +1,48 @@
+# Non-secret application settings.
+# Secrets/connection strings live in .env (see .env.example).
+
+timezone: Asia/Kolkata
+
+generation:
+  customers: 10000
+  # Lowered from the original 250,000 to 50,000 to stay comfortable on 16GB RAM (fix H5).
+  historical_transactions: 50000
+  fraud_ratio: 0.03
+  random_seed: 42
+
+velocity_windows:
+  transactions_last_10m_minutes: 10
+  transactions_last_1h_minutes: 60
+  transactions_last_24h_minutes: 1440
+  failed_attempts_1h_minutes: 60
+
+streaming:
+  topic_transactions: transactions
+  topic_fraud_decisions: fraud-decisions
+  topic_dlq: dead-letter-transactions
+  rates_supported: [1, 10, 100]
+
+  # Consumer resilience (fix H3): transient infra failures (Postgres/MinIO briefly
+  # unavailable) are retried with backoff; malformed messages go straight to the DLQ.
+  retry:
+    max_attempts: 5
+    base_delay_seconds: 0.5
+    max_delay_seconds: 10
+    jitter: true
+
+data_lake:
+  buckets:
+    raw: aidp-raw
+    clean: aidp-clean
+    curated: aidp-curated
+    features: aidp-features
+    model_output: aidp-model-output
+    mlflow_artifacts: mlflow-artifacts
+
+# Message schema/versioning note (fix M3, informational only — not enforced in v1):
+# Every message published to `transactions` carries a top-level "schema_version"
+# integer field (starts at 1). Consumers should tolerate unknown future minor
+# fields and reject/DLQ messages whose schema_version they do not recognize.
+# A schema registry (e.g. Redpanda's built-in one) is a natural v1.1 upgrade,
+# not required for this POC.
+schema_version: 1
