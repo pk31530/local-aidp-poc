@@ -40,6 +40,15 @@ CREATE TABLE IF NOT EXISTS recent_events (
 CREATE INDEX IF NOT EXISTS idx_recent_events_customer_time
     ON recent_events (customer_id, occurred_at DESC);
 
+-- Idempotency for the one write path (score_and_persist -> record_event),
+-- which always passes the scored transaction's own transaction_id. A
+-- partial index keeps transaction_id nullable for any future
+-- non-transaction-linked event while enforcing uniqueness for current
+-- usage, so a replayed message can't insert a duplicate velocity-feature
+-- row (fix: recent_events not idempotent on replay).
+CREATE UNIQUE INDEX IF NOT EXISTS uq_recent_events_transaction_id
+    ON recent_events (transaction_id) WHERE transaction_id IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS transactions (
     transaction_id          TEXT PRIMARY KEY,
     customer_id              TEXT NOT NULL,

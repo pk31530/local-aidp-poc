@@ -145,6 +145,62 @@ def test_malformed_message_goes_to_dlq_not_postgres(seeded_customer):
         conn.close()
 
 
+def test_replayed_transaction_does_not_duplicate_recent_events(seeded_customer):
+    """fix: recent_events was not idempotent on replay — the same message
+    delivered twice (e.g. a redelivered/uncommitted offset, or a consumer
+    restarted --from-beginning) used to insert a second row, inflating the
+    live velocity features read by fetch_recent_events. transactions/
+    fraud_scores/fraud_decisions were already idempotent via ON CONFLICT
+    DO NOTHING; this asserts recent_events now is too."""
+    settings = get_settings()
+    test_topic = settings.redpanda_topic_test
+    transaction_id = f"TXIT{uuid.uuid4().hex[:10].upper()}"
+
+    thread, result = _run_consumer_in_background(test_topic)
+
+    event = {
+        "transaction_id": transaction_id,
+        "customer_id": seeded_customer,
+        "transaction_timestamp": datetime.now(timezone.utc).isoformat(),
+        "amount": 555.55,
+        "merchant": "Grocery",
+        "country": "India",
+        "device_id": "DEVTEST1",
+        "payment_method": "CARD",
+        "schema_version": 1,
+        "is_fraud": False,
+    }
+    producer = Producer({"bootstrap.servers": settings.redpanda_brokers})
+    # Publish the identical message twice, simulating a replay of the same
+    # transaction.
+    producer.produce(test_topic, value=json.dumps(event).encode("utf-8"))
+    producer.produce(test_topic, value=json.dumps(event).encode("utf-8"))
+    producer.flush(10)
+
+    thread.join(timeout=20)
+    summary = result["summary"]
+
+    # Both copies are schema-valid and get scored (ON CONFLICT DO NOTHING
+    # makes the second copy's writes a no-op rather than a processing
+    # failure), so both count as "processed" by the consumer loop.
+    assert summary["processed"] == 2
+    assert summary["rejected"] == 0
+
+    conn = get_connection(TEST_DB)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM transactions WHERE transaction_id = %s", (transaction_id,))
+            assert cur.fetchone()[0] == 1
+
+            cur.execute(
+                "SELECT count(*) FROM recent_events WHERE customer_id = %s AND transaction_id = %s",
+                (seeded_customer, transaction_id),
+            )
+            assert cur.fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
 def test_unsupported_schema_version_goes_to_dlq_not_postgres(seeded_customer):
     settings = get_settings()
     test_topic = settings.redpanda_topic_test

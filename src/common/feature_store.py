@@ -91,13 +91,19 @@ def record_event(
     occurred_at: datetime,
 ) -> None:
     """Appends one event to the online store, so the *next* transaction for
-    this customer sees it (fix C1: the store is live, not a snapshot)."""
+    this customer sees it (fix C1: the store is live, not a snapshot).
+
+    ON CONFLICT DO NOTHING on transaction_id (fix: recent_events not
+    idempotent on replay) — safe to call again for the same transaction_id
+    (e.g. a replayed/redelivered message) without inserting a duplicate
+    velocity-feature row."""
     with conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO recent_events
                 (customer_id, transaction_id, event_type, amount, country, device_id, occurred_at)
             VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (transaction_id) WHERE transaction_id IS NOT NULL DO NOTHING
             """,
             (customer_id, transaction_id, event_type, amount, country, device_id, occurred_at),
         )
