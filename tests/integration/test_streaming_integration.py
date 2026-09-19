@@ -143,3 +143,40 @@ def test_malformed_message_goes_to_dlq_not_postgres(seeded_customer):
             assert cur.fetchone()[0] == 0
     finally:
         conn.close()
+
+
+def test_unsupported_schema_version_goes_to_dlq_not_postgres(seeded_customer):
+    settings = get_settings()
+    test_topic = settings.redpanda_topic_test
+
+    thread, result = _run_consumer_in_background(test_topic)
+
+    event = {
+        "transaction_id": f"TXIT{uuid.uuid4().hex[:10].upper()}",
+        "customer_id": seeded_customer,
+        "transaction_timestamp": datetime.now(timezone.utc).isoformat(),
+        "amount": 555.55,
+        "merchant": "Grocery",
+        "country": "India",
+        "device_id": "DEVTEST1",
+        "payment_method": "CARD",
+        "schema_version": 99,  # not in SUPPORTED_SCHEMA_VERSIONS
+        "is_fraud": False,
+    }
+    producer = Producer({"bootstrap.servers": settings.redpanda_brokers})
+    producer.produce(test_topic, value=json.dumps(event).encode("utf-8"))
+    producer.flush(10)
+
+    thread.join(timeout=20)
+    summary = result["summary"]
+
+    assert summary["processed"] == 0
+    assert summary["rejected"] == 1
+
+    conn = get_connection(TEST_DB)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM transactions")
+            assert cur.fetchone()[0] == 0
+    finally:
+        conn.close()
