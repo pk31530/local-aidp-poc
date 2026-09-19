@@ -13,7 +13,6 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-import mlflow
 import psycopg2
 import psycopg2.extras
 from fastapi import Depends, FastAPI, HTTPException
@@ -23,7 +22,7 @@ from psycopg2.pool import ThreadedConnectionPool
 from src.common.config import PROJECT_ROOT, get_settings
 from src.common.features import RiskLookups
 from src.common.logging import bind_transaction_id, clear_transaction_id, configure_logging, get_logger
-from src.common.mlflow_setup import configure_mlflow
+from src.common.mlflow_setup import configure_mlflow, load_champion_model
 from src.common.scoring import score_and_persist
 
 from src.api.schemas import (
@@ -48,11 +47,10 @@ state: dict = {"model": None, "model_version": None, "risk_lookups": None, "pool
 def _load_model() -> None:
     try:
         configure_mlflow()
-        client = mlflow.tracking.MlflowClient()
-        mv = client.get_model_version_by_alias(settings.mlflow_model_name, "champion")
-        state["model"] = mlflow.xgboost.load_model(f"models:/{settings.mlflow_model_name}@champion")
-        state["model_version"] = mv.version
-        log.info("model_loaded", model_version=mv.version, run_id=mv.run_id)
+        model, version = load_champion_model(settings.mlflow_model_name)
+        state["model"] = model
+        state["model_version"] = version
+        log.info("model_loaded", model_version=version)
     except Exception:
         log.error("model_load_failed", exc_info=True)
         state["model"] = None

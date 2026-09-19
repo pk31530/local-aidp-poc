@@ -26,7 +26,6 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-import mlflow
 import polars as pl
 from confluent_kafka import Consumer, KafkaException, Producer
 from pydantic import ValidationError
@@ -35,7 +34,7 @@ from src.common.config import PROJECT_ROOT, get_settings
 from src.common.db import get_connection
 from src.common.features import RiskLookups
 from src.common.logging import bind_transaction_id, clear_transaction_id, configure_logging, get_logger
-from src.common.mlflow_setup import configure_mlflow
+from src.common.mlflow_setup import configure_mlflow, load_champion_model
 from src.common.retry import transient_retry
 from src.common.schemas import Transaction
 from src.common.scoring import score_and_persist
@@ -105,10 +104,8 @@ class RawEventBuffer:
 def _load_model_or_raise():
     configure_mlflow()
     settings = get_settings()
-    client = mlflow.tracking.MlflowClient()
-    mv = client.get_model_version_by_alias(settings.mlflow_model_name, "champion")
-    model = mlflow.xgboost.load_model(f"models:/{settings.mlflow_model_name}@champion")
-    return model, str(mv.version)
+    model, version = load_champion_model(settings.mlflow_model_name)
+    return model, str(version)
 
 
 @transient_retry()
