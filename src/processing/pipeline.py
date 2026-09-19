@@ -18,6 +18,7 @@ import polars as pl
 from src.common.config import PROJECT_ROOT, get_settings
 from src.common.db import get_connection
 from src.common.logging import configure_logging, get_logger
+from src.common.splits import assign_split
 from src.processing.clean import clean_transactions
 from src.processing.enrich import enrich_transactions
 from src.processing.raw import validate_batch_file
@@ -105,8 +106,12 @@ def run_pipeline(input_path: Path, upload_to_minio: bool = True) -> dict:
         _write_rejected(rejected_clean, OUTPUT_DIR / "rejected" / "clean_rejected.csv")
         records_rejected += len(rejected_clean)
 
-        # ---- risk lookups (derived from this labeled batch) ----
-        risk_lookups = compute_risk_lookups(clean_df)
+        # ---- split assignment (must happen before risk lookups so they are
+        # fit on the train partition only, eliminating target leakage) ----
+        clean_df = assign_split(clean_df, seed=settings.gen_random_seed)
+
+        # ---- risk lookups (derived from the train partition only) ----
+        risk_lookups = compute_risk_lookups(clean_df.filter(pl.col("split") == "train"))
         MODELS_DIR.mkdir(parents=True, exist_ok=True)
         risk_lookups.save(MODELS_DIR / "risk_lookups.json")
         if upload_to_minio:

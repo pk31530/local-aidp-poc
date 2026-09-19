@@ -80,6 +80,34 @@ def test_risk_lookups_high_fraud_merchant_scores_higher():
     assert lookups.merchant_score("NeverSeenBefore") == lookups.default_merchant_risk
 
 
+def test_risk_lookups_fit_on_train_split_only_ignore_val_test_fraud():
+    """Finding 1 fix: a merchant that is fraud-only in the val/test partition
+    must not inflate the train-fit lookup — proving only split=="train" rows
+    feed compute_risk_lookups, as src/processing/pipeline.py now does."""
+    df = pl.DataFrame(
+        [
+            # "LeakyMerchant" is 100% fraud, but every occurrence lands in
+            # val/test — it must be invisible to the train-only lookup.
+            _base_row(transaction_id="TX1", merchant="LeakyMerchant", is_fraud=True, split="val"),
+            _base_row(transaction_id="TX2", merchant="LeakyMerchant", is_fraud=True, split="test"),
+            # Plenty of legitimate train-split volume so LeakyMerchant is
+            # genuinely absent from the train partition, not just diluted.
+            _base_row(transaction_id="TX3", merchant="Grocery", is_fraud=False, split="train"),
+            _base_row(transaction_id="TX4", merchant="Grocery", is_fraud=False, split="train"),
+            _base_row(transaction_id="TX5", merchant="Electronics", is_fraud=False, split="train"),
+            _base_row(transaction_id="TX6", merchant="Electronics", is_fraud=True, split="train"),
+        ]
+    )
+
+    train_only = df.filter(pl.col("split") == "train")
+    lookups = compute_risk_lookups(train_only)
+
+    # LeakyMerchant never appears in train, so it must fall back to the
+    # neutral default rate, not the near-1.0 rate its val/test rows imply.
+    assert lookups.merchant_score("LeakyMerchant") == lookups.default_merchant_risk
+    assert lookups.merchant_score("LeakyMerchant") < 0.5
+
+
 def test_enrich_then_project_curated_and_features():
     customers_df = pl.DataFrame(
         [
@@ -97,8 +125,8 @@ def test_enrich_then_project_curated_and_features():
     )
     clean_df = pl.DataFrame(
         [
-            _base_row(transaction_id="TX1", transaction_timestamp=_ts("2026-06-01T10:00:00")),
-            _base_row(transaction_id="TX2", transaction_timestamp=_ts("2026-06-01T10:05:00"), amount=5000.0, is_fraud=True),
+            _base_row(transaction_id="TX1", transaction_timestamp=_ts("2026-06-01T10:00:00"), split="train"),
+            _base_row(transaction_id="TX2", transaction_timestamp=_ts("2026-06-01T10:05:00"), amount=5000.0, is_fraud=True, split="test"),
         ]
     )
     failed_attempts_df = pl.DataFrame(
@@ -121,3 +149,5 @@ def test_enrich_then_project_curated_and_features():
     assert "customer_average_amount" in curated.columns
     assert "amount_vs_customer_average" in features.columns
     assert "amount_vs_customer_average" not in curated.columns
+    assert "split" in features.columns
+    assert set(features["split"].to_list()) == {"train", "test"}
