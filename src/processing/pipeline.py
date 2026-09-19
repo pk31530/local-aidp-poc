@@ -89,52 +89,71 @@ def run_pipeline(input_path: Path, upload_to_minio: bool = True) -> dict:
 
     log.info("pipeline_started", input=str(input_path))
 
-    # ---- RAW ----
-    raw_df, rejected_raw = validate_batch_file(input_path)
-    _write_and_upload(raw_df, "raw", upload_to_minio)
-    _write_rejected(rejected_raw, OUTPUT_DIR / "rejected" / "raw_rejected.csv")
+    records_processed = 0
+    records_rejected = 0
 
-    # ---- CLEAN ----
-    clean_df, rejected_clean = clean_transactions(raw_df)
-    _write_and_upload(clean_df, "clean", upload_to_minio)
-    _write_rejected(rejected_clean, OUTPUT_DIR / "rejected" / "clean_rejected.csv")
+    try:
+        # ---- RAW ----
+        raw_df, rejected_raw = validate_batch_file(input_path)
+        _write_and_upload(raw_df, "raw", upload_to_minio)
+        _write_rejected(rejected_raw, OUTPUT_DIR / "rejected" / "raw_rejected.csv")
+        records_rejected = len(rejected_raw)
 
-    # ---- risk lookups (derived from this labeled batch) ----
-    risk_lookups = compute_risk_lookups(clean_df)
-    MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    risk_lookups.save(MODELS_DIR / "risk_lookups.json")
-    if upload_to_minio:
-        from src.common.storage import upload_file
+        # ---- CLEAN ----
+        clean_df, rejected_clean = clean_transactions(raw_df)
+        _write_and_upload(clean_df, "clean", upload_to_minio)
+        _write_rejected(rejected_clean, OUTPUT_DIR / "rejected" / "clean_rejected.csv")
+        records_rejected += len(rejected_clean)
 
-        upload_file(MODELS_DIR / "risk_lookups.json", "aidp-model-output", "risk_lookups.json")
+        # ---- risk lookups (derived from this labeled batch) ----
+        risk_lookups = compute_risk_lookups(clean_df)
+        MODELS_DIR.mkdir(parents=True, exist_ok=True)
+        risk_lookups.save(MODELS_DIR / "risk_lookups.json")
+        if upload_to_minio:
+            from src.common.storage import upload_file
 
-    # ---- CURATED + FEATURES (one enrichment pass, two projections) ----
-    customers_df = pl.read_parquet(CUSTOMERS_PATH)
-    failed_attempts_df = (
-        pl.read_csv(FAILED_ATTEMPTS_PATH) if FAILED_ATTEMPTS_PATH.exists() else pl.DataFrame()
+            upload_file(MODELS_DIR / "risk_lookups.json", "aidp-model-output", "risk_lookups.json")
+
+        # ---- CURATED + FEATURES (one enrichment pass, two projections) ----
+        customers_df = pl.read_parquet(CUSTOMERS_PATH)
+        failed_attempts_df = (
+            pl.read_csv(FAILED_ATTEMPTS_PATH) if FAILED_ATTEMPTS_PATH.exists() else pl.DataFrame()
+        )
+        enriched_df = enrich_transactions(clean_df, customers_df, failed_attempts_df, risk_lookups)
+
+        curated_df = to_curated(enriched_df)
+        _write_and_upload(curated_df, "curated", upload_to_minio)
+
+        features_df = to_features(enriched_df)
+        _write_and_upload(features_df, "features", upload_to_minio)
+
+        records_processed = curated_df.height
+        summary = {
+            "input_rows": raw_df.height + len(rejected_raw),
+            "raw_valid": raw_df.height,
+            "raw_rejected": len(rejected_raw),
+            "clean_valid": clean_df.height,
+            "clean_rejected": len(rejected_clean),
+            "curated_rows": curated_df.height,
+            "features_rows": features_df.height,
+            "total_rejected": records_rejected,
+        }
+        log.info("pipeline_complete", **summary)
+    except Exception:
+        log.error(
+            "pipeline_failed",
+            records_processed=records_processed,
+            records_rejected=records_rejected,
+            exc_info=True,
+        )
+        record_pipeline_run(
+            "FAILED", records_processed=records_processed, records_rejected=records_rejected, started_at=started_at
+        )
+        raise
+
+    record_pipeline_run(
+        "SUCCESS", records_processed=records_processed, records_rejected=records_rejected, started_at=started_at
     )
-    enriched_df = enrich_transactions(clean_df, customers_df, failed_attempts_df, risk_lookups)
-
-    curated_df = to_curated(enriched_df)
-    _write_and_upload(curated_df, "curated", upload_to_minio)
-
-    features_df = to_features(enriched_df)
-    _write_and_upload(features_df, "features", upload_to_minio)
-
-    total_rejected = len(rejected_raw) + len(rejected_clean)
-    summary = {
-        "input_rows": raw_df.height + len(rejected_raw),
-        "raw_valid": raw_df.height,
-        "raw_rejected": len(rejected_raw),
-        "clean_valid": clean_df.height,
-        "clean_rejected": len(rejected_clean),
-        "curated_rows": curated_df.height,
-        "features_rows": features_df.height,
-        "total_rejected": total_rejected,
-    }
-    log.info("pipeline_complete", **summary)
-
-    record_pipeline_run("SUCCESS", records_processed=curated_df.height, records_rejected=total_rejected, started_at=started_at)
 
     return summary
 

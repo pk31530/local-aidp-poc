@@ -123,7 +123,7 @@ def _record_run_start(database=None) -> int:
 
 
 @transient_retry()
-def _record_run_end(run_id: int, processed: int, rejected: int, database=None) -> None:
+def _record_run_end(run_id: int, processed: int, rejected: int, database=None, status: str = "SUCCESS") -> None:
     conn = get_connection(database)
     try:
         with conn:
@@ -131,10 +131,10 @@ def _record_run_end(run_id: int, processed: int, rejected: int, database=None) -
                 cur.execute(
                     """
                     UPDATE pipeline_runs
-                    SET status = 'SUCCESS', records_processed = %s, records_rejected = %s, completed_at = now()
+                    SET status = %s, records_processed = %s, records_rejected = %s, completed_at = now()
                     WHERE run_id = %s
                     """,
-                    (processed, rejected, run_id),
+                    (status, processed, rejected, run_id),
                 )
     finally:
         conn.close()
@@ -160,104 +160,124 @@ def run(
     topic = topic or settings.redpanda_topic_transactions
     dlq_topic = dlq_topic or settings.redpanda_topic_dlq
 
-    model, model_version = _load_model_or_raise()
-    risk_lookups = RiskLookups.load(RISK_LOOKUPS_PATH) if RISK_LOOKUPS_PATH.exists() else RiskLookups.empty()
-
-    consumer = Consumer(
-        {
-            "bootstrap.servers": settings.redpanda_brokers,
-            "group.id": group_id,
-            "auto.offset.reset": "earliest" if from_beginning else "latest",
-            "enable.auto.commit": False,
-        }
-    )
-    consumer.subscribe([topic])
-
-    dlq_producer = Producer({"bootstrap.servers": settings.redpanda_brokers})
-    dlq = DeadLetterPublisher(dlq_producer, dlq_topic, log)
-    raw_buffer = RawEventBuffer(raw_bucket, log)
-
+    # fix H3/pipeline_runs-status: a RUNNING row is recorded before model
+    # loading so a model-load failure (or any other setup/loop failure) is
+    # still traceable to a run, and gets corrected to FAILED below instead
+    # of leaving zero trace or a falsely-SUCCESS row.
     run_id = _record_run_start(database=database)
 
     processed = 0
     rejected = 0
-    start = time.monotonic()
-
-    log.info("consumer_started", model_version=model_version, from_beginning=from_beginning, run_id=run_id)
+    consumer = None
+    dlq_producer = None
+    raw_buffer = None
 
     try:
-        while duration is None or (time.monotonic() - start) < duration:
-            msg = consumer.poll(timeout=1.0)
-            if msg is None:
-                continue
-            if msg.error():
-                raise KafkaException(msg.error())
+        model, model_version = _load_model_or_raise()
+        risk_lookups = RiskLookups.load(RISK_LOOKUPS_PATH) if RISK_LOOKUPS_PATH.exists() else RiskLookups.empty()
 
-            raw_value = msg.value()
+        consumer = Consumer(
+            {
+                "bootstrap.servers": settings.redpanda_brokers,
+                "group.id": group_id,
+                "auto.offset.reset": "earliest" if from_beginning else "latest",
+                "enable.auto.commit": False,
+            }
+        )
+        consumer.subscribe([topic])
 
-            try:
-                payload = json.loads(raw_value)
-            except json.JSONDecodeError as exc:
-                dlq.send(raw_value, f"invalid_json: {exc}")
-                rejected += 1
-                consumer.commit(msg)
-                continue
+        dlq_producer = Producer({"bootstrap.servers": settings.redpanda_brokers})
+        dlq = DeadLetterPublisher(dlq_producer, dlq_topic, log)
+        raw_buffer = RawEventBuffer(raw_bucket, log)
 
-            try:
-                tx = Transaction(**payload)
-            except ValidationError as exc:
-                dlq.send(raw_value, f"schema_validation_failed: {exc}")
-                rejected += 1
-                consumer.commit(msg)
-                continue
+        start = time.monotonic()
 
-            bind_transaction_id(tx.transaction_id)
-            try:
+        log.info("consumer_started", model_version=model_version, from_beginning=from_beginning, run_id=run_id)
+
+        try:
+            while duration is None or (time.monotonic() - start) < duration:
+                msg = consumer.poll(timeout=1.0)
+                if msg is None:
+                    continue
+                if msg.error():
+                    raise KafkaException(msg.error())
+
+                raw_value = msg.value()
+
                 try:
-                    result = _score_with_retry(
-                        model,
-                        model_version,
-                        risk_lookups,
-                        database=database,
-                        transaction_id=tx.transaction_id,
-                        customer_id=tx.customer_id,
-                        amount=tx.amount,
-                        merchant=tx.merchant,
-                        country=tx.country,
-                        device_id=tx.device_id,
-                        payment_method=tx.payment_method,
-                        transaction_timestamp=tx.transaction_timestamp,
-                        source="stream",
-                    )
-                except Exception as exc:
-                    # fix H3: retries (inside _score_with_retry) are already
-                    # exhausted by the time we get here — this is a genuine
-                    # processing failure, not a malformed message.
-                    log.error("processing_failed_after_retries", error=str(exc), exc_info=True)
-                    dlq.send(raw_value, f"processing_failed_after_retries: {exc}")
+                    payload = json.loads(raw_value)
+                except json.JSONDecodeError as exc:
+                    dlq.send(raw_value, f"invalid_json: {exc}")
                     rejected += 1
                     consumer.commit(msg)
                     continue
 
-                raw_buffer.add(payload)
-                processed += 1
-                consumer.commit(msg)
+                try:
+                    tx = Transaction(**payload)
+                except ValidationError as exc:
+                    dlq.send(raw_value, f"schema_validation_failed: {exc}")
+                    rejected += 1
+                    consumer.commit(msg)
+                    continue
 
-                log.info(
-                    "transaction_scored",
-                    customer_id=tx.customer_id,
-                    fraud_probability=round(result.fraud_probability, 4),
-                    decision=result.decision,
-                )
-            finally:
-                clear_transaction_id()
-    except KeyboardInterrupt:
-        log.info("consumer_interrupted_by_user")
+                bind_transaction_id(tx.transaction_id)
+                try:
+                    try:
+                        result = _score_with_retry(
+                            model,
+                            model_version,
+                            risk_lookups,
+                            database=database,
+                            transaction_id=tx.transaction_id,
+                            customer_id=tx.customer_id,
+                            amount=tx.amount,
+                            merchant=tx.merchant,
+                            country=tx.country,
+                            device_id=tx.device_id,
+                            payment_method=tx.payment_method,
+                            transaction_timestamp=tx.transaction_timestamp,
+                            source="stream",
+                        )
+                    except Exception as exc:
+                        # fix H3: retries (inside _score_with_retry) are already
+                        # exhausted by the time we get here — this is a genuine
+                        # processing failure, not a malformed message.
+                        log.error("processing_failed_after_retries", error=str(exc), exc_info=True)
+                        dlq.send(raw_value, f"processing_failed_after_retries: {exc}")
+                        rejected += 1
+                        consumer.commit(msg)
+                        continue
+
+                    raw_buffer.add(payload)
+                    processed += 1
+                    consumer.commit(msg)
+
+                    log.info(
+                        "transaction_scored",
+                        customer_id=tx.customer_id,
+                        fraud_probability=round(result.fraud_probability, 4),
+                        decision=result.decision,
+                    )
+                finally:
+                    clear_transaction_id()
+        except KeyboardInterrupt:
+            log.info("consumer_interrupted_by_user")
+    except Exception:
+        # A genuine crash (Kafka error, model-load failure, or anything else
+        # unhandled) — record it as FAILED before re-raising so pipeline_runs
+        # never misrepresents a crash as SUCCESS or drops it entirely.
+        log.error("consumer_run_failed", exc_info=True)
+        _record_run_end(run_id, processed, rejected, database=database, status="FAILED")
+        raise
     finally:
-        raw_buffer.flush()
-        consumer.close()
-        dlq_producer.flush(10)
-        _record_run_end(run_id, processed, rejected, database=database)
+        if raw_buffer is not None:
+            raw_buffer.flush()
+        if consumer is not None:
+            consumer.close()
+        if dlq_producer is not None:
+            dlq_producer.flush(10)
+
+    _record_run_end(run_id, processed, rejected, database=database, status="SUCCESS")
 
     summary = {"processed": processed, "rejected": rejected, "run_id": run_id}
     log.info("consumer_stopped", **summary)
