@@ -280,6 +280,9 @@ class RunLifecycle:
         error_message: Optional[str] = None,
         records_processed: Optional[int] = None,
         records_rejected: Optional[int] = None,
+        dataset_version: Optional[str] = None,
+        model_version: Optional[str] = None,
+        artifacts: Optional[dict[str, Any]] = None,
     ) -> RunRecord:
         updates: dict[str, Any] = {
             "completed_at": _now(),
@@ -290,6 +293,12 @@ class RunLifecycle:
             updates["records_processed"] = records_processed
         if records_rejected is not None:
             updates["records_rejected"] = records_rejected
+        if dataset_version is not None:
+            updates["dataset_version"] = dataset_version
+        if model_version is not None:
+            updates["model_version"] = model_version
+        if artifacts is not None:
+            updates["artifacts"] = redact_secret_keys(artifacts)
         return self._transition(run_id, target=FAILED, allowed_from={PENDING, RUNNING}, updates=updates)
 
     def fail_from_exception(
@@ -299,6 +308,9 @@ class RunLifecycle:
         *,
         records_processed: Optional[int] = None,
         records_rejected: Optional[int] = None,
+        dataset_version: Optional[str] = None,
+        model_version: Optional[str] = None,
+        artifacts: Optional[dict[str, Any]] = None,
     ) -> Optional[RunRecord]:
         """Best-effort FAILED recording that never raises.
 
@@ -320,16 +332,33 @@ class RunLifecycle:
                 error_message=error_message,
                 records_processed=records_processed,
                 records_rejected=records_rejected,
+                dataset_version=dataset_version,
+                model_version=model_version,
+                artifacts=artifacts,
             )
         except Exception:
             log.error("provenance_failed_status_write_failed", run_id=run_id, exc_info=True)
             return None
 
-    def cancel(self, run_id: int, *, reason: Optional[str] = None) -> RunRecord:
-        updates = {
+    def cancel(
+        self,
+        run_id: int,
+        *,
+        reason: Optional[str] = None,
+        dataset_version: Optional[str] = None,
+        model_version: Optional[str] = None,
+        artifacts: Optional[dict[str, Any]] = None,
+    ) -> RunRecord:
+        updates: dict[str, Any] = {
             "completed_at": _now(),
             "error_message": truncate_text(reason, MAX_ERROR_MESSAGE_LENGTH),
         }
+        if dataset_version is not None:
+            updates["dataset_version"] = dataset_version
+        if model_version is not None:
+            updates["model_version"] = model_version
+        if artifacts is not None:
+            updates["artifacts"] = redact_secret_keys(artifacts)
         return self._transition(run_id, target=CANCELLED, allowed_from={PENDING, RUNNING}, updates=updates)
 
     def get(self, run_id: int) -> RunRecord:

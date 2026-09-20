@@ -39,9 +39,13 @@ from src.common.retry import transient_retry
 from src.common.schemas import Transaction
 from src.common.scoring import score_and_persist
 from src.common.storage import upload_file
+from src.control_plane.config import StreamRunConfig
+from src.control_plane.provenance import get_git_sha
+from src.control_plane.runs import RunLifecycle
 
 RISK_LOOKUPS_PATH = PROJECT_ROOT / "data" / "models" / "risk_lookups.json"
 FLUSH_BATCH_SIZE = 10
+HEARTBEAT_EVERY_N_MESSAGES = 10
 
 
 @transient_retry()
@@ -108,38 +112,6 @@ def _load_model_or_raise():
     return model, str(version)
 
 
-@transient_retry()
-def _record_run_start(database=None) -> int:
-    conn = get_connection(database)
-    try:
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO pipeline_runs (pipeline_name, status) VALUES ('stream', 'RUNNING') RETURNING run_id"
-                )
-                return cur.fetchone()[0]
-    finally:
-        conn.close()
-
-
-@transient_retry()
-def _record_run_end(run_id: int, processed: int, rejected: int, database=None, status: str = "SUCCESS") -> None:
-    conn = get_connection(database)
-    try:
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    UPDATE pipeline_runs
-                    SET status = %s, records_processed = %s, records_rejected = %s, completed_at = now()
-                    WHERE run_id = %s
-                    """,
-                    (status, processed, rejected, run_id),
-                )
-    finally:
-        conn.close()
-
-
 def run(
     duration: float | None,
     from_beginning: bool,
@@ -149,25 +121,50 @@ def run(
     group_id: str = "aidp-consumer",
     raw_bucket: str = "aidp-raw",
 ) -> dict:
-    """`topic`/`dlq_topic`/`database` default to the production
-    topic/DLQ-topic/database; tests pass the isolated `transactions-test`
-    topic and `aidp_test` database instead (fix H4), with a distinct
-    `group_id` so a test run doesn't share committed offsets with the
-    production consumer group."""
+    """Legacy entry point — signature and defaults unchanged. Builds a typed
+    config and delegates all workload/lifecycle logic to run_configured();
+    trigger_source="legacy" identifies calls made this way rather than
+    through the future CLI (trigger_source="cli")."""
+    config = StreamRunConfig(
+        duration=duration,
+        from_beginning=from_beginning,
+        topic=topic,
+        dlq_topic=dlq_topic,
+        database=database,
+        group_id=group_id,
+        raw_bucket=raw_bucket,
+    )
+    return run_configured(config, trigger_source="legacy")
+
+
+def run_configured(config: StreamRunConfig, *, trigger_source: str = "legacy") -> dict:
+    """`config.topic`/`config.dlq_topic`/`config.database` default to the
+    production topic/DLQ-topic/database; tests pass the isolated
+    `transactions-test` topic and `aidp_test` database instead (fix H4), with
+    a distinct `group_id` so a test run doesn't share committed offsets with
+    the production consumer group."""
     configure_logging("ingestion.consumer")
     log = get_logger(__name__)
     settings = get_settings()
-    topic = topic or settings.redpanda_topic_transactions
-    dlq_topic = dlq_topic or settings.redpanda_topic_dlq
+    topic = config.topic or settings.redpanda_topic_transactions
+    dlq_topic = config.dlq_topic or settings.redpanda_topic_dlq
 
-    # fix H3/pipeline_runs-status: a RUNNING row is recorded before model
-    # loading so a model-load failure (or any other setup/loop failure) is
-    # still traceable to a run, and gets corrected to FAILED below instead
-    # of leaving zero trace or a falsely-SUCCESS row.
-    run_id = _record_run_start(database=database)
+    lifecycle = RunLifecycle(database=config.database)
+    # fix H3/pipeline_runs-status: the run is recorded before model loading
+    # so a model-load failure (or any other setup/loop failure) is still
+    # traceable to a run, and gets corrected to FAILED below instead of
+    # leaving zero trace or a falsely-SUCCESS row.
+    run = lifecycle.begin(
+        "stream",
+        trigger_source=trigger_source,
+        git_sha=get_git_sha(),
+        config_snapshot=config.redacted_snapshot(),
+        config_hash=config.config_hash(),
+    )
 
     processed = 0
     rejected = 0
+    model_version = None
     consumer = None
     dlq_producer = None
     raw_buffer = None
@@ -179,8 +176,8 @@ def run(
         consumer = Consumer(
             {
                 "bootstrap.servers": settings.redpanda_brokers,
-                "group.id": group_id,
-                "auto.offset.reset": "earliest" if from_beginning else "latest",
+                "group.id": config.group_id,
+                "auto.offset.reset": "earliest" if config.from_beginning else "latest",
                 "enable.auto.commit": False,
             }
         )
@@ -188,14 +185,16 @@ def run(
 
         dlq_producer = Producer({"bootstrap.servers": settings.redpanda_brokers})
         dlq = DeadLetterPublisher(dlq_producer, dlq_topic, log)
-        raw_buffer = RawEventBuffer(raw_bucket, log)
+        raw_buffer = RawEventBuffer(config.raw_bucket, log)
 
         start = time.monotonic()
 
-        log.info("consumer_started", model_version=model_version, from_beginning=from_beginning, run_id=run_id)
+        log.info(
+            "consumer_started", model_version=model_version, from_beginning=config.from_beginning, run_id=run.run_id
+        )
 
         try:
-            while duration is None or (time.monotonic() - start) < duration:
+            while config.duration is None or (time.monotonic() - start) < config.duration:
                 msg = consumer.poll(timeout=1.0)
                 if msg is None:
                     continue
@@ -227,7 +226,7 @@ def run(
                             model,
                             model_version,
                             risk_lookups,
-                            database=database,
+                            database=config.database,
                             transaction_id=tx.transaction_id,
                             customer_id=tx.customer_id,
                             amount=tx.amount,
@@ -258,16 +257,32 @@ def run(
                         fraud_probability=round(result.fraud_probability, 4),
                         decision=result.decision,
                     )
+
+                    # Best-effort progress signal only: a failure here is
+                    # logged and ignored, never allowed to affect message
+                    # processing, commits, or DLQ routing.
+                    if processed % HEARTBEAT_EVERY_N_MESSAGES == 0:
+                        try:
+                            lifecycle.heartbeat(run.run_id)
+                        except Exception:
+                            log.warning("heartbeat_failed", run_id=run.run_id, exc_info=True)
                 finally:
                     clear_transaction_id()
         except KeyboardInterrupt:
+            # Operator-initiated stop (Ctrl+C): treated the same as a
+            # duration expiring — a graceful, expected way to end a local
+            # demo consumer, not a failure. Falls through to the same
+            # SUCCESS recording below as a normal loop exit, so the run
+            # never remains stuck in RUNNING.
             log.info("consumer_interrupted_by_user")
-    except Exception:
+    except Exception as exc:
         # A genuine crash (Kafka error, model-load failure, or anything else
         # unhandled) — record it as FAILED before re-raising so pipeline_runs
         # never misrepresents a crash as SUCCESS or drops it entirely.
         log.error("consumer_run_failed", exc_info=True)
-        _record_run_end(run_id, processed, rejected, database=database, status="FAILED")
+        lifecycle.fail_from_exception(
+            run.run_id, exc, records_processed=processed, records_rejected=rejected, model_version=model_version
+        )
         raise
     finally:
         if raw_buffer is not None:
@@ -277,9 +292,15 @@ def run(
         if dlq_producer is not None:
             dlq_producer.flush(10)
 
-    _record_run_end(run_id, processed, rejected, database=database, status="SUCCESS")
+    lifecycle.succeed(
+        run.run_id,
+        records_processed=processed,
+        records_rejected=rejected,
+        model_version=model_version,
+        artifacts={"raw_bucket": config.raw_bucket},
+    )
 
-    summary = {"processed": processed, "rejected": rejected, "run_id": run_id}
+    summary = {"processed": processed, "rejected": rejected, "run_id": run.run_id}
     log.info("consumer_stopped", **summary)
     return summary
 

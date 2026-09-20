@@ -37,6 +37,9 @@ from src.common.db import get_connection
 from src.common.features import MODEL_FEATURE_COLUMNS
 from src.common.logging import configure_logging, get_logger
 from src.common.mlflow_setup import configure_mlflow
+from src.control_plane.config import TrainingRunConfig
+from src.control_plane.provenance import get_git_sha
+from src.control_plane.runs import RunLifecycle
 
 DEFAULT_FEATURES_PATH = PROJECT_ROOT / "data" / "output" / "features" / "transactions.parquet"
 RANDOM_SEED = get_settings().gen_random_seed
@@ -130,88 +133,128 @@ def _evaluate(model, X_test, y_test) -> dict:
 
 
 def train(features_path: Path = DEFAULT_FEATURES_PATH) -> dict:
+    """Legacy entry point — signature and default unchanged. Builds a typed
+    config and delegates all workload/lifecycle logic to
+    train_configured(); trigger_source="legacy" identifies calls made this
+    way rather than through the future CLI (trigger_source="cli")."""
+    config = TrainingRunConfig(features_path=features_path)
+    return train_configured(config, trigger_source="legacy")
+
+
+def train_configured(config: TrainingRunConfig, *, trigger_source: str = "legacy") -> dict:
     configure_logging("ml.train")
     log = get_logger(__name__)
     settings = get_settings()
 
-    configure_mlflow()
-    mlflow.set_experiment(EXPERIMENT_NAME)
-
-    dataset_version = _dataset_version(features_path)
-    df = _load_dataset(features_path)
-    X_train, X_val, X_test, y_train, y_val, y_test = _split(df)
-
-    log.info(
-        "training_data_loaded",
-        total_rows=len(df),
-        train_rows=len(X_train),
-        val_rows=len(X_val),
-        test_rows=len(X_test),
-        fraud_ratio_overall=round(float(df["is_fraud"].astype(int).mean()), 4),
-        dataset_version=dataset_version,
+    lifecycle = RunLifecycle()
+    run = lifecycle.begin(
+        "train",
+        trigger_source=trigger_source,
+        git_sha=get_git_sha(),
+        config_snapshot=config.redacted_snapshot(),
+        config_hash=config.config_hash(),
     )
 
+    dataset_version = None
+
     try:
-        model, params, model_type = _train_xgboost(X_train, y_train, X_val, y_val)
-    except Exception:
-        log.warning("xgboost_unavailable_falling_back_to_random_forest", exc_info=True)
-        model, params, model_type = _train_random_forest_fallback(X_train, y_train)
+        configure_mlflow()
+        mlflow.set_experiment(EXPERIMENT_NAME)
 
-    metrics = _evaluate(model, X_test, y_test)
-    log.info("evaluation_complete", model_type=model_type, **{k: v for k, v in metrics.items() if k != "confusion_matrix"})
-    log.info("confusion_matrix", **metrics["confusion_matrix"])
+        # Reading/hashing the features file happens inside the protected
+        # block — a missing/unreadable/corrupted file must still record
+        # FAILED, not crash before any run record exists.
+        dataset_version = _dataset_version(config.features_path)
+        df = _load_dataset(config.features_path)
+        X_train, X_val, X_test, y_train, y_val, y_test = _split(df)
 
-    with mlflow.start_run(run_name=f"{model_type}-{dataset_version}") as run:
-        mlflow.log_param("model_type", model_type)
-        mlflow.log_params(params)
-        mlflow.log_param("feature_list", ",".join(MODEL_FEATURE_COLUMNS))
-        mlflow.log_param("dataset_version", dataset_version)
-        mlflow.log_param("train_rows", len(X_train))
-        mlflow.log_param("val_rows", len(X_val))
-        mlflow.log_param("test_rows", len(X_test))
-        mlflow.log_param("random_seed", RANDOM_SEED)
-
-        mlflow.log_metric("precision", metrics["precision"])
-        mlflow.log_metric("recall", metrics["recall"])
-        mlflow.log_metric("f1", metrics["f1"])
-        mlflow.log_metric("roc_auc", metrics["roc_auc"])
-        mlflow.log_metric("false_positive_rate", metrics["false_positive_rate"])
-        mlflow.log_metric("false_negative_rate", metrics["false_negative_rate"])
-        mlflow.log_metric("accuracy", metrics["accuracy"])
-        for k, v in metrics["confusion_matrix"].items():
-            mlflow.log_metric(f"confusion_{k}", v)
-
-        cm_path = PROJECT_ROOT / "data" / "models" / "last_confusion_matrix.json"
-        cm_path.parent.mkdir(parents=True, exist_ok=True)
-        cm_path.write_text(json.dumps(metrics["confusion_matrix"], indent=2))
-        mlflow.log_artifact(str(cm_path))
-
-        signature = mlflow.models.infer_signature(X_train, model.predict_proba(X_train)[:, 1])
-        log_model_fn = mlflow.xgboost.log_model if model_type == "xgboost" else mlflow.sklearn.log_model
-        model_info = log_model_fn(
-            model,
-            artifact_path="model",
-            signature=signature,
-            input_example=X_train.head(3),
-            registered_model_name=settings.mlflow_model_name,
+        log.info(
+            "training_data_loaded",
+            total_rows=len(df),
+            train_rows=len(X_train),
+            val_rows=len(X_val),
+            test_rows=len(X_test),
+            fraud_ratio_overall=round(float(df["is_fraud"].astype(int).mean()), 4),
+            dataset_version=dataset_version,
         )
 
-        run_id = run.info.run_id
-        registered_version = model_info.registered_model_version
+        try:
+            model, params, model_type = _train_xgboost(X_train, y_train, X_val, y_val)
+        except Exception:
+            log.warning("xgboost_unavailable_falling_back_to_random_forest", exc_info=True)
+            model, params, model_type = _train_random_forest_fallback(X_train, y_train)
 
-    client = mlflow.tracking.MlflowClient()
-    client.set_registered_model_alias(settings.mlflow_model_name, "champion", registered_version)
-    log.info("model_registered", model_name=settings.mlflow_model_name, version=registered_version, alias="champion", run_id=run_id)
+        metrics = _evaluate(model, X_test, y_test)
+        log.info("evaluation_complete", model_type=model_type, **{k: v for k, v in metrics.items() if k != "confusion_matrix"})
+        log.info("confusion_matrix", **metrics["confusion_matrix"])
 
-    _record_model_version_in_postgres(
+        with mlflow.start_run(run_name=f"{model_type}-{dataset_version}") as mlflow_run:
+            mlflow.log_param("model_type", model_type)
+            mlflow.log_params(params)
+            mlflow.log_param("feature_list", ",".join(MODEL_FEATURE_COLUMNS))
+            mlflow.log_param("dataset_version", dataset_version)
+            mlflow.log_param("train_rows", len(X_train))
+            mlflow.log_param("val_rows", len(X_val))
+            mlflow.log_param("test_rows", len(X_test))
+            mlflow.log_param("random_seed", RANDOM_SEED)
+
+            mlflow.log_metric("precision", metrics["precision"])
+            mlflow.log_metric("recall", metrics["recall"])
+            mlflow.log_metric("f1", metrics["f1"])
+            mlflow.log_metric("roc_auc", metrics["roc_auc"])
+            mlflow.log_metric("false_positive_rate", metrics["false_positive_rate"])
+            mlflow.log_metric("false_negative_rate", metrics["false_negative_rate"])
+            mlflow.log_metric("accuracy", metrics["accuracy"])
+            for k, v in metrics["confusion_matrix"].items():
+                mlflow.log_metric(f"confusion_{k}", v)
+
+            cm_path = PROJECT_ROOT / "data" / "models" / "last_confusion_matrix.json"
+            cm_path.parent.mkdir(parents=True, exist_ok=True)
+            cm_path.write_text(json.dumps(metrics["confusion_matrix"], indent=2))
+            mlflow.log_artifact(str(cm_path))
+
+            signature = mlflow.models.infer_signature(X_train, model.predict_proba(X_train)[:, 1])
+            log_model_fn = mlflow.xgboost.log_model if model_type == "xgboost" else mlflow.sklearn.log_model
+            model_info = log_model_fn(
+                model,
+                artifact_path="model",
+                signature=signature,
+                input_example=X_train.head(3),
+                registered_model_name=settings.mlflow_model_name,
+            )
+
+            mlflow_run_id = mlflow_run.info.run_id
+            registered_version = model_info.registered_model_version
+
+        client = mlflow.tracking.MlflowClient()
+        client.set_registered_model_alias(settings.mlflow_model_name, "champion", registered_version)
+        log.info(
+            "model_registered",
+            model_name=settings.mlflow_model_name,
+            version=registered_version,
+            alias="champion",
+            run_id=mlflow_run_id,
+        )
+
+        _record_model_version_in_postgres(
+            model_version=str(registered_version),
+            model_name=settings.mlflow_model_name,
+            mlflow_run_id=mlflow_run_id,
+            metrics=metrics,
+        )
+    except Exception as exc:
+        lifecycle.fail_from_exception(run.run_id, exc, dataset_version=dataset_version)
+        raise
+
+    lifecycle.succeed(
+        run.run_id,
+        dataset_version=dataset_version,
         model_version=str(registered_version),
-        model_name=settings.mlflow_model_name,
-        mlflow_run_id=run_id,
-        metrics=metrics,
+        artifacts={"mlflow_run_id": mlflow_run_id},
     )
 
     return {
-        "run_id": run_id,
+        "run_id": mlflow_run_id,
         "model_version": registered_version,
         "model_type": model_type,
         **{k: v for k, v in metrics.items() if k != "confusion_matrix"},

@@ -148,6 +148,36 @@ def test_fail_truncates_long_error_message(lifecycle):
     assert len(failed.error_message) <= 2000
 
 
+def test_fail_records_dataset_and_model_version_and_artifacts(lifecycle):
+    run = lifecycle.begin("train")
+    failed = lifecycle.fail(
+        run.run_id,
+        error_type="RuntimeError",
+        error_message="boom",
+        dataset_version="abc123",
+        model_version="7",
+        artifacts={"postgres_dsn": "postgresql://u:p@h/db", "note": "ok"},
+    )
+    assert failed.dataset_version == "abc123"
+    assert failed.model_version == "7"
+    assert failed.artifacts["postgres_dsn"] == "***REDACTED***"
+    assert failed.artifacts["note"] == "ok"
+
+
+def test_cancel_records_dataset_and_model_version_and_artifacts(lifecycle):
+    run = lifecycle.begin("stream")
+    cancelled = lifecycle.cancel(
+        run.run_id,
+        reason="operator stopped it",
+        dataset_version="abc123",
+        model_version="7",
+        artifacts={"raw_bucket": "aidp-raw"},
+    )
+    assert cancelled.dataset_version == "abc123"
+    assert cancelled.model_version == "7"
+    assert cancelled.artifacts == {"raw_bucket": "aidp-raw"}
+
+
 # ---- state-transition rules ---------------------------------------------------------
 
 
