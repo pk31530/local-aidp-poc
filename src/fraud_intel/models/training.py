@@ -382,6 +382,15 @@ def train_channel_configured(
                 registered_model_name=f"{get_settings().mlflow_model_name}-fraud-intel-online-banking-gbm",
             )
             gbm_mlflow_run_id = gbm_run.info.run_id
+            # Phase 6 corrective pass: the preprocessor was previously only
+            # ever recorded as a version STRING (preprocessing_artifact_version)
+            # -- the actual fitted object was never persisted anywhere
+            # reloadable. Logging its deterministic JSON form (never pickle,
+            # same ChannelPreprocessor.to_json_dict()/from_json_dict()
+            # round-trip already used elsewhere) here, under the gbm run,
+            # is what makes real scoring-time reload
+            # (src.fraud_intel.scoring.dispatch) possible at all.
+            mlflow.log_dict(preprocessor.to_json_dict(), "preprocessor.json")
             gbm_model_version = gbm_model_info.registered_model_version
         # No mlflow.tracking.MlflowClient().set_registered_model_alias(...) call
         # anywhere in this function -- guide section 22's deliberate difference
@@ -412,6 +421,10 @@ def train_channel_configured(
             )
             anomaly_mlflow_run_id = anomaly_run.info.run_id
             anomaly_model_version = anomaly_model_info.registered_model_version
+            # Same rationale as preprocessor.json above -- makes real
+            # scoring-time reload of the fitted normalization bounds
+            # possible (src.fraud_intel.scoring.dispatch).
+            mlflow.log_dict(anomaly_normalization.to_json_dict(), "anomaly_normalization.json")
 
         evaluation_report_ref = json.dumps(
             {

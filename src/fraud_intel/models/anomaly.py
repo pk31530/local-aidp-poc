@@ -49,6 +49,15 @@ class AnomalyNormalization:
         canonical = json.dumps(self.to_json_dict(), sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
+    @classmethod
+    def from_json_dict(cls, data: Mapping[str, Any]) -> "AnomalyNormalization":
+        return cls(
+            train_min=data["train_min"],
+            train_max=data["train_max"],
+            anomaly_artifact_version=data["anomaly_artifact_version"],
+            library_versions=dict(data["library_versions"]),
+        )
+
 
 def fit_anomaly_model(
     X_train: Sequence[Sequence[float]], *, random_seed: int, anomaly_artifact_version: str

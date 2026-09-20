@@ -267,6 +267,9 @@ class _FakeMlflow:
     def log_metric(self, key, value):
         pass
 
+    def log_dict(self, data, path):
+        pass
+
 
 def _ob_event(*, event_timestamp: datetime, event_id: uuid.UUID | None = None) -> FraudEvent:
     return FraudEvent(

@@ -140,15 +140,119 @@ def test_train_loads_population_and_dispatches_to_train_channel_configured(monke
     assert result == {"bundle_id": 9, "status": "CANDIDATE"}
 
 
-# ---- fraud-intel score: real alert/evidence persistence exists, real MLflow loading does not ----
+# ---- fraud-intel score: real reference-channel dispatch (Phase 6 corrective pass) -----
 
 
-def test_score_raises_not_implemented_mapped_to_operational_exit_code(capsys):
+def test_score_dispatches_to_score_channel(monkeypatch, capsys):
+    captured = {}
+
+    def _fake_score_channel(*, channel, lifecycle, data_access, get_operational_bundle, artifact_loader, alert_queue_store):
+        captured.update(
+            channel=channel, lifecycle=lifecycle, data_access=data_access,
+            get_operational_bundle=get_operational_bundle, artifact_loader=artifact_loader,
+            alert_queue_store=alert_queue_store,
+        )
+        return {"run_id": 1, "channel": channel, "bundle_id": 2, "bundle_version": 1, "records_processed": 3, "records_rejected": 0, "alerts": []}
+
+    fake_data_access = object()
+    fake_artifact_loader = object()
+    monkeypatch.setattr("src.fraud_intel.scoring.dispatch.score_channel", _fake_score_channel)
+    monkeypatch.setattr("src.fraud_intel.scoring.dispatch.create_default_scoring_data_access", lambda database: fake_data_access)
+    monkeypatch.setattr("src.fraud_intel.scoring.dispatch.create_default_bundle_artifact_loader", lambda: fake_artifact_loader)
+    monkeypatch.setattr(cli_main, "create_default_alert_queue_store", lambda database: object())
+    monkeypatch.setattr(cli_main, "_get_operational_bundle", lambda channel, database: _bundle())
+
+    cli_main.main(["fraud-intel", "score", "--channel", "online_banking", "--database", "aidp_test", "--json"])
+
+    assert captured["channel"] == "online_banking"
+    assert captured["data_access"] is fake_data_access
+    assert captured["artifact_loader"] is fake_artifact_loader
+    assert captured["get_operational_bundle"]("online_banking") == _bundle()
+    result = json.loads(capsys.readouterr().out)
+    assert result == {"run_id": 1, "channel": "online_banking", "bundle_id": 2, "bundle_version": 1, "records_processed": 3, "records_rejected": 0, "alerts": []}
+
+
+def test_score_unsupported_channel_is_a_cli_user_error(capsys):
+    with pytest.raises(SystemExit) as exc_info:
+        cli_main.main(["fraud-intel", "score", "--channel", "wire", "--database", "aidp_test", "--json"])
+    assert exc_info.value.code == 2
+    result = json.loads(capsys.readouterr().out)
+    assert result["error"] == "CLIUserError"
+    assert "Phase 7A" in result["message"]
+
+
+@pytest.mark.parametrize("exc_cls_path", [
+    "src.fraud_intel.scoring.dispatch.NoOperationalBundleError",
+    "src.fraud_intel.scoring.dispatch.BundlePolicyMismatchError",
+])
+def test_score_maps_domain_errors_to_cli_user_error(monkeypatch, capsys, exc_cls_path):
+    import importlib
+
+    module_path, cls_name = exc_cls_path.rsplit(".", 1)
+    exc_cls = getattr(importlib.import_module(module_path), cls_name)
+
+    def _raise(**kwargs):
+        raise exc_cls("refused")
+
+    monkeypatch.setattr("src.fraud_intel.scoring.dispatch.score_channel", _raise)
+    monkeypatch.setattr("src.fraud_intel.scoring.dispatch.create_default_scoring_data_access", lambda database: object())
+    monkeypatch.setattr("src.fraud_intel.scoring.dispatch.create_default_bundle_artifact_loader", lambda: object())
+    monkeypatch.setattr(cli_main, "create_default_alert_queue_store", lambda database: object())
+    monkeypatch.setattr(cli_main, "_get_operational_bundle", lambda channel, database: _bundle())
+
     with pytest.raises(SystemExit) as exc_info:
         cli_main.main(["fraud-intel", "score", "--channel", "online_banking", "--database", "aidp_test", "--json"])
-    assert exc_info.value.code == 3
-    result = json.loads(capsys.readouterr().out)
-    assert result["error"] == "NotImplementedError"
+    assert exc_info.value.code == 2
+    assert json.loads(capsys.readouterr().out)["error"] == "CLIUserError"
+
+
+def test_score_clean_json_stdout_and_logs_go_to_stderr(monkeypatch, capsys):
+    def _fake_score_channel(**kwargs):
+        from src.common.logging import get_logger
+
+        get_logger("fake.fraud_score").info("fake_fraud_score_started")
+        return {"run_id": 1, "channel": "online_banking", "bundle_id": 2, "bundle_version": 1, "records_processed": 0, "records_rejected": 0, "alerts": []}
+
+    monkeypatch.setattr("src.fraud_intel.scoring.dispatch.score_channel", _fake_score_channel)
+    monkeypatch.setattr("src.fraud_intel.scoring.dispatch.create_default_scoring_data_access", lambda database: object())
+    monkeypatch.setattr("src.fraud_intel.scoring.dispatch.create_default_bundle_artifact_loader", lambda: object())
+    monkeypatch.setattr(cli_main, "create_default_alert_queue_store", lambda database: object())
+    monkeypatch.setattr(cli_main, "_get_operational_bundle", lambda channel, database: _bundle())
+
+    cli_main.main(["fraud-intel", "score", "--channel", "online_banking", "--database", "aidp_test", "--json"])
+
+    captured = capsys.readouterr()
+    stdout_lines = [line for line in captured.out.splitlines() if line]
+    assert len(stdout_lines) == 1
+    json.loads(stdout_lines[0])  # exactly one clean JSON object, nothing else
+    assert "fake_fraud_score_started" not in captured.out
+    assert "fake_fraud_score_started" in captured.err
+
+
+# ---- Phase 7B readiness: no permanent-stub handler remains -------------------------------
+
+
+def test_no_phase7b_required_handler_raises_not_implemented_error():
+    """AST-based (not substring-based) so a docstring/comment that merely
+    MENTIONS NotImplementedError -- e.g. explaining that a handler no
+    longer raises it -- can never produce a false positive (the same class
+    of false positive already hit twice elsewhere in Phase 6:
+    tests/unit/test_fraud_intel_migration_004.py)."""
+    import ast
+    import inspect
+
+    for handler in (
+        cli_main._handle_fraud_intel_generate,
+        cli_main._handle_fraud_intel_train,
+        cli_main._handle_fraud_intel_score,
+        cli_main._handle_fraud_intel_promote,
+    ):
+        tree = ast.parse(inspect.getsource(handler))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call):
+                func = node.exc.func
+                name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+                assert name != "NotImplementedError", f"{handler.__name__} still raises NotImplementedError"
 
 
 # ---- fraud-intel evaluate: explicit Phase 6 scope marker -----------------------------

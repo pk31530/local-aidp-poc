@@ -188,21 +188,36 @@ def _handle_fraud_intel_train(args: argparse.Namespace) -> dict:
 
 
 def _handle_fraud_intel_score(args: argparse.Namespace) -> dict:
-    """Real alert/evidence persistence (Phase 6) is fully built and unit-
-    tested (src.fraud_intel.alerts.queue). What is NOT yet built is real
-    MLflow model-artifact loading into a LoadedChannelBundle -- that is
-    Phase 7B scope, matching every other "_Postgres*Store" in this
-    codebase, which is reviewed but never exercised until Phase 7B applies
-    the migrations. This raises NotImplementedError (mapped to exit 3 by
-    main()'s generic handler, not a user error) rather than pretending to
-    score for real."""
-    _require_database(args)
+    """Real dispatch (Phase 6 corrective pass): finds the OPERATIONAL
+    online_banking bundle, loads/validates its pinned artifacts and
+    policies, scores every pending source alert through the existing,
+    already-tested alert queue, and records a real `fraud_score`
+    RunLifecycle run. See src.fraud_intel.scoring.dispatch.score_channel
+    for the full orchestration -- this handler only wires up its
+    collaborators. A channel other than online_banking is rejected by
+    `_require_implemented_channel` below with a CLIUserError, not a
+    NotImplementedError -- it is a supported-later, not a broken, state."""
+    database = _require_database(args)
     _require_implemented_channel(args.channel)
-    raise NotImplementedError(
-        "aidp fraud-intel score requires loading real trained model artifacts from MLflow "
-        "(Phase 7B scope, not yet implemented) -- the alert queue, evidence persistence, and "
-        "scoring orchestrator this command would call are already built and unit-tested (Phase 5/6)"
+    from src.fraud_intel.scoring.dispatch import (
+        BundlePolicyMismatchError,
+        NoOperationalBundleError,
+        create_default_bundle_artifact_loader,
+        create_default_scoring_data_access,
+        score_channel,
     )
+
+    try:
+        return score_channel(
+            channel=args.channel,
+            lifecycle=RunLifecycle(database),
+            data_access=create_default_scoring_data_access(database),
+            get_operational_bundle=lambda channel: _get_operational_bundle(channel, database),
+            artifact_loader=create_default_bundle_artifact_loader(),
+            alert_queue_store=create_default_alert_queue_store(database),
+        )
+    except (NoOperationalBundleError, BundlePolicyMismatchError) as exc:
+        raise CLIUserError(str(exc)) from exc
 
 
 def _handle_fraud_intel_evaluate(args: argparse.Namespace) -> dict:
@@ -434,7 +449,11 @@ def build_parser() -> argparse.ArgumentParser:
     fi_score_p = fraud_intel_sub.add_parser(
         "score", parents=[json_parent, database_parent], help="score pending source alerts for a channel"
     )
-    fi_score_p.add_argument("--channel", required=True, choices=sorted(FRAUD_INTEL_IMPLEMENTED_CHANNELS))
+    # All 7 channels are accepted at the argparse level (unlike train/
+    # evaluate) so an unsupported channel reaches _require_implemented_channel
+    # and produces a clean, JSON-formatted CLIUserError -- not argparse's own
+    # unformatted usage error.
+    fi_score_p.add_argument("--channel", required=True, choices=sorted(FRAUD_INTEL_ALL_CHANNELS))
     fi_score_p.set_defaults(handler=_handle_fraud_intel_score)
 
     fi_evaluate_p = fraud_intel_sub.add_parser(

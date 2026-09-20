@@ -238,6 +238,7 @@ def score_and_record_alert(
     config_hash: str,
     git_sha: Optional[str],
     store: AlertQueueStore,
+    score_execution_id: Optional[uuid.UUID] = None,
 ) -> tuple[FraudAlertRecord, Optional[AlertEvidenceRecord]]:
     """Guarantees exactly one fraud_alerts row per valid SourceAlertContext
     -- created at FIRST-scoring time (guide section 4's architecture
@@ -246,11 +247,21 @@ def score_and_record_alert(
     called with valid, well-formed arguments (a wrong-channel event, for
     example, still raises immediately -- that is a caller bug, not a
     scoring-degradation case this function is responsible for
-    absorbing)."""
+    absorbing).
+
+    `score_execution_id` is optional (Phase 6 corrective pass): omitting
+    it mints a fresh id, exactly as before. A caller that needs to safely
+    RETRY the same logical scoring attempt (e.g. after a transient store
+    failure) may instead pass the same id it used on the prior attempt --
+    `alert_evidence`'s own UNIQUE(alert_id, score_execution_id) dedup
+    (store.record_evidence()) then returns the existing row instead of
+    writing a duplicate, rather than the retry silently producing a second,
+    distinct evidence row for what is really one execution."""
     # Minted BEFORE scoring begins (Phase 6 decision 2) -- the SAME id
     # identifies both a genuine ScoredAlert and a catastrophic-failure
     # record for this one logical scoring attempt.
-    score_execution_id = uuid.uuid4()
+    if score_execution_id is None:
+        score_execution_id = uuid.uuid4()
 
     try:
         scored = score_source_alert(

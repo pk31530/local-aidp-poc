@@ -110,13 +110,13 @@ def _ctx(event: FraudEvent) -> FeatureComputationContext:
     return FeatureComputationContext(current_event=event, historical_events=(), source_alert_history=(), as_of_time=event.event_timestamp)
 
 
-def _score(*, event=None, source_alert=None, store, bundle=None):
+def _score(*, event=None, source_alert=None, store, bundle=None, score_execution_id=None):
     event = event or _event()
     return score_and_record_alert(
         event=event, source_alert=source_alert or _source_alert(event_id=event.event_id), context=_ctx(event),
         bundle=bundle or _bundle(), rule_provider=LocalYamlRuleProvider(), ensemble_policy=_ensemble_policy(),
         graph_policy=_graph_policy(), resolved_fraud_evidence=(), config_hash="cfg-hash-1", git_sha="deadbeef",
-        store=store,
+        store=store, score_execution_id=score_execution_id,
     )
 
 
@@ -172,7 +172,7 @@ def test_amount_minor_units_matches_the_event_not_a_dollar_value():
     assert alert.amount_minor_units == event.amount_minor_units == 10_000
 
 
-# ---- same-execution retry (store-level, since score_and_record_alert always mints a fresh id) ----
+# ---- same-execution retry ----------------------------------------------------------
 
 
 def test_same_score_execution_id_retry_leaves_evidence_unchanged():
@@ -192,6 +192,27 @@ def test_same_score_execution_id_retry_leaves_evidence_unchanged():
     )
     assert retried == evidence  # completely unchanged -- the "retry" attempt's payload was ignored
     assert len(store.evidence_by_alert[alert.alert_id]) == 1
+
+
+def test_score_and_record_alert_reuses_an_explicit_score_execution_id_for_a_retry():
+    """Phase 6 corrective pass: score_execution_id is now an optional
+    parameter -- a caller that needs to safely retry the same logical
+    scoring attempt (e.g. src.fraud_intel.scoring.dispatch after a
+    transient failure) can pass the SAME id on both calls, and the second
+    call is a true no-op (same evidence row, not a second one) rather than
+    minting a fresh id and silently producing a duplicate-looking rescore."""
+    store = _FakeAlertQueueStore()
+    event = _event()
+    source_alert = _source_alert(event_id=event.event_id)
+    explicit_id = uuid.uuid4()
+
+    alert1, evidence1 = _score(event=event, source_alert=source_alert, store=store, score_execution_id=explicit_id)
+    alert2, evidence2 = _score(event=event, source_alert=source_alert, store=store, score_execution_id=explicit_id)
+
+    assert alert1.alert_id == alert2.alert_id
+    assert evidence1.evidence_id == evidence2.evidence_id
+    assert evidence1.score_execution_id == evidence2.score_execution_id == explicit_id
+    assert len(store.evidence_by_alert[alert1.alert_id]) == 1  # no duplicate row from the "retry"
 
 
 # ---- catastrophic failure -------------------------------------------------------------
