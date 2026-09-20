@@ -116,8 +116,31 @@ phase.
 | H5 | Default seed size 50,000 rows, not 250,000 | `config/settings.yaml`, `.env.example` |
 | M1 | Structured logging with transaction-id correlation | `src/common/logging.py` |
 | M2 | Timezone pinned (Asia/Kolkata), night flag tested against it | `src/common/timeutil.py`; explicit test in `tests/unit/test_features.py` |
-| M3 | Message schema versioning (informational) | `schema_version` field on every message, `src/common/schemas.py` |
+| M3 | Message schema versioning, enforced | `schema_version` field on every message, `src/common/schemas.py`. Originally informational-only; enforcement (unsupported versions rejected and DLQ'd) landed in the v1.1 hardening pass — see `HARDENING_LOG.md` Fix 1. |
 | M4 | Pydantic bounds validation on top of type validation | `src/common/schemas.py` (`MAX_REASONABLE_AMOUNT`), `src/api/schemas.py` |
+
+## v1.2 control plane (in progress)
+
+Work has started on `feat/aidp-v1-2-control-plane` to add a small operational
+control plane on top of the v1.1 build, without importing distributed-GPU
+complexity. See `AIDP_V1_2_CONTROL_PLANE_BUILD_GUIDE.md` for the full,
+phase-by-phase plan. Planned additions:
+
+- **Typed run configuration** — validated `BatchRunConfig`,
+  `TrainingRunConfig`, and `StreamRunConfig` models for the batch pipeline,
+  training, and streaming consumer, replacing ad hoc function arguments.
+- **Central run lifecycle/provenance service** (`src/control_plane/`) —
+  one implementation for recording run status and metadata, replacing the
+  three separate `pipeline_runs` write paths that exist today in
+  `src/processing/pipeline.py`, `src/ingestion/consumer.py`, and the
+  currently-untracked training runs in `src/ml/train.py`.
+- **Unified `aidp` CLI** (`src/cli/`, `scripts/aidp.sh`) — one command
+  surface over the existing pipeline/train/stream entry points, with
+  human-readable and `--json` output.
+
+As of this section, none of this has been implemented yet — this is Phase 0
+(baseline assessment and documentation correction) of the plan. No runtime
+code or database schema has changed for v1.2.
 
 ## Real issues hit and fixed during the build
 
