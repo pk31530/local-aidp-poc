@@ -9,8 +9,23 @@ from __future__ import annotations
 import os
 
 import mlflow
+from mlflow.exceptions import MlflowException
 
 from src.common.config import get_settings
+
+
+class ModelAliasNotFoundError(Exception):
+    """The requested model alias (or the underlying model) does not exist
+    in the registry — distinct from a connection, authentication, or
+    server failure, which must propagate unchanged."""
+
+
+# MLflow's SQLAlchemy-backed model registry store (what this repo's Postgres-
+# backed MLflow uses) raises exactly this error code — not RESOURCE_DOES_NOT_EXIST
+# — when get_model_version_by_alias() can't find the alias; verified against
+# mlflow.store.model_registry.sqlalchemy_store.SqlAlchemyStore.get_model_version_by_alias.
+# Checked via the structured `error_code` field, never by matching message text.
+_ALIAS_NOT_FOUND_ERROR_CODE = "INVALID_PARAMETER_VALUE"
 
 
 def configure_mlflow() -> None:
@@ -60,8 +75,19 @@ def get_model_alias_info(model_name: str, alias: str) -> dict:
     Returns only model_name, alias, version, model_type, and the MLflow
     run_id — never parameters, tags, artifact/storage paths, or any
     credential/environment information.
+
+    Raises ModelAliasNotFoundError specifically when the alias/model
+    doesn't exist (identified by MLflow's structured error_code, not by
+    matching message text). Any other MlflowException — a connection
+    failure, an authentication failure, a server error — propagates
+    unchanged, since those are operational failures, not a bad CLI input.
     """
-    _, mv, run, model_type = _resolve_model_version(model_name, alias)
+    try:
+        _, mv, run, model_type = _resolve_model_version(model_name, alias)
+    except MlflowException as exc:
+        if exc.error_code == _ALIAS_NOT_FOUND_ERROR_CODE:
+            raise ModelAliasNotFoundError(f"model {model_name!r} has no alias {alias!r}") from exc
+        raise
     return {
         "model_name": model_name,
         "alias": alias,

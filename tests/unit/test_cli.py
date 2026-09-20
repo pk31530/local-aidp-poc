@@ -8,6 +8,7 @@ from mlflow.exceptions import MlflowException
 
 from src.cli import __main__ as cli_main
 from src.common.config import PROJECT_ROOT
+from src.common.mlflow_setup import ModelAliasNotFoundError
 from src.control_plane.config import BatchRunConfig, StreamRunConfig, TrainingRunConfig
 from src.control_plane.runs import RunLifecycle as RealRunLifecycle
 from src.control_plane.runs import RunRecord
@@ -367,8 +368,12 @@ def test_model_show_success(monkeypatch, capsys):
 
 
 def test_model_show_unknown_alias_is_user_error(monkeypatch, capsys):
+    """Missing model alias -> ModelAliasNotFoundError -> safe JSON error,
+    exit 2. No real MLflow connection is made — get_model_alias_info is
+    monkeypatched entirely."""
+
     def _raise(model_name, alias):
-        raise MlflowException("alias not found")
+        raise ModelAliasNotFoundError(f"model {model_name!r} has no alias {alias!r}")
 
     monkeypatch.setattr(cli_main, "get_model_alias_info", _raise)
 
@@ -376,6 +381,32 @@ def test_model_show_unknown_alias_is_user_error(monkeypatch, capsys):
         cli_main.main(["model", "show", "nope", "--json"])
 
     assert exc_info.value.code == 2
+    result = json.loads(capsys.readouterr().out)
+    # main() reports the CLIUserError it raised (consistent with every other
+    # user-error path — run-show-not-found, out-of-range --limit, etc.),
+    # not the inner ModelAliasNotFoundError it was built from.
+    assert result["error"] == "CLIUserError"
+    assert "nope" in result["message"]
+
+
+def test_model_show_mlflow_unavailable_is_operational_error(monkeypatch, capsys):
+    """MLflow unavailable / server failure -> exit 3, not exit 2. A plain
+    MlflowException that is NOT a ModelAliasNotFoundError must propagate as
+    an operational failure. No real MLflow connection is made."""
+
+    def _raise(model_name, alias):
+        raise MlflowException("mlflow server unavailable", error_code="TEMPORARILY_UNAVAILABLE")
+
+    monkeypatch.setattr(cli_main, "get_model_alias_info", _raise)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_main.main(["model", "show", "champion", "--json"])
+
+    assert exc_info.value.code == 3
+    captured = capsys.readouterr()
+    result = json.loads(captured.out)
+    assert result["error"] == "MlflowException"
+    assert "cli_command_failed" in captured.err
 
 
 # ---- shell wrapper argument forwarding (safe: --help only, no real work) ----------

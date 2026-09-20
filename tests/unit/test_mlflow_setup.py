@@ -1,8 +1,18 @@
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 
+import pytest
+from mlflow.exceptions import (
+    INTERNAL_ERROR,
+    INVALID_PARAMETER_VALUE,
+    PERMISSION_DENIED,
+    TEMPORARILY_UNAVAILABLE,
+    UNAUTHENTICATED,
+    MlflowException,
+)
+
 import src.common.mlflow_setup as mlflow_setup_module
-from src.common.mlflow_setup import get_model_alias_info, load_champion_model
+from src.common.mlflow_setup import ModelAliasNotFoundError, get_model_alias_info, load_champion_model
 
 
 @dataclass
@@ -130,3 +140,74 @@ def test_get_model_alias_info_defaults_model_type_to_xgboost_when_param_missing(
     info = get_model_alias_info("fraud-detection-model", "champion")
 
     assert info["model_type"] == "xgboost"
+
+
+# ---- get_model_alias_info: structured not-found vs. operational failures ----------
+
+
+class _RaisingMlflowClient:
+    """Raises a given MlflowException from get_model_version_by_alias, so
+    no real MLflow client or connection is ever created."""
+
+    def __init__(self, exc: Exception):
+        self._exc = exc
+
+    def get_model_version_by_alias(self, model_name, alias):
+        raise self._exc
+
+    def get_run(self, run_id):
+        raise AssertionError("must not be reached when get_model_version_by_alias raises")
+
+
+def _fake_mlflow_with_raising_client(exc: Exception):
+    client = _RaisingMlflowClient(exc)
+    return SimpleNamespace(tracking=SimpleNamespace(MlflowClient=lambda: client))
+
+
+def test_missing_alias_raises_model_alias_not_found_error(monkeypatch):
+    # The real error code MLflow's SQLAlchemy-backed model registry store
+    # raises for a missing alias (verified against
+    # SqlAlchemyStore.get_model_version_by_alias) — not RESOURCE_DOES_NOT_EXIST.
+    # error_code must be the actual protobuf enum value, not its string name —
+    # MlflowException.__init__ silently falls back to INTERNAL_ERROR otherwise.
+    not_found = MlflowException("Registered model alias nope not found.", error_code=INVALID_PARAMETER_VALUE)
+    assert not_found.error_code == "INVALID_PARAMETER_VALUE"  # guards the fixture itself
+    monkeypatch.setattr(mlflow_setup_module, "mlflow", _fake_mlflow_with_raising_client(not_found))
+
+    with pytest.raises(ModelAliasNotFoundError):
+        get_model_alias_info("fraud-detection-model", "nope")
+
+
+@pytest.mark.parametrize(
+    "error_code",
+    [TEMPORARILY_UNAVAILABLE, UNAUTHENTICATED, INTERNAL_ERROR, PERMISSION_DENIED],
+)
+def test_other_mlflow_exceptions_are_not_converted_and_propagate(monkeypatch, error_code):
+    """Connection/auth/server failures must remain plain MlflowException,
+    not be reclassified as ModelAliasNotFoundError — the CLI relies on this
+    to treat them as operational failures (exit 3), not user error (exit 2)."""
+    operational = MlflowException("mlflow server unavailable", error_code=error_code)
+    monkeypatch.setattr(mlflow_setup_module, "mlflow", _fake_mlflow_with_raising_client(operational))
+
+    with pytest.raises(MlflowException) as exc_info:
+        get_model_alias_info("fraud-detection-model", "champion")
+
+    assert not isinstance(exc_info.value, ModelAliasNotFoundError)
+
+
+def test_no_real_mlflow_client_is_ever_constructed(monkeypatch):
+    """Guards the fake itself: MlflowClient() must resolve to our fake
+    lambda, never mlflow.tracking.MlflowClient's real implementation."""
+    constructed = []
+    fake_mlflow = SimpleNamespace(
+        tracking=SimpleNamespace(
+            MlflowClient=lambda: constructed.append(1)
+            or _RaisingMlflowClient(MlflowException("not found", error_code=INVALID_PARAMETER_VALUE))
+        )
+    )
+    monkeypatch.setattr(mlflow_setup_module, "mlflow", fake_mlflow)
+
+    with pytest.raises(ModelAliasNotFoundError):
+        get_model_alias_info("fraud-detection-model", "nope")
+
+    assert constructed == [1]

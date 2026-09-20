@@ -15,8 +15,6 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from mlflow.exceptions import MlflowException
-
 from src.cli.output import (
     EXIT_OPERATIONAL_ERROR,
     EXIT_USER_ERROR,
@@ -26,7 +24,7 @@ from src.cli.output import (
 )
 from src.common.config import get_app_settings, get_fraud_rules, get_settings
 from src.common.logging import configure_logging, get_logger
-from src.common.mlflow_setup import get_model_alias_info
+from src.common.mlflow_setup import ModelAliasNotFoundError, get_model_alias_info
 from src.control_plane.config import BatchRunConfig, StreamRunConfig, TrainingRunConfig
 from src.control_plane.runs import PIPELINE_NAMES, STATUSES, RunLifecycle, RunNotFoundError
 from src.ingestion.consumer import run_configured
@@ -112,8 +110,11 @@ def _handle_model_show(args: argparse.Namespace) -> dict:
     settings = get_settings()
     try:
         return get_model_alias_info(settings.mlflow_model_name, args.alias)
-    except MlflowException as exc:
+    except ModelAliasNotFoundError as exc:
         raise CLIUserError(str(exc)) from exc
+    # Any other MlflowException (connection failure, auth failure, server
+    # error) is intentionally not caught here — it propagates to main()'s
+    # generic handler as an operational failure (exit 3).
 
 
 # ---- argparse tree -------------------------------------------------------------------
@@ -184,7 +185,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
-    configure_logging("cli")
+    # force=True: the CLI owns its whole process from startup, so it's the
+    # one caller that should guarantee a clean, deterministic single
+    # handler bound to stderr, regardless of anything imported before it.
+    configure_logging("cli", force=True)
     log = get_logger(__name__)
     parser = build_parser()
     args = parser.parse_args(argv)
