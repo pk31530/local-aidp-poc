@@ -28,7 +28,11 @@ GRAPH_SHARED_DEVICE_FLAG_THRESHOLD = 2
 GRAPH_FAN_IN_FLAG_THRESHOLD = 3
 GRAPH_NEAR_FRAUD_LINKED_MAX_HOPS = 2
 
-Layer = Literal["rule", "gbm", "anomaly", "graph"]
+Layer = Literal["rule", "gbm", "anomaly", "graph", "orchestrator"]
+# "orchestrator" (Phase 6): reserved for a catastrophic-scoring-failure
+# reason code (SCORING_UNAVAILABLE) -- never emitted by build_reason_codes()
+# itself, only constructed directly by src.fraud_intel.alerts.queue when
+# score_source_alert() raises before returning any ScoredAlert at all.
 Severity = Literal["informational", "contributing", "mandatory"]
 
 _RULE_SEVERITY_BY_CATEGORY = {

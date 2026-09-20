@@ -35,7 +35,18 @@ CANCELLED = "CANCELLED"
 STATUSES = {PENDING, RUNNING, SUCCESS, FAILED, CANCELLED}
 TERMINAL_STATUSES = {SUCCESS, FAILED, CANCELLED}
 
-PIPELINE_NAMES = {"batch", "train", "stream"}
+PIPELINE_NAMES = {
+    "batch",
+    "train",
+    "stream",
+    # v1.3 Phase 6 (guide section 11): additive only. Valid only once
+    # migration 004's pipeline_runs.pipeline_name CHECK widen has also
+    # been applied -- schema and this set must land together.
+    "fraud_score",
+    "label_eligibility",
+    "model_promotion",
+    "fraud_evaluation",
+}
 TRIGGER_SOURCES = {"cli", "legacy", "github_actions", "api", "test"}
 
 # PENDING -> SUCCESS is deliberately absent: a run must pass through RUNNING

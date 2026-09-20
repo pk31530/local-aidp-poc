@@ -117,13 +117,15 @@ _PREPROCESSOR = ChannelPreprocessor.fit(
 
 def _bundle(*, gbm_model=None, lr_model=None, anomaly_model=None) -> LoadedChannelBundle:
     return LoadedChannelBundle(
-        channel="online_banking", bundle_version=2,
+        channel="online_banking", bundle_id=2, bundle_version=2,
         gbm_model=gbm_model if gbm_model is not None else _FakeProbaModel(0.2),
         lr_model=lr_model if lr_model is not None else _FakeProbaModel(0.3),
         anomaly_model=anomaly_model if anomaly_model is not None else _FakeAnomalyModel(),
         anomaly_normalization=AnomalyNormalization(train_min=-1.0, train_max=1.0, anomaly_artifact_version="anom-test", library_versions={}),
         preprocessor=_PREPROCESSOR,
-        feature_schema_version="v1",
+        gbm_model_version="gbm-7", lr_model_version="lr-7", anomaly_model_version="anomaly-7",
+        preprocessing_artifact_version="pp-test", feature_schema_version="v1",
+        rule_set_version="v1", graph_policy_version="v1", ensemble_policy_version="v1", reason_code_version="v1",
     )
 
 

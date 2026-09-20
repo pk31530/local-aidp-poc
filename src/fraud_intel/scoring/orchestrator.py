@@ -77,18 +77,40 @@ class LoadedChannelBundle:
     -- distinct from `ChannelModelBundleRecord` (Phase 4), which only
     holds version *strings*. Loading these objects from MLflow using those
     version strings is explicitly not the orchestrator's job (a separate,
-    not-yet-built concern, analogous to v1.1's `load_champion_model()`);
-    Phase 5's tests construct this directly with fakes.
+    not-yet-built concern, analogous to v1.1's `load_champion_model()`).
+
+    Phase 6 decision 3: this bundle also carries its own PINNED provenance
+    -- bundle_id and every component/policy version string the bundle was
+    registered with. `alert_evidence`'s provenance columns
+    (src.fraud_intel.alerts.queue) are populated from THESE fields, not
+    from the live ensemble_policy/graph_policy objects passed to
+    score_source_alert() -- the bundle's own recorded versions represent
+    "what this bundle was validated/trained against," which may diverge
+    from "what policy is live right now" if a policy YAML changes without
+    a retrain. This also means every one of these fields is available even
+    when scoring fails catastrophically (they come from this argument, not
+    from any scoring OUTPUT), which is exactly why a catastrophic-failure
+    evidence row can still have a fully populated bundle/policy provenance
+    trail.
     """
 
     channel: str
+    bundle_id: int
     bundle_version: int
     gbm_model: Any
     lr_model: Any
     anomaly_model: Any
     anomaly_normalization: AnomalyNormalization
     preprocessor: ChannelPreprocessor
+    gbm_model_version: str
+    lr_model_version: str
+    anomaly_model_version: str
+    preprocessing_artifact_version: str
     feature_schema_version: str
+    rule_set_version: str
+    graph_policy_version: str
+    ensemble_policy_version: str
+    reason_code_version: str
 
 
 class ComponentStatus(BaseModel):

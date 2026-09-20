@@ -103,7 +103,9 @@ CREATE TABLE IF NOT EXISTS model_versions (
 -- fresh, empty data directory, so the two must be kept in agreement).
 CREATE TABLE IF NOT EXISTS pipeline_runs (
     run_id              BIGSERIAL PRIMARY KEY,
-    pipeline_name       TEXT NOT NULL CHECK (pipeline_name IN ('batch', 'train', 'stream')),
+    -- v1.3 Phase 6 additive widen: fraud_score/label_eligibility/
+    -- model_promotion/fraud_evaluation, alongside the original three.
+    pipeline_name       TEXT NOT NULL CHECK (pipeline_name IN ('batch', 'train', 'stream', 'fraud_score', 'label_eligibility', 'model_promotion', 'fraud_evaluation')),
     status              TEXT NOT NULL CHECK (status IN ('PENDING', 'RUNNING', 'SUCCESS', 'FAILED', 'CANCELLED')),
     trigger_source      TEXT CHECK (trigger_source IS NULL OR trigger_source IN ('cli', 'legacy', 'github_actions', 'api', 'test')),
     git_sha             TEXT,
@@ -165,7 +167,12 @@ CREATE TABLE IF NOT EXISTS source_alerts (
     source_alert_reason_codes  JSONB NOT NULL DEFAULT '[]'::jsonb,
     generation_run_id          TEXT,
     dataset_version             TEXT,
-    created_at                  TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at                  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- v1.3 Phase 6: fraud_alerts composite-FKs against (source_system,
+    -- source_alert_id) -- source_alert_id alone being a PK does not
+    -- satisfy Postgres's requirement that a composite FK's referenced
+    -- columns have a unique constraint on that EXACT column pair.
+    UNIQUE (source_system, source_alert_id)
 );
 CREATE INDEX IF NOT EXISTS idx_source_alerts_event_id ON source_alerts (event_id);
 CREATE INDEX IF NOT EXISTS idx_source_alerts_generation_run ON source_alerts (generation_run_id);
@@ -196,6 +203,14 @@ CREATE TABLE IF NOT EXISTS channel_model_bundles (
     anomaly_model_version            TEXT,
     preprocessing_artifact_version   TEXT,
     feature_schema_version           TEXT,
+    -- Phase 5 decision 3 -- required for promotion eligibility (see
+    -- src.fraud_intel.models.bundle.REQUIRED_OPERATIONAL_COMPONENTS) but
+    -- nullable here so Phase 4's already-registered, immutable candidate
+    -- bundle (which predates these columns) stays valid unchanged.
+    rule_set_version                 TEXT,
+    graph_policy_version              TEXT,
+    ensemble_policy_version            TEXT,
+    reason_code_version                 TEXT,
     training_run_id                  BIGINT,
     dataset_version                  TEXT,
     evaluation_report_ref            TEXT,
@@ -209,3 +224,115 @@ CREATE TABLE IF NOT EXISTS channel_model_bundles (
 -- at the database level, independent of application logic.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_one_operational_bundle_per_channel
     ON channel_model_bundles (channel) WHERE status = 'OPERATIONAL';
+
+-- ============================================================
+-- AiDP v1.3 fraud-intelligence: alert queue, evidence, analyst
+-- dispositions, label assessments (v1.3 Phase 6). See
+-- infrastructure/postgres/migrations/004_fraud_alerts_evidence_and_lifecycle.sql
+-- for the matching existing-install migration; the two must stay in
+-- agreement, same discipline as pipeline_runs/channel_events above.
+-- ============================================================
+
+-- One row per source alert (guide section 18), never per event -- the
+-- same event_id can appear on more than one row (guide section 6).
+-- initial_operational_priority_score/initial_priority_band/
+-- initial_ensemble_policy_version are set ONCE, at first-scoring time,
+-- and never updated by a later rescore (Phase 6 decision 2) -- the
+-- current/latest scoring result always comes from the latest
+-- alert_evidence row instead, never from these columns.
+CREATE TABLE IF NOT EXISTS fraud_alerts (
+    alert_id                             BIGSERIAL PRIMARY KEY,
+    event_id                             UUID NOT NULL REFERENCES channel_events (event_id),
+    source_alert_id                      UUID NOT NULL,
+    source_system                        TEXT NOT NULL,
+    channel                              TEXT NOT NULL CHECK (channel IN ('ach', 'wire', 'mobile_deposit', 'online_banking', 'atm', 'debit_card', 'p2p')),
+    customer_id                          TEXT NOT NULL,
+    account_id                           TEXT NOT NULL,
+    amount_minor_units                   BIGINT NOT NULL CHECK (amount_minor_units > 0),
+    initial_operational_priority_score   NUMERIC(7, 6) NOT NULL CHECK (initial_operational_priority_score BETWEEN 0 AND 1),
+    initial_priority_band                TEXT NOT NULL CHECK (initial_priority_band IN ('LOW', 'MEDIUM', 'HIGH')),
+    initial_ensemble_policy_version      TEXT NOT NULL,
+    status                               TEXT NOT NULL DEFAULT 'OPEN' CHECK (status IN ('OPEN', 'IN_REVIEW', 'CLOSED')),
+    created_at                           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (source_system, source_alert_id),
+    FOREIGN KEY (source_system, source_alert_id) REFERENCES source_alerts (source_system, source_alert_id)
+);
+CREATE INDEX IF NOT EXISTS idx_fraud_alerts_event_id ON fraud_alerts (event_id);
+CREATE INDEX IF NOT EXISTS idx_fraud_alerts_status ON fraud_alerts (status);
+CREATE INDEX IF NOT EXISTS idx_fraud_alerts_priority_band ON fraud_alerts (initial_priority_band);
+CREATE INDEX IF NOT EXISTS idx_fraud_alerts_created_at ON fraud_alerts (created_at DESC);
+
+-- Insert-only, immutable. One row per logical scoring execution
+-- (score_execution_id) -- a same-execution retry is a safe no-op, a
+-- deliberate re-score always adds a new row (guide section 18/20).
+-- Component/policy/bundle-provenance columns are NOT NULL wherever they
+-- are derivable from the scoring CALL's own arguments (bundle/policy
+-- objects), which are known even when scoring itself fails catastrophically
+-- (Phase 6 decision 3) -- only genuine scoring OUTPUTS (rule_result,
+-- operational_priority_score, priority_band, rule_set_version) are
+-- nullable, since those alone are unrecoverable from a catastrophic
+-- failure.
+CREATE TABLE IF NOT EXISTS alert_evidence (
+    evidence_id                      UUID PRIMARY KEY,
+    alert_id                         BIGINT NOT NULL REFERENCES fraud_alerts (alert_id),
+    score_execution_id               UUID NOT NULL,
+    rule_result                      JSONB,
+    gbm_probability                  NUMERIC(7, 6),
+    lr_probability                   NUMERIC(7, 6),
+    anomaly_score                    NUMERIC(7, 6),
+    graph_risk_score                 NUMERIC(7, 6),
+    operational_priority_score       NUMERIC(7, 6) CHECK (operational_priority_score IS NULL OR operational_priority_score BETWEEN 0 AND 1),
+    priority_band                    TEXT CHECK (priority_band IS NULL OR priority_band IN ('LOW', 'MEDIUM', 'HIGH')),
+    degraded                         BOOLEAN NOT NULL DEFAULT false,
+    component_statuses               JSONB NOT NULL CHECK (jsonb_typeof(component_statuses) = 'object'),
+    reason_codes                     JSONB NOT NULL CHECK (jsonb_typeof(reason_codes) = 'array'),
+    channel_model_bundle_id           BIGINT NOT NULL REFERENCES channel_model_bundles (bundle_id),
+    gbm_model_version                 TEXT NOT NULL,
+    lr_model_version                   TEXT NOT NULL,
+    anomaly_model_version               TEXT NOT NULL,
+    preprocessing_artifact_version        TEXT NOT NULL,
+    feature_schema_version                TEXT NOT NULL,
+    rule_set_version                      TEXT,
+    graph_policy_version                  TEXT NOT NULL,
+    ensemble_policy_version               TEXT NOT NULL,
+    reason_code_version                   TEXT NOT NULL,
+    config_hash                           TEXT NOT NULL,
+    git_sha                               TEXT,
+    event_time                            TIMESTAMPTZ NOT NULL,
+    scored_at                             TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (alert_id, score_execution_id)
+);
+CREATE INDEX IF NOT EXISTS idx_alert_evidence_alert_latest ON alert_evidence (alert_id, scored_at DESC, evidence_id DESC);
+
+-- Append-only analyst action log -- never updated or deleted. Multiple
+-- dispositions per alert over time are legitimate (guide section 18).
+CREATE TABLE IF NOT EXISTS analyst_dispositions (
+    disposition_id     BIGSERIAL PRIMARY KEY,
+    alert_id            BIGINT NOT NULL REFERENCES fraud_alerts (alert_id),
+    analyst_id           TEXT NOT NULL,
+    disposition            TEXT NOT NULL CHECK (disposition IN ('CONFIRMED_FRAUD', 'CONFIRMED_LEGITIMATE', 'NEEDS_MORE_INFO', 'ESCALATED')),
+    notes                    TEXT CHECK (notes IS NULL OR char_length(notes) <= 2000),
+    disposed_at                TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_analyst_dispositions_alert_id ON analyst_dispositions (alert_id);
+
+-- Append-only -- replaces any single mutable "current training label" row
+-- (guide section 18/19). source_disposition_id traces an analyst-derived
+-- assessment back to the exact disposition it is based on (NULL for a
+-- synthetic-only assessment, per Phase 6 decision 5's application-level
+-- rule, enforced in src.fraud_intel.labels.eligibility).
+CREATE TABLE IF NOT EXISTS label_assessments (
+    assessment_id           BIGSERIAL PRIMARY KEY,
+    alert_id                 BIGINT NOT NULL REFERENCES fraud_alerts (alert_id),
+    policy_version              TEXT NOT NULL,
+    evaluated_at                  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    source_disposition_id           BIGINT REFERENCES analyst_dispositions (disposition_id),
+    basis_timestamp                   TIMESTAMPTZ NOT NULL,
+    maturity_due_at                     TIMESTAMPTZ NOT NULL,
+    maturity_status                       TEXT NOT NULL CHECK (maturity_status IN ('IMMATURE', 'MATURE')),
+    eligibility_result                      BOOLEAN NOT NULL,
+    eligibility_reason_code                   TEXT NOT NULL,
+    resolved_label                              TEXT CHECK (resolved_label IS NULL OR resolved_label IN ('RESOLVED_FRAUD', 'RESOLVED_LEGITIMATE', 'UNRESOLVED')),
+    resolved_label_source                         TEXT CHECK (resolved_label_source IS NULL OR resolved_label_source IN ('SYNTHETIC_GENERATOR', 'ANALYST_DISPOSITION', 'EXTERNAL_CONFIRMATION'))
+);
+CREATE INDEX IF NOT EXISTS idx_label_assessments_alert_latest ON label_assessments (alert_id, evaluated_at DESC, assessment_id DESC);
