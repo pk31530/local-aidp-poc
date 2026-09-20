@@ -91,7 +91,7 @@ class BundleArtifactLoader(Protocol):
 GetOperationalBundle = Callable[[str], Optional[ChannelModelBundleRecord]]
 
 
-def _load_and_validate_pinned_policies(bundle: ChannelModelBundleRecord) -> tuple[RuleProvider, GraphPolicy, EnsemblePolicy]:
+def load_and_validate_pinned_policies(bundle: ChannelModelBundleRecord) -> tuple[RuleProvider, GraphPolicy, EnsemblePolicy]:
     """Loads the CURRENT local policy config/constants and validates each
     against the bundle's own PINNED version -- refuses (rather than
     silently scoring against drifted policy) exactly when
@@ -415,7 +415,7 @@ def score_channel(
         if bundle_record is None:
             raise NoOperationalBundleError(f"no OPERATIONAL bundle for channel {channel!r}")
 
-        rule_provider, graph_policy, ensemble_policy = _load_and_validate_pinned_policies(bundle_record)
+        rule_provider, graph_policy, ensemble_policy = load_and_validate_pinned_policies(bundle_record)
         loaded_bundle = artifact_loader.load(bundle_record)
         config_hash = _bundle_config_hash(bundle_record)
         git_sha = get_git_sha()

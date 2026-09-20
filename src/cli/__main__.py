@@ -233,18 +233,21 @@ def _handle_fraud_intel_evaluate(args: argparse.Namespace) -> dict:
     `--recall-target` are all required -- no implicit default anywhere
     (Phase 7A decision 6). The OPERATIONAL bundle is resolved for real
     (`_get_operational_bundle`, same as `model show`); `--candidate-
-    bundle-version` is optional and, when given, adds a clearly-separate
-    shadow-candidate comparison section to the JSON output. This command
-    is single-channel by its own `--channel` flag -- cross-channel
-    aggregation (evaluate_cross_channel()) is a library capability this
-    CLI surface does not (yet) expose as its own flag."""
+    bundle-version` is optional and, when given, re-scores the exact same
+    resolved population against the CANDIDATE bundle IN MEMORY, via the
+    pure score_source_alert() path (src.fraud_intel.evaluation.
+    shadow_candidate.score_candidate_shadow()) -- never
+    score_and_record_alert(), never a fraud_alerts/alert_evidence write,
+    never a promotion. This command is single-channel by its own
+    `--channel` flag -- cross-channel aggregation (evaluate_cross_channel())
+    is a library capability this CLI surface does not (yet) expose as its
+    own flag."""
     database = _require_database(args)
     _require_implemented_channel(args.channel)
 
-    from src.fraud_intel.cli_data_access import load_candidate_shadow_scores, load_resolved_alert_outcomes
+    from src.fraud_intel.cli_data_access import load_resolved_alert_outcomes
     from src.fraud_intel.evaluation.capacity import CountCapacity, FractionCapacity
     from src.fraud_intel.evaluation.cross_channel import evaluate_channel
-    from src.fraud_intel.evaluation.shadow_candidate import compare_operational_vs_candidate
 
     try:
         capacity = (
@@ -274,15 +277,36 @@ def _handle_fraud_intel_evaluate(args: argparse.Namespace) -> dict:
         "operational_evaluation": operational_dump,
         "rules_only_baseline": rules_only_baseline,
         "shadow_candidate_comparison": None,
+        "candidate_scoring_errors": [],
     }
 
     if args.candidate_bundle_version is not None:
+        from src.fraud_intel.cli_data_access import load_resolved_alert_scoring_contexts
+        from src.fraud_intel.evaluation.shadow_candidate import compare_operational_vs_candidate, score_candidate_shadow
+        from src.fraud_intel.scoring.dispatch import (
+            BundlePolicyMismatchError,
+            create_default_bundle_artifact_loader,
+            load_and_validate_pinned_policies,
+        )
+
         promotion_store = create_default_bundle_promotion_store(database)
         try:
             candidate_bundle = promotion_store.get_bundle(args.channel, args.candidate_bundle_version)
         except LookupError as exc:
             raise CLIUserError(str(exc)) from exc
-        candidate_scores = load_candidate_shadow_scores(args.channel, candidate_bundle.bundle_id, database)
+
+        try:
+            rule_provider, graph_policy, ensemble_policy = load_and_validate_pinned_policies(candidate_bundle)
+        except BundlePolicyMismatchError as exc:
+            raise CLIUserError(str(exc)) from exc
+        loaded_candidate_bundle = create_default_bundle_artifact_loader().load(candidate_bundle)
+
+        scoring_inputs = load_resolved_alert_scoring_contexts(args.channel, database)
+        candidate_scores, candidate_errors = score_candidate_shadow(
+            scoring_inputs, bundle=loaded_candidate_bundle, rule_provider=rule_provider,
+            ensemble_policy=ensemble_policy, graph_policy=graph_policy,
+        )
+
         try:
             comparison = compare_operational_vs_candidate(
                 args.channel, outcomes, candidate_scores,
@@ -293,6 +317,7 @@ def _handle_fraud_intel_evaluate(args: argparse.Namespace) -> dict:
         except ValueError as exc:
             raise CLIUserError(str(exc)) from exc
         result["shadow_candidate_comparison"] = comparison.model_dump(mode="json")
+        result["candidate_scoring_errors"] = [e.model_dump(mode="json") for e in candidate_errors]
 
     return result
 

@@ -1,31 +1,65 @@
-"""Shadow-candidate evaluation (Phase 7A corrective pass): a pure,
-typed comparison between an OPERATIONAL bundle's real scores and a
-CANDIDATE bundle's shadow scores over the same source-alert population.
+"""Shadow-candidate evaluation (Phase 7A corrective pass): in-memory
+candidate scoring plus a pure, typed comparison between an OPERATIONAL
+bundle's real scores and a CANDIDATE bundle's shadow scores over the
+same source-alert population.
 
-This module never scores anything itself, never contacts a database or
-MLflow, and never imports src.fraud_intel.alerts.queue or
-src.fraud_intel.models.promotion -- structurally verified by
-tests/unit/test_fraud_intel_shadow_candidate.py. It ONLY compares two
-already-computed, caller-supplied score sequences and returns a report.
-Candidate scores therefore cannot, even in principle, create a
-fraud_alerts/alert_evidence row, influence the analyst queue or a
-disposition, or trigger a promotion -- there is no code path here that
+`score_candidate_shadow()` is the ONLY function here that does real work
+beyond comparison -- it calls the existing PURE
+src.fraud_intel.scoring.orchestrator.score_source_alert() (no database,
+MLflow, or persistence inside that function either) once per alert, in
+memory, and NEVER src.fraud_intel.alerts.queue.score_and_record_alert().
+This module never contacts a database or MLflow itself, and never
+imports src.fraud_intel.alerts.queue or src.fraud_intel.models.promotion
+-- structurally verified by tests/unit/test_fraud_intel_shadow_candidate.py.
+A candidate's scores are therefore held in memory only, as
+`CandidateShadowScore` objects; nothing here can, even in principle,
+create a fraud_alerts/alert_evidence row, influence the analyst queue or
+a disposition, or trigger a promotion -- there is no code path here that
 writes anything, and no function that calls
-src.fraud_intel.models.promotion.promote_bundle.
+src.fraud_intel.models.promotion.promote_bundle. A per-alert scoring
+failure is captured as a `CandidateShadowScoringError` and skipped --
+never allowed to raise out of the batch or touch that alert's real,
+already-persisted operational evidence.
 """
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field
 from sklearn.metrics import average_precision_score, brier_score_loss
 
+from src.control_plane.provenance import redact_credentials, truncate_text
+from src.fraud_intel.ensemble.policy import EnsemblePolicy
 from src.fraud_intel.evaluation.capacity import CountCapacity, FractionCapacity, resolve_capacity_count
 from src.fraud_intel.evaluation.cross_channel import AlertOutcome, MetricValue, PriorityBand
+from src.fraud_intel.events.base import FraudEvent
+from src.fraud_intel.events.source_alert_context import SourceAlertContext
+from src.fraud_intel.features.core import FeatureComputationContext
+from src.fraud_intel.graph.entity_graph import GraphPolicy, ResolvedFraudEntityEvidence
+from src.fraud_intel.rules.provider import RuleProvider
+from src.fraud_intel.scoring.orchestrator import LoadedChannelBundle, score_source_alert
 
 DEFAULT_MIN_ROWS_FOR_SCORE_DIFF_STDEV = 2
+MAX_SHADOW_ERROR_MESSAGE_LENGTH = 500
+
+
+@dataclass(frozen=True)
+class CandidateScoringInput:
+    """Everything needed to re-score one already-resolved alert against a
+    CANDIDATE bundle via the pure score_source_alert() path -- the exact
+    same shape as src.fraud_intel.scoring.dispatch.PendingScoringItem,
+    defined separately here (not imported from dispatch.py) so this
+    module never pulls in dispatch.py's own import of
+    src.fraud_intel.alerts.queue, even transitively."""
+
+    source_alert_id: uuid.UUID
+    event: FraudEvent
+    source_alert: SourceAlertContext
+    context: FeatureComputationContext
+    resolved_fraud_evidence: tuple[ResolvedFraudEntityEvidence, ...]
 
 
 class CandidateShadowScore(BaseModel):
@@ -41,6 +75,73 @@ class CandidateShadowScore(BaseModel):
     event_timestamp: datetime
     candidate_priority_score: float = Field(ge=0, le=1)
     candidate_priority_band: PriorityBand
+
+
+class CandidateShadowScoringError(BaseModel):
+    """A safe, typed record of one alert's candidate re-scoring failure --
+    never the raw exception, never propagated out of score_candidate_shadow()
+    to abort the whole batch, and never written anywhere: the alert's
+    real, already-persisted OPERATIONAL alert/evidence is completely
+    untouched by this failure."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    source_alert_id: uuid.UUID
+    error_type: str
+    message: str
+
+
+def score_candidate_shadow(
+    scoring_inputs: Sequence[CandidateScoringInput],
+    *,
+    bundle: LoadedChannelBundle,
+    rule_provider: RuleProvider,
+    ensemble_policy: EnsemblePolicy,
+    graph_policy: GraphPolicy,
+    config_hash: Optional[str] = None,
+    git_sha: Optional[str] = None,
+) -> tuple[list[CandidateShadowScore], list[CandidateShadowScoringError]]:
+    """Scores every input through the PURE
+    src.fraud_intel.scoring.orchestrator.score_source_alert() path (never
+    src.fraud_intel.alerts.queue.score_and_record_alert()) against the
+    CANDIDATE `bundle`, entirely in memory -- no fraud_alerts/alert_evidence
+    row is ever created, no disposition is ever touched, and nothing here
+    can promote the candidate. A fresh score_execution_id is minted per
+    alert purely for score_source_alert()'s own audit-trail field; it is
+    never persisted by this function. One alert's scoring failure is
+    captured as a CandidateShadowScoringError and the batch continues --
+    the same "one bad alert must not block the rest" principle
+    src.fraud_intel.scoring.dispatch.score_channel() already applies to
+    real operational scoring."""
+    scores: list[CandidateShadowScore] = []
+    errors: list[CandidateShadowScoringError] = []
+    for item in scoring_inputs:
+        try:
+            scored = score_source_alert(
+                event=item.event,
+                source_alert=item.source_alert,
+                context=item.context,
+                bundle=bundle,
+                rule_provider=rule_provider,
+                ensemble_policy=ensemble_policy,
+                graph_policy=graph_policy,
+                resolved_fraud_evidence=item.resolved_fraud_evidence,
+                score_execution_id=uuid.uuid4(),
+                config_hash=config_hash,
+                git_sha=git_sha,
+            )
+            scores.append(
+                CandidateShadowScore(
+                    source_alert_id=item.source_alert_id, channel=item.event.channel, event_timestamp=item.event.event_timestamp,
+                    candidate_priority_score=scored.operational_priority_score, candidate_priority_band=scored.priority_band,
+                )
+            )
+        except Exception as exc:
+            safe_message = truncate_text(redact_credentials(str(exc)), MAX_SHADOW_ERROR_MESSAGE_LENGTH) or ""
+            errors.append(
+                CandidateShadowScoringError(source_alert_id=item.source_alert_id, error_type=type(exc).__name__, message=safe_message)
+            )
+    return scores, errors
 
 
 class ShadowCandidateComparisonResult(BaseModel):

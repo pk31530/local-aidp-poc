@@ -15,9 +15,10 @@ import psycopg2.extras
 from src.common.db import get_connection
 from src.fraud_intel.ensemble.policy import compute_operational_priority_score, load_ensemble_policy
 from src.fraud_intel.evaluation.cross_channel import AlertOutcome
-from src.fraud_intel.evaluation.shadow_candidate import CandidateShadowScore
+from src.fraud_intel.evaluation.shadow_candidate import CandidateScoringInput
 from src.fraud_intel.events.base import FraudEvent
 from src.fraud_intel.events.source_alert_context import SourceAlertContext, SyntheticGroundTruthLabel
+from src.fraud_intel.features.core import FeatureComputationContext
 from src.fraud_intel.generator.ach import generate_ach_events
 from src.fraud_intel.generator.atm import generate_atm_events
 from src.fraud_intel.generator.customers import generate_customers
@@ -213,47 +214,146 @@ def load_resolved_alert_outcomes(channel: str, database: str) -> list[AlertOutco
     return outcomes
 
 
-def load_candidate_shadow_scores(channel: str, candidate_bundle_id: int, database: str) -> list[CandidateShadowScore]:
-    """Real Postgres read for the OPTIONAL shadow-candidate comparison.
-    Reviewed as SQL, not exercised. Reads `alert_evidence` rows already
-    tagged with the CANDIDATE bundle's own channel_model_bundle_id --
-    those rows are only ever written by a real shadow-scoring pass
-    (Phase 7B+ scope, not built in this corrective pass): a candidate is
-    scored against ALREADY-EXISTING fraud_alerts rows and its evidence is
-    appended with the SAME alert_id and a NEW score_execution_id, exactly
-    like any other rescore (src.fraud_intel.alerts.queue), never a new
-    fraud_alerts row. Until that writer exists, this legitimately (and
-    correctly) returns an empty list -- src.fraud_intel.evaluation.
-    shadow_candidate handles an empty candidate population as
-    non_computable, not a crash."""
+_MAX_HISTORICAL_EVENTS_PER_ALERT = 1000
+_MAX_SOURCE_ALERT_HISTORY_PER_ALERT = 200
+_MAX_RESOLVED_FRAUD_EVIDENCE_ROWS = 500
+
+
+def load_resolved_alert_scoring_contexts(channel: str, database: str) -> list[CandidateScoringInput]:
+    """Real Postgres read backing the OPTIONAL shadow-candidate
+    comparison. Reviewed as SQL, not exercised. For every RESOLVED,
+    ELIGIBLE alert in `channel` (the same population
+    load_resolved_alert_outcomes() reads), reconstructs its full
+    event-time scoring context -- event, source_alert,
+    FeatureComputationContext (historical_events/source_alert_history),
+    resolved_fraud_evidence -- the exact same shape and query pattern
+    src.fraud_intel.scoring.dispatch._PostgresScoringDataAccess.list_pending()
+    already builds for PENDING alerts, here for ALREADY-resolved ones.
+
+    This function only READS. The candidate bundle is re-scored against
+    these contexts in memory, via src.fraud_intel.evaluation.
+    shadow_candidate.score_candidate_shadow() (the pure score_source_alert()
+    path) -- never persisted anywhere. There used to be a
+    load_candidate_shadow_scores() here that queried alert_evidence for a
+    channel_model_bundle_id tag no writer has ever produced; it has been
+    removed and replaced by this real, in-memory-scoring-oriented read."""
+    from src.fraud_intel.graph.entity_graph import ResolvedFraudEntityEvidence
+
+    payload_class = get_channel_adapter(channel).payload_class
     conn = get_connection(database)
     try:
         with conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
                     """
-                    SELECT fa.source_alert_id, fa.channel, ev.event_time, ev.operational_priority_score, ev.priority_band
-                    FROM alert_evidence ev
-                    JOIN fraud_alerts fa ON fa.alert_id = ev.alert_id
-                    WHERE ev.channel_model_bundle_id = %s AND fa.channel = %s
-                    ORDER BY fa.source_alert_id, ev.scored_at DESC, ev.evidence_id DESC
+                    SELECT fa.source_alert_id, fa.event_id, ce.channel AS ce_channel, ce.customer_id AS ce_customer_id,
+                           ce.account_id AS ce_account_id, ce.event_timestamp AS ce_event_timestamp,
+                           ce.amount_minor_units AS ce_amount_minor_units, ce.direction AS ce_direction,
+                           ce.device_id AS ce_device_id, ce.ip_address AS ce_ip_address,
+                           ce.channel_payload AS ce_channel_payload, ce.scenario_id AS ce_scenario_id,
+                           ce.schema_version AS ce_schema_version,
+                           sa.source_system, sa.source_alert_created_at, sa.source_rule_ids, sa.source_rule_version,
+                           sa.source_alert_score, sa.source_alert_reason_codes, sa.generation_run_id,
+                           sa.dataset_version, sa.created_at
+                    FROM fraud_alerts fa
+                    JOIN channel_events ce ON ce.event_id = fa.event_id
+                    JOIN source_alerts sa ON sa.source_system = fa.source_system AND sa.source_alert_id = fa.source_alert_id
+                    JOIN LATERAL (
+                        SELECT * FROM label_assessments WHERE alert_id = fa.alert_id
+                        ORDER BY evaluated_at DESC, assessment_id DESC LIMIT 1
+                    ) la ON true
+                    WHERE fa.channel = %s AND la.eligibility_result = true
+                      AND la.resolved_label IN ('RESOLVED_FRAUD', 'RESOLVED_LEGITIMATE')
                     """,
-                    (candidate_bundle_id, channel),
+                    (channel,),
                 )
-                rows = cur.fetchall()
+                alert_rows = cur.fetchall()
+
+                items: list[CandidateScoringInput] = []
+                for row in alert_rows:
+                    event = FraudEvent(
+                        event_id=row["event_id"], channel=row["ce_channel"], customer_id=row["ce_customer_id"],
+                        account_id=row["ce_account_id"], event_timestamp=row["ce_event_timestamp"],
+                        amount_minor_units=row["ce_amount_minor_units"], direction=row["ce_direction"],
+                        device_id=row["ce_device_id"], ip_address=row["ce_ip_address"], scenario_id=row["ce_scenario_id"],
+                        schema_version=row["ce_schema_version"], channel_payload=payload_class(**row["ce_channel_payload"]),
+                    )
+                    source_alert = SourceAlertContext(
+                        source_alert_id=row["source_alert_id"], source_system=row["source_system"],
+                        event_id=row["event_id"], source_alert_created_at=row["source_alert_created_at"],
+                        source_rule_ids=row["source_rule_ids"], source_rule_version=row["source_rule_version"],
+                        source_alert_score=row["source_alert_score"], source_alert_reason_codes=row["source_alert_reason_codes"],
+                        generation_run_id=row["generation_run_id"], dataset_version=row["dataset_version"],
+                        created_at=row["created_at"],
+                    )
+
+                    cur.execute(
+                        "SELECT * FROM channel_events WHERE customer_id = %s AND event_timestamp < %s "
+                        "ORDER BY event_timestamp DESC LIMIT %s",
+                        (event.customer_id, event.event_timestamp, _MAX_HISTORICAL_EVENTS_PER_ALERT),
+                    )
+                    historical_events = tuple(
+                        FraudEvent(
+                            event_id=h["event_id"], channel=h["channel"], customer_id=h["customer_id"],
+                            account_id=h["account_id"], event_timestamp=h["event_timestamp"],
+                            amount_minor_units=h["amount_minor_units"], direction=h["direction"],
+                            device_id=h["device_id"], ip_address=h["ip_address"], scenario_id=h["scenario_id"],
+                            schema_version=h["schema_version"],
+                            channel_payload=get_channel_adapter(h["channel"]).payload_class(**h["channel_payload"]),
+                        )
+                        for h in cur.fetchall()
+                    )
+
+                    cur.execute(
+                        "SELECT sa2.* FROM source_alerts sa2 JOIN channel_events ce2 ON ce2.event_id = sa2.event_id "
+                        "WHERE ce2.customer_id = %s AND sa2.source_alert_created_at < %s "
+                        "ORDER BY sa2.source_alert_created_at DESC LIMIT %s",
+                        (event.customer_id, event.event_timestamp, _MAX_SOURCE_ALERT_HISTORY_PER_ALERT),
+                    )
+                    source_alert_history = tuple(
+                        SourceAlertContext(
+                            source_alert_id=h["source_alert_id"], source_system=h["source_system"],
+                            event_id=h["event_id"], source_alert_created_at=h["source_alert_created_at"],
+                            source_rule_ids=h["source_rule_ids"], source_rule_version=h["source_rule_version"],
+                            source_alert_score=h["source_alert_score"], source_alert_reason_codes=h["source_alert_reason_codes"],
+                            generation_run_id=h["generation_run_id"], dataset_version=h["dataset_version"],
+                            created_at=h["created_at"],
+                        )
+                        for h in cur.fetchall()
+                    )
+
+                    context = FeatureComputationContext(
+                        current_event=event, historical_events=historical_events,
+                        source_alert_history=source_alert_history, as_of_time=event.event_timestamp,
+                    )
+
+                    cur.execute(
+                        "SELECT la.assessment_id, la.policy_version, la.basis_timestamp, la.resolved_label_source, "
+                        "fa2.customer_id, fa2.account_id FROM label_assessments la "
+                        "JOIN fraud_alerts fa2 ON fa2.alert_id = la.alert_id "
+                        "WHERE la.resolved_label = 'RESOLVED_FRAUD' AND la.eligibility_result = true "
+                        "AND la.basis_timestamp < %s ORDER BY la.evaluated_at DESC LIMIT %s",
+                        (event.event_timestamp, _MAX_RESOLVED_FRAUD_EVIDENCE_ROWS),
+                    )
+                    resolved_fraud_evidence: list[ResolvedFraudEntityEvidence] = []
+                    for fraud_row in cur.fetchall():
+                        common = dict(
+                            label_assessment_id=str(fraud_row["assessment_id"]), resolved_fraud_at=fraud_row["basis_timestamp"],
+                            eligibility_policy_version=fraud_row["policy_version"], label_source=fraud_row["resolved_label_source"],
+                        )
+                        resolved_fraud_evidence.append(
+                            ResolvedFraudEntityEvidence(entity_type="customer", entity_id=fraud_row["customer_id"], **common)
+                        )
+                        resolved_fraud_evidence.append(
+                            ResolvedFraudEntityEvidence(entity_type="account", entity_id=fraud_row["account_id"], **common)
+                        )
+
+                    items.append(
+                        CandidateScoringInput(
+                            source_alert_id=row["source_alert_id"], event=event, source_alert=source_alert,
+                            context=context, resolved_fraud_evidence=tuple(resolved_fraud_evidence),
+                        )
+                    )
     finally:
         conn.close()
-
-    seen: set = set()
-    scores = []
-    for row in rows:
-        if row["source_alert_id"] in seen:
-            continue  # keep only the latest (first, given the ORDER BY) shadow evidence per alert
-        seen.add(row["source_alert_id"])
-        scores.append(
-            CandidateShadowScore(
-                source_alert_id=row["source_alert_id"], channel=row["channel"], event_timestamp=row["event_time"],
-                candidate_priority_score=row["operational_priority_score"], candidate_priority_band=row["priority_band"],
-            )
-        )
-    return scores
+    return items

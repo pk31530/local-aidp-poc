@@ -365,8 +365,10 @@ def test_evaluate_returns_operational_and_baseline_sections_without_a_candidate(
 
 
 def test_evaluate_includes_shadow_candidate_comparison_when_requested(monkeypatch, capsys):
-    import uuid
-
+    """CLI-level test: mocks the real I/O boundaries (bundle lookup,
+    pinned-policy loading, artifact loading, population loading, and the
+    actual in-memory scoring call) and lets the CLI's own orchestration
+    and the real compare_operational_vs_candidate() run."""
     from src.fraud_intel.evaluation.shadow_candidate import CandidateShadowScore
 
     outcomes = _outcome_fixtures()
@@ -385,8 +387,19 @@ def test_evaluate_includes_shadow_candidate_comparison_when_requested(monkeypatc
             assert bundle_version == 3
             return candidate_bundle
 
+    class _FakeArtifactLoader:
+        def load(self, bundle_record):
+            return "fake-loaded-candidate-bundle"
+
+    def _fake_score_candidate_shadow(scoring_inputs, *, bundle, rule_provider, ensemble_policy, graph_policy, **kwargs):
+        assert bundle == "fake-loaded-candidate-bundle"
+        return candidate_scores, []
+
     monkeypatch.setattr("src.fraud_intel.cli_data_access.load_resolved_alert_outcomes", lambda channel, database: outcomes)
-    monkeypatch.setattr("src.fraud_intel.cli_data_access.load_candidate_shadow_scores", lambda channel, bundle_id, database: candidate_scores)
+    monkeypatch.setattr("src.fraud_intel.cli_data_access.load_resolved_alert_scoring_contexts", lambda channel, database: [])
+    monkeypatch.setattr("src.fraud_intel.scoring.dispatch.load_and_validate_pinned_policies", lambda bundle_record: (None, None, None))
+    monkeypatch.setattr("src.fraud_intel.scoring.dispatch.create_default_bundle_artifact_loader", lambda: _FakeArtifactLoader())
+    monkeypatch.setattr("src.fraud_intel.evaluation.shadow_candidate.score_candidate_shadow", _fake_score_candidate_shadow)
     monkeypatch.setattr(cli_main, "_get_operational_bundle", lambda channel, database: _bundle())
     monkeypatch.setattr(cli_main, "create_default_bundle_promotion_store", lambda database: _FakePromotionStore())
 
@@ -400,6 +413,45 @@ def test_evaluate_includes_shadow_candidate_comparison_when_requested(monkeypatc
     assert result["shadow_candidate_comparison"]["candidate_bundle_id"] == 5
     assert result["shadow_candidate_comparison"]["candidate_bundle_version"] == 3
     assert result["shadow_candidate_comparison"]["matched_source_alert_count"] == 4
+    assert result["candidate_scoring_errors"] == []
+
+
+def test_evaluate_surfaces_candidate_scoring_errors_without_failing_the_command(monkeypatch, capsys):
+    from src.fraud_intel.evaluation.shadow_candidate import CandidateShadowScoringError
+
+    outcomes = _outcome_fixtures()
+    candidate_bundle = _bundle(bundle_id=5, bundle_version=3)
+    scoring_error = CandidateShadowScoringError(source_alert_id=outcomes[0].source_alert_id, error_type="ValueError", message="simulated per-alert failure")
+
+    class _FakePromotionStore:
+        def get_bundle(self, channel, bundle_version):
+            return candidate_bundle
+
+    class _FakeArtifactLoader:
+        def load(self, bundle_record):
+            return "fake-loaded-candidate-bundle"
+
+    def _fake_score_candidate_shadow(scoring_inputs, *, bundle, rule_provider, ensemble_policy, graph_policy, **kwargs):
+        return [], [scoring_error]
+
+    monkeypatch.setattr("src.fraud_intel.cli_data_access.load_resolved_alert_outcomes", lambda channel, database: outcomes)
+    monkeypatch.setattr("src.fraud_intel.cli_data_access.load_resolved_alert_scoring_contexts", lambda channel, database: [])
+    monkeypatch.setattr("src.fraud_intel.scoring.dispatch.load_and_validate_pinned_policies", lambda bundle_record: (None, None, None))
+    monkeypatch.setattr("src.fraud_intel.scoring.dispatch.create_default_bundle_artifact_loader", lambda: _FakeArtifactLoader())
+    monkeypatch.setattr("src.fraud_intel.evaluation.shadow_candidate.score_candidate_shadow", _fake_score_candidate_shadow)
+    monkeypatch.setattr(cli_main, "_get_operational_bundle", lambda channel, database: _bundle())
+    monkeypatch.setattr(cli_main, "create_default_bundle_promotion_store", lambda database: _FakePromotionStore())
+
+    cli_main.main(
+        ["fraud-intel", "evaluate", "--channel", "online_banking", "--capacity-mode", "count", "--capacity-value", "2",
+         "--recall-target", "0.8", "--candidate-bundle-version", "3", "--database", "aidp_test", "--json"]
+    )
+
+    result = json.loads(capsys.readouterr().out)
+    assert len(result["candidate_scoring_errors"]) == 1
+    assert result["candidate_scoring_errors"][0]["error_type"] == "ValueError"
+    # zero candidate scores -> comparison still returns cleanly, non-computable rather than crashing
+    assert result["shadow_candidate_comparison"] is not None
 
 
 def test_evaluate_unknown_candidate_bundle_version_is_a_cli_user_error(monkeypatch, capsys):

@@ -181,7 +181,7 @@ def _graph_policy_stub() -> GraphPolicy:
 
 
 def _fake_policies(bundle_record):
-    """Stands in for dispatch._load_and_validate_pinned_policies -- tests
+    """Stands in for dispatch.load_and_validate_pinned_policies -- tests
     that want to exercise dispatch orchestration without depending on the
     real, currently-loaded YAML policy versions matching monkeypatch this
     in; tests that specifically want to exercise the mismatch check itself
@@ -193,7 +193,7 @@ def _fake_policies(bundle_record):
 
 
 def test_score_channel_end_to_end_with_one_pending_alert(monkeypatch):
-    monkeypatch.setattr("src.fraud_intel.scoring.dispatch._load_and_validate_pinned_policies", _fake_policies)
+    monkeypatch.setattr("src.fraud_intel.scoring.dispatch.load_and_validate_pinned_policies", _fake_policies)
     lifecycle, run_store = _lifecycle()
     alert_store = _FakeAlertQueueStore()
     item = _pending_item()
@@ -221,7 +221,7 @@ def test_score_channel_end_to_end_with_one_pending_alert(monkeypatch):
 
 
 def test_score_channel_with_no_pending_alerts_still_succeeds(monkeypatch):
-    monkeypatch.setattr("src.fraud_intel.scoring.dispatch._load_and_validate_pinned_policies", _fake_policies)
+    monkeypatch.setattr("src.fraud_intel.scoring.dispatch.load_and_validate_pinned_policies", _fake_policies)
     lifecycle, run_store = _lifecycle()
 
     result = score_channel(
@@ -256,7 +256,7 @@ def test_missing_operational_bundle_fails_the_run_and_reraises():
 def test_bundle_policy_mismatch_fails_the_run_and_reraises():
     lifecycle, run_store = _lifecycle()
     # rule_set_version deliberately stale relative to the real, currently
-    # loaded rules_online_banking.yaml -- _load_and_validate_pinned_policies
+    # loaded rules_online_banking.yaml -- load_and_validate_pinned_policies
     # runs for real here (no monkeypatch), same as
     # tests/unit/test_fraud_intel_promotion.py's unmocked policy-load tests.
     stale_bundle = _bundle_record(rule_set_version="v999-does-not-exist")
@@ -274,7 +274,7 @@ def test_bundle_policy_mismatch_fails_the_run_and_reraises():
 
 
 def test_artifact_loading_failure_fails_the_run_and_reraises(monkeypatch):
-    monkeypatch.setattr("src.fraud_intel.scoring.dispatch._load_and_validate_pinned_policies", _fake_policies)
+    monkeypatch.setattr("src.fraud_intel.scoring.dispatch.load_and_validate_pinned_policies", _fake_policies)
     lifecycle, run_store = _lifecycle()
 
     with pytest.raises(RuntimeError, match="simulated MLflow contact failure"):
@@ -293,7 +293,7 @@ def test_artifact_loading_failure_fails_the_run_and_reraises(monkeypatch):
 
 
 def test_one_alert_scoring_failure_is_counted_rejected_not_fatal(monkeypatch):
-    monkeypatch.setattr("src.fraud_intel.scoring.dispatch._load_and_validate_pinned_policies", _fake_policies)
+    monkeypatch.setattr("src.fraud_intel.scoring.dispatch.load_and_validate_pinned_policies", _fake_policies)
     lifecycle, run_store = _lifecycle()
 
     good_item = _pending_item()
