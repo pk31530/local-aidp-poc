@@ -1,0 +1,35 @@
+# Online/Mobile Banking channel rules (guide section 10) -- reference
+# channel. Fields reference the Phase 2 online-banking feature names
+# (src.fraud_intel.features.channels.online_banking).
+#
+# MANDATORY_REVIEW below is the approved composite: profile_change_then_
+# transfer_flag AND mfa_bypass_flag (== "mfa_used flag is false", per
+# OnlineBankingPayload.mfa_used_flag). A third originally-requested
+# condition, "recipient_is_new", is NOT implemented here: no such field
+# exists on OnlineBankingPayload or in the Phase 2 online-banking feature
+# output (that field name exists on P2PPayload instead, see
+# rules_p2p.yaml -- reused there as recipient_is_new_flag). Adding an
+# online-banking "new target account" feature would require extending
+# Phase 2's feature core, which is out of this phase's scope; flagged for
+# a future Phase 2 addition. The two-condition composite below is still a
+# genuine multi-factor signal, not a single weak signal.
+channel: online_banking
+rule_set_version: v1
+rules:
+  - id: ONLINE_BANKING_PROFILE_CHANGE_TRANSFER_MFA_BYPASS
+    category: MANDATORY_REVIEW
+    when:
+      - {field: profile_change_then_transfer_flag, op: is_true}
+      - {field: mfa_bypass_flag, op: is_true}
+    reason_code: ONLINE_BANKING_PROFILE_CHANGE_TRANSFER_MFA_BYPASS
+  - id: ONLINE_BANKING_NEW_DEVICE_HIGH_VALUE
+    category: SCORE_CONTRIBUTING
+    when:
+      - {field: new_device_high_value_combo_flag, op: is_true}
+    score_contribution: 0.15
+    reason_code: ONLINE_BANKING_NEW_DEVICE_HIGH_VALUE
+  - id: ONLINE_BANKING_HIGH_SESSION_VELOCITY
+    category: INFORMATIONAL
+    when:
+      - {field: session_velocity, op: gte, value: 3}
+    reason_code: ONLINE_BANKING_HIGH_SESSION_VELOCITY

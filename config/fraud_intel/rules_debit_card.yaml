@@ -1,0 +1,23 @@
+# Debit Card channel rules (guide section 10). Fields reference
+# DebitCardPayload's own fields and the shared Phase 2 feature names.
+channel: debit_card
+rule_set_version: v1
+rules:
+  - id: DEBIT_CARD_NOT_PRESENT_HIGH_VELOCITY
+    category: MANDATORY_REVIEW
+    when:
+      - {field: card_present_flag, op: is_false}
+      - {field: events_last_10m, op: gte, value: 3}
+    reason_code: DEBIT_CARD_NOT_PRESENT_HIGH_VELOCITY
+  - id: DEBIT_CARD_CROSS_BORDER_NEW_DEVICE
+    category: SCORE_CONTRIBUTING
+    when:
+      - {field: cross_border_flag, op: is_true}
+      - {field: is_new_device, op: is_true}
+    score_contribution: 0.15
+    reason_code: DEBIT_CARD_CROSS_BORDER_NEW_DEVICE
+  - id: DEBIT_CARD_NIGHT_TRANSACTION
+    category: INFORMATIONAL
+    when:
+      - {field: night_transaction_flag, op: is_true}
+    reason_code: DEBIT_CARD_NIGHT_TRANSACTION

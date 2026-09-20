@@ -1,0 +1,23 @@
+# Mobile Check Deposit channel rules (guide section 10). Fields reference
+# MobileDepositPayload's own (structured-placeholder-only, per guide
+# section 3/9/26) fields and the shared Phase 2 feature names.
+channel: mobile_deposit
+rule_set_version: v1
+rules:
+  - id: MOBILE_DEPOSIT_DUPLICATE_IMAGE_AND_CAR_LAR_MISMATCH
+    category: MANDATORY_REVIEW
+    when:
+      - {field: duplicate_image_hash_flag, op: is_true}
+      - {field: car_lar_mismatch_flag, op: is_true}
+    reason_code: MOBILE_DEPOSIT_DUPLICATE_IMAGE_AND_CAR_LAR_MISMATCH
+  - id: MOBILE_DEPOSIT_LOW_IMAGE_QUALITY
+    category: SCORE_CONTRIBUTING
+    when:
+      - {field: image_quality_score, op: lt, value: 0.6}
+    score_contribution: 0.1
+    reason_code: MOBILE_DEPOSIT_LOW_IMAGE_QUALITY
+  - id: MOBILE_DEPOSIT_SIGNATURE_NOT_VERIFIED
+    category: INFORMATIONAL
+    when:
+      - {field: signature_verification_flag, op: is_false}
+    reason_code: MOBILE_DEPOSIT_SIGNATURE_NOT_VERIFIED

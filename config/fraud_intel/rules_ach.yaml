@@ -1,0 +1,27 @@
+# ACH channel rules (guide section 10). Fields reference the ACHPayload's
+# own fields, the shared Phase 2 feature names (src.fraud_intel.features
+# .core.SHARED_FEATURE_COLUMNS), and current-event intrinsic fields
+# (amount_minor_units, channel, direction). Operators are restricted to
+# the fixed allowlist enforced by src.fraud_intel.rules.provider.
+channel: ach
+rule_set_version: v1
+rules:
+  - id: ACH_NEW_DEVICE_HIGH_AMOUNT_RAPID_VELOCITY
+    category: MANDATORY_REVIEW
+    when:
+      - {field: is_new_device, op: is_true}
+      - {field: amount_minor_units, op: gt, value: 500000}
+      - {field: events_last_1h, op: gte, value: 3}
+    reason_code: ACH_NEW_DEVICE_HIGH_AMOUNT_RAPID_VELOCITY
+  - id: ACH_NEW_DEVICE_HIGH_AMOUNT
+    category: SCORE_CONTRIBUTING
+    when:
+      - {field: is_new_device, op: is_true}
+      - {field: amount_minor_units, op: gt, value: 500000}
+    score_contribution: 0.15
+    reason_code: ACH_NEW_DEVICE_HIGH_AMOUNT
+  - id: ACH_NIGHT_TRANSACTION
+    category: INFORMATIONAL
+    when:
+      - {field: night_transaction_flag, op: is_true}
+    reason_code: ACH_NIGHT_TRANSACTION
