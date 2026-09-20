@@ -122,3 +122,90 @@ CREATE TABLE IF NOT EXISTS pipeline_runs (
 );
 CREATE INDEX IF NOT EXISTS idx_pipeline_runs_pipeline_name ON pipeline_runs (pipeline_name);
 CREATE INDEX IF NOT EXISTS idx_pipeline_runs_status ON pipeline_runs (status);
+
+-- ============================================================
+-- AiDP v1.3 fraud-intelligence: channel events, source alerts, synthetic
+-- labels, and channel model bundles (v1.3 Phase 1). See
+-- infrastructure/postgres/migrations/003_channel_events_and_labels.sql for
+-- the matching existing-install migration; the two must stay in agreement,
+-- same discipline as pipeline_runs above.
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS channel_events (
+    event_id            UUID PRIMARY KEY,
+    channel              TEXT NOT NULL CHECK (channel IN ('ach', 'wire', 'mobile_deposit', 'online_banking', 'atm', 'debit_card', 'p2p')),
+    customer_id           TEXT NOT NULL,
+    account_id            TEXT NOT NULL,
+    event_timestamp       TIMESTAMPTZ NOT NULL,
+    amount_minor_units    BIGINT NOT NULL CHECK (amount_minor_units > 0),
+    direction             TEXT NOT NULL CHECK (direction IN ('debit', 'credit')),
+    device_id             TEXT,
+    ip_address            TEXT,
+    channel_payload       JSONB NOT NULL,
+    scenario_id           TEXT,
+    schema_version        INT NOT NULL DEFAULT 1,
+    generation_run_id     TEXT,
+    dataset_version       TEXT,
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_channel_events_customer ON channel_events (customer_id);
+CREATE INDEX IF NOT EXISTS idx_channel_events_timestamp ON channel_events (event_timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_channel_events_generation_run ON channel_events (generation_run_id);
+
+-- One row per source alert (guide section 6). event_id is intentionally
+-- NOT unique here -- one event can have more than one source alert.
+CREATE TABLE IF NOT EXISTS source_alerts (
+    source_alert_id           UUID PRIMARY KEY,
+    source_system              TEXT NOT NULL,
+    event_id                   UUID NOT NULL REFERENCES channel_events (event_id),
+    source_alert_created_at    TIMESTAMPTZ NOT NULL,
+    source_rule_ids            JSONB NOT NULL DEFAULT '[]'::jsonb,
+    source_rule_version        TEXT NOT NULL,
+    source_alert_score         NUMERIC(7, 6),
+    source_alert_reason_codes  JSONB NOT NULL DEFAULT '[]'::jsonb,
+    generation_run_id          TEXT,
+    dataset_version             TEXT,
+    created_at                  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_source_alerts_event_id ON source_alerts (event_id);
+CREATE INDEX IF NOT EXISTS idx_source_alerts_generation_run ON source_alerts (generation_run_id);
+
+-- Ground truth from the synthetic generator only (guide section 6/8) --
+-- one row per event, never read by any scoring/feature code path.
+CREATE TABLE IF NOT EXISTS synthetic_event_labels (
+    event_id                  UUID PRIMARY KEY REFERENCES channel_events (event_id),
+    scenario_id                TEXT,
+    synthetic_scenario_label   BOOLEAN NOT NULL,
+    scenario_type               TEXT NOT NULL,
+    label_source                 TEXT NOT NULL DEFAULT 'SYNTHETIC_GENERATOR' CHECK (label_source = 'SYNTHETIC_GENERATOR'),
+    generation_run_id            TEXT,
+    dataset_version               TEXT,
+    generated_at                   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Channel model bundle registry (guide section 22). Not populated until
+-- Phase 4 -- its shape is defined now so later phases don't need a schema
+-- change. status widens to RETIRED alongside CANDIDATE/OPERATIONAL so a
+-- promoted bundle's predecessor can be demoted rather than deleted.
+CREATE TABLE IF NOT EXISTS channel_model_bundles (
+    bundle_id                       BIGSERIAL PRIMARY KEY,
+    channel                          TEXT NOT NULL CHECK (channel IN ('ach', 'wire', 'mobile_deposit', 'online_banking', 'atm', 'debit_card', 'p2p')),
+    bundle_version                   INT NOT NULL,
+    gbm_model_version                TEXT,
+    lr_model_version                 TEXT,
+    anomaly_model_version            TEXT,
+    preprocessing_artifact_version   TEXT,
+    feature_schema_version           TEXT,
+    training_run_id                  BIGINT,
+    dataset_version                  TEXT,
+    evaluation_report_ref            TEXT,
+    status                           TEXT NOT NULL DEFAULT 'CANDIDATE' CHECK (status IN ('CANDIDATE', 'OPERATIONAL', 'RETIRED')),
+    created_at                       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    promoted_at                      TIMESTAMPTZ,
+    promoted_by                      TEXT,
+    UNIQUE (channel, bundle_version)
+);
+-- Guide section 22: at most one OPERATIONAL bundle per channel, enforced
+-- at the database level, independent of application logic.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_one_operational_bundle_per_channel
+    ON channel_model_bundles (channel) WHERE status = 'OPERATIONAL';

@@ -33,7 +33,10 @@ NEW_COLUMNS = [
 def test_migration_file_exists_with_next_unused_number():
     migrations_dir = PROJECT_ROOT / "infrastructure" / "postgres" / "migrations"
     numbers = sorted(int(p.name[:3]) for p in migrations_dir.glob("*.sql"))
-    assert numbers == [1, 2]
+    # v1.3 Phase 1 adds migration 003 (channel_events/source_alerts/
+    # synthetic_event_labels/channel_model_bundles) -- this file otherwise
+    # covers migration 002 specifically and is unaffected by that addition.
+    assert numbers == [1, 2, 3]
 
 
 def test_every_new_column_appears_in_schema_sql():
