@@ -6,7 +6,7 @@ convention as tests/unit/test_cli.py.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import pytest
 
@@ -85,18 +85,48 @@ def test_generate_dispatches_to_generate_and_write(monkeypatch, capsys):
     captured = {}
 
     def _spy(*, channel, count, seed, database, reference_date):
-        captured.update(channel=channel, count=count, seed=seed, database=database)
-        return {"channel": channel, "count": count, "generation_run_id": "genrun-1", "dataset_version": "dsv-1"}
+        captured.update(channel=channel, count=count, seed=seed, database=database, reference_date=reference_date)
+        return {"channel": channel, "requested_count": count, "generation_run_id": "genrun-1", "dataset_version": "dsv-1"}
 
     monkeypatch.setattr(cli_main, "generate_and_write", _spy)
 
     cli_main.main(
-        ["fraud-intel", "generate", "--channel", "online_banking", "--count", "5", "--seed", "7", "--database", "aidp_test", "--json"]
+        ["fraud-intel", "generate", "--channel", "online_banking", "--count", "5", "--seed", "7",
+         "--reference-date", "2026-01-01", "--database", "aidp_test", "--json"]
     )
 
-    assert captured == {"channel": "online_banking", "count": 5, "seed": 7, "database": "aidp_test"}
+    assert captured == {
+        "channel": "online_banking", "count": 5, "seed": 7, "database": "aidp_test",
+        "reference_date": date(2026, 1, 1),
+    }
     result = json.loads(capsys.readouterr().out)
     assert result["generation_run_id"] == "genrun-1"
+
+
+def test_generate_reference_date_defaults_to_today_when_omitted(monkeypatch, capsys):
+    captured = {}
+
+    def _spy(*, channel, count, seed, database, reference_date):
+        captured["reference_date"] = reference_date
+        return {"channel": channel, "requested_count": count, "generation_run_id": "genrun-1", "dataset_version": "dsv-1"}
+
+    monkeypatch.setattr(cli_main, "generate_and_write", _spy)
+
+    cli_main.main(["fraud-intel", "generate", "--channel", "online_banking", "--count", "5", "--database", "aidp_test", "--json"])
+
+    assert captured["reference_date"] == date.today()
+
+
+def test_generate_invalid_reference_date_is_a_cli_user_error(capsys):
+    with pytest.raises(SystemExit) as exc_info:
+        cli_main.main(
+            ["fraud-intel", "generate", "--channel", "online_banking", "--count", "5",
+             "--reference-date", "not-a-date", "--database", "aidp_test", "--json"]
+        )
+    assert exc_info.value.code == 2
+    result = json.loads(capsys.readouterr().out)
+    assert result["error"] == "CLIUserError"
+    assert "--reference-date" in result["message"]
 
 
 def test_generate_value_error_is_a_cli_user_error(monkeypatch, capsys):
@@ -117,9 +147,10 @@ def test_generate_value_error_is_a_cli_user_error(monkeypatch, capsys):
 def test_train_loads_population_and_dispatches_to_train_channel_configured(monkeypatch, capsys):
     captured = {}
 
-    def _fake_load_population(channel, database):
+    def _fake_load_population(channel, database, *, generation_run_id):
         captured["channel"] = channel
         captured["database"] = database
+        captured["generation_run_id"] = generation_run_id
         return [], [], []
 
     def _fake_train_channel_configured(config, *, trigger_source, channel_events, source_alerts, synthetic_labels, bundle_store):
@@ -133,14 +164,59 @@ def test_train_loads_population_and_dispatches_to_train_channel_configured(monke
     monkeypatch.setattr("src.fraud_intel.models.training.train_channel_configured", _fake_train_channel_configured)
     monkeypatch.setattr(cli_main, "create_default_bundle_store", lambda database: fake_bundle_store)
 
-    cli_main.main(["fraud-intel", "train", "--channel", "online_banking", "--database", "aidp_test", "--json"])
+    cli_main.main(
+        ["fraud-intel", "train", "--channel", "online_banking", "--generation-run-id", "genrun-abc",
+         "--database", "aidp_test", "--json"]
+    )
 
     assert captured["channel"] == "online_banking"
     assert captured["database"] == "aidp_test"
+    assert captured["generation_run_id"] == "genrun-abc"
     assert captured["config"].channel == "online_banking"
     assert captured["trigger_source"] == "cli"
     result = json.loads(capsys.readouterr().out)
     assert result == {"bundle_id": 9, "status": "CANDIDATE"}
+
+
+def test_train_missing_generation_run_id_is_a_cli_user_error(monkeypatch, capsys):
+    """Training must never silently fall back to loading every row ever
+    generated for a channel -- --generation-run-id is required."""
+    monkeypatch.setattr("src.fraud_intel.cli_data_access.load_channel_population", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not be called")))
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_main.main(["fraud-intel", "train", "--channel", "online_banking", "--database", "aidp_test", "--json"])
+    assert exc_info.value.code == 2
+    result = json.loads(capsys.readouterr().out)
+    assert result["error"] == "CLIUserError"
+    assert "--generation-run-id" in result["message"]
+
+
+@pytest.mark.parametrize(
+    "exc_cls_path",
+    [
+        "src.fraud_intel.cli_data_access.UnknownGenerationRunError",
+        "src.fraud_intel.cli_data_access.GenerationRunChannelMismatchError",
+        "src.fraud_intel.cli_data_access.GenerationRunDatasetVersionError",
+    ],
+)
+def test_train_generation_run_domain_errors_are_cli_user_errors(monkeypatch, capsys, exc_cls_path):
+    import importlib
+
+    module_path, _, cls_name = exc_cls_path.rpartition(".")
+    exc_cls = getattr(importlib.import_module(module_path), cls_name)
+
+    def _raise(channel, database, *, generation_run_id):
+        raise exc_cls("simulated")
+
+    monkeypatch.setattr("src.fraud_intel.cli_data_access.load_channel_population", _raise)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_main.main(
+            ["fraud-intel", "train", "--channel", "online_banking", "--generation-run-id", "genrun-abc",
+             "--database", "aidp_test", "--json"]
+        )
+    assert exc_info.value.code == 2
+    assert json.loads(capsys.readouterr().out)["error"] == "CLIUserError"
 
 
 @pytest.mark.parametrize("channel", sorted({"ach", "wire", "mobile_deposit", "atm", "debit_card", "p2p"}))
@@ -148,7 +224,7 @@ def test_train_accepts_every_phase7a_registered_channel(monkeypatch, capsys, cha
     """Phase 7A: FRAUD_INTEL_IMPLEMENTED_CHANNELS is widened to all 7 --
     every non-reference channel now reaches the shared training path
     instead of being rejected by _require_implemented_channel."""
-    def _fake_load_population(channel, database):
+    def _fake_load_population(channel, database, *, generation_run_id):
         return [], [], []
 
     def _fake_train_channel_configured(config, *, trigger_source, channel_events, source_alerts, synthetic_labels, bundle_store):
@@ -158,7 +234,9 @@ def test_train_accepts_every_phase7a_registered_channel(monkeypatch, capsys, cha
     monkeypatch.setattr("src.fraud_intel.models.training.train_channel_configured", _fake_train_channel_configured)
     monkeypatch.setattr(cli_main, "create_default_bundle_store", lambda database: object())
 
-    cli_main.main(["fraud-intel", "train", "--channel", channel, "--database", "aidp_test", "--json"])
+    cli_main.main(
+        ["fraud-intel", "train", "--channel", channel, "--generation-run-id", "genrun-abc", "--database", "aidp_test", "--json"]
+    )
 
     result = json.loads(capsys.readouterr().out)
     assert result["channel"] == channel

@@ -6,6 +6,8 @@ monkeypatches these functions directly, same precedent as every other
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
 from datetime import date
 from typing import Any
@@ -40,77 +42,220 @@ _GENERATORS = {
     "p2p": generate_p2p_events,
 }
 
+# Bump only when a channel generator's own logic changes such that the
+# IDENTICAL (channel, count, seed, reference_date) inputs would now
+# produce different events -- this is folded into the generation identity
+# hash below specifically so that scenario, not the per-event payload
+# schema_version (src.fraud_intel.events.base.FraudEvent.schema_version,
+# which describes the payload shape, not the generator's own behavior)
+# also invalidates old identities.
+GENERATION_SPEC_VERSION = "v1"
+
+
+class GenerationIdentityConflictError(ValueError):
+    """The about-to-be-generated batch would silently collide, via
+    channel_events' own ON CONFLICT (event_id) DO NOTHING, with rows
+    already stored under a DIFFERENT generation_run_id -- e.g. the same
+    (channel, seed, count) regenerated with a different reference_date.
+    Event ids are deterministic per (seed, channel) alone (see
+    src.fraud_intel.generator._shared.channel_rng) and are NOT themselves
+    a function of reference_date, so this check exists precisely to catch
+    that case explicitly rather than letting it be silently discarded."""
+
+
+def _generation_identity(*, channel: str, count: int, seed: int, reference_date: date) -> tuple[str, str]:
+    """Deterministic generation_run_id/dataset_version, derived from the
+    complete generation specification (channel, count, seed,
+    reference_date, GENERATION_SPEC_VERSION) -- NOT a fresh uuid4() per
+    call. An exact retry (identical inputs) therefore always recomputes
+    the SAME identifiers as whatever is already stored, rather than
+    minting a new, never-actually-persisted "phantom" id while every
+    insert is silently skipped by ON CONFLICT DO NOTHING."""
+    canonical = json.dumps(
+        {
+            "channel": channel, "count": count, "seed": seed,
+            "reference_date": reference_date.isoformat(),
+            "generation_spec_version": GENERATION_SPEC_VERSION,
+        },
+        sort_keys=True, separators=(",", ":"),
+    )
+    spec_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+    return f"genrun-{spec_hash}", f"dsv-{spec_hash}"
+
 
 def generate_and_write(*, channel: str, count: int, seed: int, database: str, reference_date: date) -> dict[str, Any]:
     if channel not in _GENERATORS:
         raise ValueError(f"unknown channel {channel!r}")
-    generation_run_id = f"genrun-{uuid.uuid4()}"
-    dataset_version = f"dsv-{uuid.uuid4().hex[:16]}"
+
+    generation_run_id, dataset_version = _generation_identity(channel=channel, count=count, seed=seed, reference_date=reference_date)
     customers = generate_customers(n=max(count // 5, 1), seed=seed, reference_date=reference_date)
     results = _GENERATORS[channel](
         seed=seed, n=count, reference_date=reference_date, customers=customers,
         generation_run_id=generation_run_id, dataset_version=dataset_version,
     )
+    event_ids = [str(event.event_id) for event, _, _ in results]
+
     conn = get_connection(database)
     try:
         with conn:
-            with conn.cursor() as cur:
-                for event, source_alert, label in results:
-                    cur.execute(
-                        "INSERT INTO channel_events (event_id, channel, customer_id, account_id, event_timestamp, "
-                        "amount_minor_units, direction, device_id, ip_address, channel_payload, scenario_id, "
-                        "schema_version, generation_run_id, dataset_version) "
-                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (event_id) DO NOTHING",
-                        (
-                            str(event.event_id), event.channel, event.customer_id, event.account_id,
-                            event.event_timestamp, event.amount_minor_units, event.direction, event.device_id,
-                            event.ip_address, psycopg2.extras.Json(event.channel_payload.model_dump(mode="json")),
-                            event.scenario_id, event.schema_version, generation_run_id, dataset_version,
-                        ),
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as dict_cur:
+                existing_run_id_by_event: dict[str, str] = {}
+                if event_ids:
+                    dict_cur.execute(
+                        "SELECT event_id, generation_run_id FROM channel_events WHERE event_id = ANY(%s)",
+                        (event_ids,),
                     )
-                    if source_alert is not None:
+                    existing_run_id_by_event = {str(row["event_id"]): row["generation_run_id"] for row in dict_cur.fetchall()}
+
+                foreign = {
+                    eid: existing_run_id
+                    for eid, existing_run_id in existing_run_id_by_event.items()
+                    if existing_run_id != generation_run_id
+                }
+                if foreign:
+                    sample_event_id, sample_run_id = next(iter(foreign.items()))
+                    raise GenerationIdentityConflictError(
+                        f"generating channel={channel!r} seed={seed} count={count} "
+                        f"reference_date={reference_date.isoformat()!r} (generation_run_id={generation_run_id!r}) "
+                        f"would collide with {len(foreign)} event_id(s) already stored under a DIFFERENT "
+                        f"generation_run_id (e.g. event_id={sample_event_id!r} belongs to "
+                        f"generation_run_id={sample_run_id!r}). event_ids are deterministic per (seed, channel) "
+                        "alone, so the same (channel, seed, count) combination has already been generated with a "
+                        "different reference_date or generator version -- refusing to silently discard those rows. "
+                        "Use a different seed, or remove the conflicting generation_run_id's rows first."
+                    )
+
+                existing_event_count = len(existing_run_id_by_event)
+
+                with conn.cursor() as cur:
+                    for event, source_alert, label in results:
                         cur.execute(
-                            "INSERT INTO source_alerts (source_alert_id, source_system, event_id, "
-                            "source_alert_created_at, source_rule_ids, source_rule_version, source_alert_score, "
-                            "source_alert_reason_codes, generation_run_id, dataset_version) "
-                            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
-                            "ON CONFLICT (source_system, source_alert_id) DO NOTHING",
+                            "INSERT INTO channel_events (event_id, channel, customer_id, account_id, event_timestamp, "
+                            "amount_minor_units, direction, device_id, ip_address, channel_payload, scenario_id, "
+                            "schema_version, generation_run_id, dataset_version) "
+                            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (event_id) DO NOTHING",
                             (
-                                str(source_alert.source_alert_id), source_alert.source_system, str(event.event_id),
-                                source_alert.source_alert_created_at, psycopg2.extras.Json(source_alert.source_rule_ids),
-                                source_alert.source_rule_version, source_alert.source_alert_score,
-                                psycopg2.extras.Json(source_alert.source_alert_reason_codes),
-                                generation_run_id, dataset_version,
+                                str(event.event_id), event.channel, event.customer_id, event.account_id,
+                                event.event_timestamp, event.amount_minor_units, event.direction, event.device_id,
+                                event.ip_address, psycopg2.extras.Json(event.channel_payload.model_dump(mode="json")),
+                                event.scenario_id, event.schema_version, generation_run_id, dataset_version,
                             ),
                         )
-                    cur.execute(
-                        "INSERT INTO synthetic_event_labels (event_id, scenario_id, synthetic_scenario_label, "
-                        "scenario_type, generation_run_id, dataset_version) VALUES (%s,%s,%s,%s,%s,%s) "
-                        "ON CONFLICT (event_id) DO NOTHING",
-                        (
-                            str(event.event_id), label.scenario_id, label.synthetic_scenario_label,
-                            label.scenario_type, generation_run_id, dataset_version,
-                        ),
-                    )
+                        if source_alert is not None:
+                            cur.execute(
+                                "INSERT INTO source_alerts (source_alert_id, source_system, event_id, "
+                                "source_alert_created_at, source_rule_ids, source_rule_version, source_alert_score, "
+                                "source_alert_reason_codes, generation_run_id, dataset_version) "
+                                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                                "ON CONFLICT (source_system, source_alert_id) DO NOTHING",
+                                (
+                                    str(source_alert.source_alert_id), source_alert.source_system, str(event.event_id),
+                                    source_alert.source_alert_created_at, psycopg2.extras.Json(source_alert.source_rule_ids),
+                                    source_alert.source_rule_version, source_alert.source_alert_score,
+                                    psycopg2.extras.Json(source_alert.source_alert_reason_codes),
+                                    generation_run_id, dataset_version,
+                                ),
+                            )
+                        cur.execute(
+                            "INSERT INTO synthetic_event_labels (event_id, scenario_id, synthetic_scenario_label, "
+                            "scenario_type, generation_run_id, dataset_version) VALUES (%s,%s,%s,%s,%s,%s) "
+                            "ON CONFLICT (event_id) DO NOTHING",
+                            (
+                                str(event.event_id), label.scenario_id, label.synthetic_scenario_label,
+                                label.scenario_type, generation_run_id, dataset_version,
+                            ),
+                        )
     finally:
         conn.close()
-    return {"channel": channel, "count": len(results), "generation_run_id": generation_run_id, "dataset_version": dataset_version}
+
+    return {
+        "channel": channel,
+        "requested_count": count,
+        "inserted_event_count": len(results) - existing_event_count,
+        "existing_event_count": existing_event_count,
+        "source_alert_count": sum(1 for _, source_alert, _ in results if source_alert is not None),
+        "label_count": len(results),
+        "generation_run_id": generation_run_id,
+        "dataset_version": dataset_version,
+        "reference_date": reference_date.isoformat(),
+        "seed": seed,
+    }
+
+
+class UnknownGenerationRunError(ValueError):
+    """No channel_events row exists for this generation_run_id at all --
+    it was never generated (or a real writer failure left nothing
+    persisted), so there is structurally nothing to train on."""
+
+
+class GenerationRunChannelMismatchError(ValueError):
+    """generation_run_id exists, but for a DIFFERENT channel than
+    requested. Since generation_run_id is now a deterministic hash of
+    the full generation spec (src.fraud_intel.cli_data_access.
+    _generation_identity), including channel, this should never happen
+    for a run_id this codebase itself minted -- it indicates a copy-paste
+    error in the value passed on the command line."""
+
+
+class GenerationRunDatasetVersionError(ValueError):
+    """A generation_run_id row set spans more than one dataset_version
+    for the requested channel -- the generation-identity invariant
+    (exactly one dataset_version per generation_run_id) has been
+    violated, e.g. by a hand-edited row. Training must refuse rather
+    than silently pick one."""
 
 
 def load_channel_population(
-    channel: str, database: str,
+    channel: str, database: str, *, generation_run_id: str,
 ) -> tuple[list[FraudEvent], list[SourceAlertContext], list[SyntheticGroundTruthLabel]]:
     """Phase 7A: generalized from Phase 6's load_online_banking_population()
     -- the channel's own registered payload class (src.fraud_intel.registry)
     reconstructs channel_payload, so this one function serves all 7
     channels instead of one hardcoded to online_banking. get_channel_adapter()
-    itself is the channel-validity check."""
+    itself is the channel-validity check.
+
+    Phase 7B Stage 2 corrective pass: `generation_run_id` is now a
+    required keyword -- this function must NEVER silently load every row
+    ever generated for a channel; it loads exactly the one generation
+    run's population, and refuses (rather than training on an unintended
+    mix of runs) if that run_id is unknown, belongs to a different
+    channel, or spans more than one dataset_version for this channel."""
     payload_class = get_channel_adapter(channel).payload_class
     conn = get_connection(database)
     try:
         with conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute("SELECT * FROM channel_events WHERE channel = %s", (channel,))
+                cur.execute(
+                    "SELECT DISTINCT channel FROM channel_events WHERE generation_run_id = %s", (generation_run_id,)
+                )
+                existing_channels = {row["channel"] for row in cur.fetchall()}
+                if not existing_channels:
+                    raise UnknownGenerationRunError(
+                        f"no channel_events rows found for generation_run_id {generation_run_id!r} -- it was never "
+                        "generated, or generation itself failed and rolled back"
+                    )
+                if existing_channels != {channel}:
+                    raise GenerationRunChannelMismatchError(
+                        f"generation_run_id {generation_run_id!r} belongs to channel(s) {sorted(existing_channels)!r}, "
+                        f"not {channel!r}"
+                    )
+
+                cur.execute(
+                    "SELECT count(DISTINCT dataset_version) AS n FROM channel_events "
+                    "WHERE channel = %s AND generation_run_id = %s",
+                    (channel, generation_run_id),
+                )
+                dataset_version_count = cur.fetchone()["n"]
+                if dataset_version_count != 1:
+                    raise GenerationRunDatasetVersionError(
+                        f"generation_run_id {generation_run_id!r} has {dataset_version_count} distinct "
+                        f"dataset_version value(s) for channel {channel!r} -- expected exactly 1"
+                    )
+
+                cur.execute(
+                    "SELECT * FROM channel_events WHERE channel = %s AND generation_run_id = %s",
+                    (channel, generation_run_id),
+                )
                 events = [
                     FraudEvent(
                         event_id=row["event_id"], channel=row["channel"], customer_id=row["customer_id"],
@@ -123,6 +268,9 @@ def load_channel_population(
                 ]
                 event_ids = [str(e.event_id) for e in events]
                 if not event_ids:
+                    # Defensive -- the distinct-channel check above already
+                    # guarantees at least one row exists for this exact
+                    # (channel, generation_run_id) pair.
                     return [], [], []
 
                 cur.execute("SELECT * FROM source_alerts WHERE event_id = ANY(%s)", (event_ids,))

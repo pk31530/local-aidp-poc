@@ -163,9 +163,17 @@ def _require_implemented_channel(channel: str) -> None:
 
 def _handle_fraud_intel_generate(args: argparse.Namespace) -> dict:
     database = _require_database(args)
+    if args.reference_date is not None:
+        try:
+            reference_date = date.fromisoformat(args.reference_date)
+        except ValueError as exc:
+            raise CLIUserError(f"--reference-date must be an ISO YYYY-MM-DD date: {exc}") from exc
+    else:
+        reference_date = date.today()
+
     try:
         return generate_and_write(
-            channel=args.channel, count=args.count, seed=args.seed, database=database, reference_date=date.today()
+            channel=args.channel, count=args.count, seed=args.seed, database=database, reference_date=reference_date
         )
     except ValueError as exc:
         raise CLIUserError(str(exc)) from exc
@@ -174,11 +182,28 @@ def _handle_fraud_intel_generate(args: argparse.Namespace) -> dict:
 def _handle_fraud_intel_train(args: argparse.Namespace) -> dict:
     database = _require_database(args)
     _require_implemented_channel(args.channel)
-    from src.fraud_intel.cli_data_access import load_channel_population
+    if not args.generation_run_id:
+        raise CLIUserError(
+            "--generation-run-id is required for training -- training must never silently load every row ever "
+            "generated for a channel"
+        )
+
+    from src.fraud_intel.cli_data_access import (
+        GenerationRunChannelMismatchError,
+        GenerationRunDatasetVersionError,
+        UnknownGenerationRunError,
+        load_channel_population,
+    )
     from src.fraud_intel.config import ChannelTrainingRunConfig
     from src.fraud_intel.models.training import train_channel_configured
 
-    events, source_alerts, labels = load_channel_population(args.channel, database)
+    try:
+        events, source_alerts, labels = load_channel_population(
+            args.channel, database, generation_run_id=args.generation_run_id
+        )
+    except (UnknownGenerationRunError, GenerationRunChannelMismatchError, GenerationRunDatasetVersionError) as exc:
+        raise CLIUserError(str(exc)) from exc
+
     try:
         config = ChannelTrainingRunConfig(channel=args.channel)
     except ValidationError as exc:
@@ -639,12 +664,21 @@ def build_parser() -> argparse.ArgumentParser:
     fi_generate_p.add_argument("--channel", required=True, choices=sorted(FRAUD_INTEL_ALL_CHANNELS))
     fi_generate_p.add_argument("--count", type=int, required=True)
     fi_generate_p.add_argument("--seed", type=int, default=42)
+    fi_generate_p.add_argument(
+        "--reference-date", dest="reference_date", default=None,
+        help="ISO YYYY-MM-DD; omit to default to today (not reproducible across days)",
+    )
     fi_generate_p.set_defaults(handler=_handle_fraud_intel_generate)
 
     fi_train_p = fraud_intel_sub.add_parser(
         "train", parents=[json_parent, database_parent], help="train a candidate channel model bundle"
     )
     fi_train_p.add_argument("--channel", required=True, choices=sorted(FRAUD_INTEL_IMPLEMENTED_CHANNELS))
+    # Not argparse `required=True` -- validated inside the handler (after
+    # --database) so a missing value is a clean CLIUserError/JSON error,
+    # the same contract every other required-but-optionally-typed
+    # fraud-intel flag follows, not argparse's own unformatted usage exit.
+    fi_train_p.add_argument("--generation-run-id", dest="generation_run_id", default=None)
     fi_train_p.set_defaults(handler=_handle_fraud_intel_train)
 
     fi_score_p = fraud_intel_sub.add_parser(
