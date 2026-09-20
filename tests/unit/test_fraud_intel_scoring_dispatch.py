@@ -235,6 +235,32 @@ def test_score_channel_with_no_pending_alerts_still_succeeds(monkeypatch):
     assert run_store.get(result["run_id"]).status == "SUCCESS"
 
 
+def test_score_channel_creates_no_label_assessment():
+    """Phase 7B Stage 0: scoring must never silently create a training
+    label -- src.fraud_intel.labels.eligibility.assess_channel_labels is
+    the only path that ever appends a label_assessments row, and it is
+    only reachable via the separate, explicit
+    `aidp fraud-intel labels assess` command. AST-based (Phase 7A
+    convention, avoids docstring-substring false positives) over BOTH
+    score_channel (this module) and score_and_record_alert (the queue
+    write it delegates to) -- neither may call anything named
+    append_assessment or reference a label_assessments table/identifier."""
+    import ast
+    import inspect
+
+    from src.fraud_intel.alerts.queue import score_and_record_alert
+
+    for fn in (score_channel, score_and_record_alert):
+        tree = ast.parse(inspect.getsource(fn))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func = node.func
+                name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+                assert name != "append_assessment", f"{fn.__name__} must never call append_assessment"
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                assert "label_assessments" not in node.value, f"{fn.__name__} must never reference label_assessments"
+
+
 # ---- RunLifecycle failure + re-raise --------------------------------------------------
 
 

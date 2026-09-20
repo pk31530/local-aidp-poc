@@ -226,41 +226,79 @@ def _handle_fraud_intel_score(args: argparse.Namespace) -> dict:
         raise CLIUserError(str(exc)) from exc
 
 
-def _handle_fraud_intel_evaluate(args: argparse.Namespace) -> dict:
-    """Phase 7A corrective pass: the real evaluation code
-    (src.fraud_intel.evaluation.cross_channel/shadow_candidate), not the
-    Phase 6 placeholder marker. `--capacity-mode`/`--capacity-value`/
-    `--recall-target` are all required -- no implicit default anywhere
-    (Phase 7A decision 6). The OPERATIONAL bundle is resolved for real
-    (`_get_operational_bundle`, same as `model show`); `--candidate-
-    bundle-version` is optional and, when given, re-scores the exact same
-    resolved population against the CANDIDATE bundle IN MEMORY, via the
-    pure score_source_alert() path (src.fraud_intel.evaluation.
-    shadow_candidate.score_candidate_shadow()) -- never
-    score_and_record_alert(), never a fraud_alerts/alert_evidence write,
-    never a promotion. This command is single-channel by its own
-    `--channel` flag -- cross-channel aggregation (evaluate_cross_channel())
-    is a library capability this CLI surface does not (yet) expose as its
-    own flag."""
-    database = _require_database(args)
-    _require_implemented_channel(args.channel)
+def _evaluate_candidate_cold_start(args: argparse.Namespace, database: str) -> dict:
+    """No OPERATIONAL bundle exists yet for this channel -- there is
+    structurally no live scored population to evaluate against
+    (fraud_alerts/alert_evidence/label_assessments are only ever created
+    by a real scoring run, which itself requires an OPERATIONAL bundle).
+    Evaluates the CANDIDATE using its own immutable, already-written
+    training-time held-out test-split report instead -- real evidence,
+    never fabricated, but explicitly labeled as such (never implied to be
+    live operational evaluation). If the report is absent, malformed, or
+    does not match the bundle it is attached to, evaluation fails and
+    `promotion_gate_result` is never produced -- promotion remains
+    blocked (promote is a separate command requiring its own separate
+    approval regardless, but this function also never calls it)."""
+    from src.fraud_intel.evaluation.cold_start import ColdStartReportError, evaluate_cold_start_promotion_gate, load_and_validate_cold_start_report
 
-    from src.fraud_intel.cli_data_access import load_resolved_alert_outcomes
-    from src.fraud_intel.evaluation.capacity import CountCapacity, FractionCapacity
-    from src.fraud_intel.evaluation.cross_channel import evaluate_channel
-
+    promotion_store = create_default_bundle_promotion_store(database)
     try:
-        capacity = (
-            CountCapacity(value=args.capacity_value)
-            if args.capacity_mode == "count"
-            else FractionCapacity(value=args.capacity_value)
-        )
-    except ValidationError as exc:
+        candidate_bundle = promotion_store.get_bundle(args.channel, args.candidate_bundle_version)
+    except LookupError as exc:
         raise CLIUserError(str(exc)) from exc
 
-    bundle = _get_operational_bundle(args.channel, database)
-    if bundle is None:
-        raise CLIUserError(f"no OPERATIONAL bundle for channel {args.channel!r}")
+    try:
+        report = load_and_validate_cold_start_report(candidate_bundle)
+    except ColdStartReportError as exc:
+        raise CLIUserError(str(exc)) from exc
+
+    gate = evaluate_cold_start_promotion_gate(report)
+
+    return {
+        "channel": args.channel,
+        "evaluation_mode": "candidate_training_holdout",
+        "operational_bundle": None,
+        "operational_evaluation": None,
+        "candidate_bundle": {"bundle_id": candidate_bundle.bundle_id, "bundle_version": candidate_bundle.bundle_version},
+        "candidate_evaluation": {
+            "gbm_evaluation": report.gbm_evaluation,
+            "lr_shadow_evaluation": report.lr_shadow_evaluation,
+            "realized_split_fractions": report.realized_split_fractions,
+            "split_class_counts": report.split_class_counts,
+            "training_run_id": report.training_run_id,
+            "dataset_version": report.dataset_version,
+        },
+        "rules_only_baseline": {
+            "test_fraud_prevalence": gate["test_fraud_prevalence"],
+            "note": (
+                "Cold-start rules-only baseline is the held-out test split's own fraud prevalence -- no "
+                "live rules-only re-scoring is possible before any real scoring run exists for this "
+                "channel. A GBM pr_auc at or below this value indicates no ranking value over random "
+                "guessing."
+            ),
+        },
+        "shadow_candidate_comparison": None,
+        "candidate_scoring_errors": [],
+        "promotion_gate_result": gate,
+        "disclaimer": (
+            "Synthetic, held-out test-window evidence from the training run -- NOT live operational "
+            "evaluation. Do not interpret as proof of real-world (Citizens Bank) production accuracy."
+        ),
+    }
+
+
+def _evaluate_live(args: argparse.Namespace, database: str, operational_bundle, capacity) -> dict:
+    """An OPERATIONAL bundle exists -- evaluates the real, live,
+    source-alerted, RESOLVED population (src.fraud_intel.evaluation.
+    cross_channel), with an OPTIONAL shadow-candidate comparison when
+    `--candidate-bundle-version` is also given. Shadow comparison re-
+    scores the exact same resolved population against the CANDIDATE
+    bundle IN MEMORY, via the pure score_source_alert() path
+    (src.fraud_intel.evaluation.shadow_candidate.score_candidate_shadow())
+    -- never score_and_record_alert(), never a fraud_alerts/alert_evidence
+    write, never a promotion."""
+    from src.fraud_intel.cli_data_access import load_resolved_alert_outcomes
+    from src.fraud_intel.evaluation.cross_channel import evaluate_channel
 
     outcomes = load_resolved_alert_outcomes(args.channel, database)
     try:
@@ -273,11 +311,19 @@ def _handle_fraud_intel_evaluate(args: argparse.Namespace) -> dict:
 
     result: dict = {
         "channel": args.channel,
-        "operational_bundle": {"bundle_id": bundle.bundle_id, "bundle_version": bundle.bundle_version},
+        "evaluation_mode": "live_resolved_alerts",
+        "operational_bundle": {"bundle_id": operational_bundle.bundle_id, "bundle_version": operational_bundle.bundle_version},
         "operational_evaluation": operational_dump,
+        "candidate_bundle": None,
+        "candidate_evaluation": None,
         "rules_only_baseline": rules_only_baseline,
         "shadow_candidate_comparison": None,
         "candidate_scoring_errors": [],
+        "promotion_gate_result": None,
+        "disclaimer": (
+            "Live evaluation against real, scored, resolved alerts in this database -- still a local POC "
+            "demonstration, not Citizens Bank production or regulatory evidence."
+        ),
     }
 
     if args.candidate_bundle_version is not None:
@@ -294,6 +340,7 @@ def _handle_fraud_intel_evaluate(args: argparse.Namespace) -> dict:
             candidate_bundle = promotion_store.get_bundle(args.channel, args.candidate_bundle_version)
         except LookupError as exc:
             raise CLIUserError(str(exc)) from exc
+        result["candidate_bundle"] = {"bundle_id": candidate_bundle.bundle_id, "bundle_version": candidate_bundle.bundle_version}
 
         try:
             rule_provider, graph_policy, ensemble_policy = load_and_validate_pinned_policies(candidate_bundle)
@@ -310,7 +357,7 @@ def _handle_fraud_intel_evaluate(args: argparse.Namespace) -> dict:
         try:
             comparison = compare_operational_vs_candidate(
                 args.channel, outcomes, candidate_scores,
-                operational_bundle_id=bundle.bundle_id, operational_bundle_version=bundle.bundle_version,
+                operational_bundle_id=operational_bundle.bundle_id, operational_bundle_version=operational_bundle.bundle_version,
                 candidate_bundle_id=candidate_bundle.bundle_id, candidate_bundle_version=candidate_bundle.bundle_version,
                 capacity=capacity, recall_target=args.recall_target,
             )
@@ -320,6 +367,45 @@ def _handle_fraud_intel_evaluate(args: argparse.Namespace) -> dict:
         result["candidate_scoring_errors"] = [e.model_dump(mode="json") for e in candidate_errors]
 
     return result
+
+
+def _handle_fraud_intel_evaluate(args: argparse.Namespace) -> dict:
+    """Phase 7A corrective pass: two distinct, clearly-labeled evaluation
+    modes (`evaluation_mode` in the output) -- `candidate_training_holdout`
+    (cold start: no OPERATIONAL bundle exists yet, so a candidate is
+    evaluated from its own training-time held-out report instead) and
+    `live_resolved_alerts` (an OPERATIONAL bundle exists; a candidate, if
+    given, is additionally shadow-compared against it). `--capacity-mode`/
+    `--capacity-value`/`--recall-target` are all required regardless of
+    mode -- no implicit default anywhere (Phase 7A decision 6); the live
+    mode uses them directly, the cold-start mode ignores them (its gate
+    has no capacity/recall-target concept -- there is no live population
+    to rank)."""
+    database = _require_database(args)
+    _require_implemented_channel(args.channel)
+
+    from src.fraud_intel.evaluation.capacity import CountCapacity, FractionCapacity
+
+    try:
+        capacity = (
+            CountCapacity(value=args.capacity_value)
+            if args.capacity_mode == "count"
+            else FractionCapacity(value=args.capacity_value)
+        )
+    except ValidationError as exc:
+        raise CLIUserError(str(exc)) from exc
+
+    operational_bundle = _get_operational_bundle(args.channel, database)
+
+    if operational_bundle is None and args.candidate_bundle_version is None:
+        raise CLIUserError(
+            f"no OPERATIONAL bundle for channel {args.channel!r} and no --candidate-bundle-version given -- "
+            "nothing to evaluate"
+        )
+
+    if operational_bundle is None:
+        return _evaluate_candidate_cold_start(args, database)
+    return _evaluate_live(args, database, operational_bundle, capacity)
 
 
 class _MlflowModelVersionVerifier:
@@ -377,6 +463,33 @@ def _handle_fraud_intel_model_show(args: argparse.Namespace) -> dict:
     if bundle is None:
         raise CLIUserError(f"no OPERATIONAL bundle for channel {args.channel!r}")
     return bundle.model_dump(mode="json")
+
+
+def _handle_fraud_intel_labels_assess(args: argparse.Namespace) -> dict:
+    """Phase 7B Stage 0's explicit label-eligibility command -- scoring
+    (`_handle_fraud_intel_score`) must never silently create a
+    label_assessments row; this is the only command that does, and only
+    when explicitly invoked. Wires the real Postgres label-basis loader
+    (src.fraud_intel.cli_data_access.load_alert_label_bases) and the real
+    Postgres assessment store into
+    src.fraud_intel.labels.eligibility.assess_channel_labels(), which
+    owns the actual `label_eligibility` RunLifecycle run, the per-alert
+    assess_label() calls, and the append-only writes -- this handler adds
+    nothing of its own beyond requiring an explicit --database (via
+    `_require_database`, the same as every other fraud-intel command) and
+    an implemented channel."""
+    database = _require_database(args)
+    _require_implemented_channel(args.channel)
+
+    from src.fraud_intel.cli_data_access import load_alert_label_bases
+    from src.fraud_intel.labels.eligibility import assess_channel_labels, create_default_label_assessment_store
+
+    return assess_channel_labels(
+        channel=args.channel,
+        lifecycle=RunLifecycle(database),
+        load_label_bases=lambda channel: load_alert_label_bases(channel, database),
+        store=create_default_label_assessment_store(database),
+    )
 
 
 def _list_alerts(database: str, *, channel=None, status=None, priority_band=None):
@@ -575,6 +688,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     fi_model_show_p.add_argument("--channel", required=True, choices=sorted(FRAUD_INTEL_ALL_CHANNELS))
     fi_model_show_p.set_defaults(handler=_handle_fraud_intel_model_show)
+
+    fi_labels_p = fraud_intel_sub.add_parser("labels", help="v1.3 explicit label-eligibility commands")
+    fi_labels_sub = fi_labels_p.add_subparsers(dest="fraud_intel_labels_action", required=True)
+    fi_labels_assess_p = fi_labels_sub.add_parser(
+        "assess", parents=[json_parent, database_parent],
+        help="run the versioned label-eligibility policy over a channel's fraud_alerts and append label_assessments",
+    )
+    fi_labels_assess_p.add_argument("--channel", required=True, choices=sorted(FRAUD_INTEL_ALL_CHANNELS))
+    fi_labels_assess_p.set_defaults(handler=_handle_fraud_intel_labels_assess)
 
     alerts_p = top.add_parser("alerts", help="analyst alert review commands")
     alerts_sub = alerts_p.add_subparsers(dest="alerts_action", required=True)

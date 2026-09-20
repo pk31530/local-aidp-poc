@@ -19,6 +19,7 @@ from src.fraud_intel.evaluation.shadow_candidate import CandidateScoringInput
 from src.fraud_intel.events.base import FraudEvent
 from src.fraud_intel.events.source_alert_context import SourceAlertContext, SyntheticGroundTruthLabel
 from src.fraud_intel.features.core import FeatureComputationContext
+from src.fraud_intel.labels.eligibility import AlertLabelBasis, resolve_label_from_disposition
 from src.fraud_intel.generator.ach import generate_ach_events
 from src.fraud_intel.generator.atm import generate_atm_events
 from src.fraud_intel.generator.customers import generate_customers
@@ -357,3 +358,63 @@ def load_resolved_alert_scoring_contexts(channel: str, database: str) -> list[Ca
     finally:
         conn.close()
     return items
+
+
+def load_alert_label_bases(channel: str, database: str) -> list[AlertLabelBasis]:
+    """Real Postgres read backing `aidp fraud-intel labels assess`
+    (Phase 7B Stage 0). Reviewed as SQL, not exercised by any unit test --
+    every eligibility/CLI test supplies fixture AlertLabelBasis rows
+    directly. One row per fraud_alerts row in `channel`: its latest
+    analyst_dispositions row when one exists (ANALYST_DISPOSITION,
+    basis_timestamp = disposed_at -- the evidentiary basis, never
+    event_timestamp, per assess_label()'s own contract), else the
+    channel_event's own synthetic_event_labels row (SYNTHETIC_GENERATOR,
+    basis_timestamp = event_timestamp -- ground truth is known instantly
+    at generation time for synthetic data, so it matures immediately
+    through assess_label()'s SYNTHETIC_IMMEDIATE_MATURITY path)."""
+    conn = get_connection(database)
+    try:
+        with conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT fa.alert_id, ce.event_timestamp, sel.synthetic_scenario_label,
+                           ad.disposition_id, ad.disposition, ad.disposed_at
+                    FROM fraud_alerts fa
+                    JOIN channel_events ce ON ce.event_id = fa.event_id
+                    JOIN synthetic_event_labels sel ON sel.event_id = fa.event_id
+                    LEFT JOIN LATERAL (
+                        SELECT * FROM analyst_dispositions WHERE alert_id = fa.alert_id
+                        ORDER BY disposed_at DESC, disposition_id DESC LIMIT 1
+                    ) ad ON true
+                    WHERE fa.channel = %s
+                    """,
+                    (channel,),
+                )
+                rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    bases: list[AlertLabelBasis] = []
+    for row in rows:
+        if row["disposition_id"] is not None:
+            bases.append(
+                AlertLabelBasis(
+                    alert_id=row["alert_id"],
+                    label_source="ANALYST_DISPOSITION",
+                    basis_timestamp=row["disposed_at"],
+                    source_disposition_id=row["disposition_id"],
+                    resolved_label=resolve_label_from_disposition(row["disposition"]),
+                )
+            )
+        else:
+            bases.append(
+                AlertLabelBasis(
+                    alert_id=row["alert_id"],
+                    label_source="SYNTHETIC_GENERATOR",
+                    basis_timestamp=row["event_timestamp"],
+                    source_disposition_id=None,
+                    resolved_label="RESOLVED_FRAUD" if row["synthetic_scenario_label"] else "RESOLVED_LEGITIMATE",
+                )
+            )
+    return bases

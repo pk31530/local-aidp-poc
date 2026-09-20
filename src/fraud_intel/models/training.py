@@ -23,7 +23,15 @@ from typing import Any, Optional, Sequence
 import mlflow
 import polars as pl
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import confusion_matrix, f1_score, precision_score, recall_score, roc_auc_score
+from sklearn.metrics import (
+    average_precision_score,
+    brier_score_loss,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
 
 from src.common.config import get_settings
 from src.common.mlflow_setup import configure_mlflow
@@ -226,20 +234,33 @@ def _fit_anomaly(X_train, config: ChannelTrainingRunConfig, anomaly_artifact_ver
 
 def _evaluate(y_true, y_pred, y_proba) -> dict:
     """Same multi-metric shape as src.ml.train._evaluate -- accuracy is
-    computed but explicitly marked supplementary, never the headline."""
+    computed but explicitly marked supplementary, never the headline.
+    pr_auc/brier_score (Phase 7A corrective pass) are what the cold-start
+    promotion gate (src.fraud_intel.evaluation.cold_start) compares
+    against the test split's own fraud prevalence -- the same PR-AUC-vs-
+    prevalence check the live evaluation path already makes, computed
+    here from the SAME held-out test-split predictions."""
     tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
     fpr = fp / (fp + tn) if (fp + tn) > 0 else 0.0
     fnr = fn / (fn + tp) if (fn + tp) > 0 else 0.0
+    single_class = len(set(y_true)) < 2
     return {
         "precision": precision_score(y_true, y_pred, zero_division=0),
         "recall": recall_score(y_true, y_pred, zero_division=0),
         "f1": f1_score(y_true, y_pred, zero_division=0),
-        "roc_auc": roc_auc_score(y_true, y_proba) if len(set(y_true)) > 1 else float("nan"),
+        "roc_auc": roc_auc_score(y_true, y_proba) if not single_class else float("nan"),
+        "pr_auc": average_precision_score(y_true, y_proba) if not single_class else float("nan"),
+        "brier_score": brier_score_loss(y_true, y_proba),
         "false_positive_rate": fpr,
         "false_negative_rate": fnr,
         "accuracy": float(sum(int(p == t) for p, t in zip(y_pred, y_true)) / len(y_true)),  # supplementary only
         "confusion_matrix": {"tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp)},
     }
+
+
+def _class_counts(df: pl.DataFrame) -> dict[str, int]:
+    labels = df["label"].to_list()
+    return {"fraud": sum(1 for v in labels if v), "legitimate": sum(1 for v in labels if not v)}
 
 
 def _split_manifest_from(split_df: pl.DataFrame, all_ids: Sequence[str]) -> SplitManifest:
@@ -436,12 +457,33 @@ def train_channel_configured(
             # possible (src.fraud_intel.scoring.dispatch).
             mlflow.log_dict(anomaly_normalization.to_json_dict(), "anomaly_normalization.json")
 
+        # Phase 7A corrective pass: this report is the ONLY evidence source
+        # for a channel's cold-start (pre-first-scoring-run) promotion
+        # decision (src.fraud_intel.evaluation.cold_start) -- it now
+        # carries the bundle-identifying fields (channel/training_run_id/
+        # dataset_version/feature_schema_version/component versions) and
+        # per-split class counts needed to validate and gate on it,
+        # alongside the pre-existing metric summaries. gbm/lr_shadow now
+        # include their confusion_matrix too (previously stripped only for
+        # the unrelated mlflow.log_metric() call above, which cannot log a
+        # nested dict as a scalar metric).
         evaluation_report_ref = json.dumps(
             {
-                "gbm": {k: v for k, v in gbm_eval.items() if k != "confusion_matrix"},
-                "lr_shadow": {k: v for k, v in lr_eval.items() if k != "confusion_matrix"},
+                "channel": config.channel,
+                "training_run_id": run.run_id,
+                "dataset_version": dataset_version,
+                "feature_schema_version": adapter.feature_schema_version,
+                "gbm_model_version": str(gbm_model_version),
+                "lr_model_version": str(lr_model_version),
+                "anomaly_model_version": str(anomaly_model_version),
+                "preprocessing_artifact_version": preprocessor.preprocessing_artifact_version,
+                "gbm_evaluation": gbm_eval,
+                "lr_shadow_evaluation": lr_eval,
                 "eligibility_policy_version": PHASE4_INTERIM_ELIGIBILITY_POLICY_VERSION,
                 "realized_split_fractions": realized_fractions,
+                "split_class_counts": {
+                    "train": _class_counts(train_df), "calibration": _class_counts(calib_df), "test": _class_counts(test_df),
+                },
                 "gbm_mlflow_run_id": gbm_mlflow_run_id,
                 "lr_mlflow_run_id": lr_mlflow_run_id,
                 "anomaly_mlflow_run_id": anomaly_mlflow_run_id,

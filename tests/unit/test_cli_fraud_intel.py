@@ -63,6 +63,7 @@ def _bundle(**overrides) -> ChannelModelBundleRecord:
         ["fraud-intel", "evaluate", "--channel", "online_banking", "--capacity-mode", "count", "--capacity-value", "10", "--recall-target", "0.8", "--json"],
         ["fraud-intel", "promote", "--channel", "online_banking", "--bundle-version", "1", "--promoted-by", "a1", "--json"],
         ["fraud-intel", "model", "show", "--channel", "online_banking", "--json"],
+        ["fraud-intel", "labels", "assess", "--channel", "online_banking", "--json"],
         ["alerts", "list", "--json"],
         ["alerts", "show", "1", "--json"],
         ["alerts", "disposition", "1", "--analyst-id", "a1", "--disposition", "CONFIRMED_FRAUD", "--json"],
@@ -290,8 +291,11 @@ def test_no_phase7b_required_handler_raises_not_implemented_error():
         cli_main._handle_fraud_intel_train,
         cli_main._handle_fraud_intel_score,
         cli_main._handle_fraud_intel_evaluate,
+        cli_main._evaluate_candidate_cold_start,
+        cli_main._evaluate_live,
         cli_main._handle_fraud_intel_promote,
         cli_main._handle_fraud_intel_model_show,
+        cli_main._handle_fraud_intel_labels_assess,
     ):
         tree = ast.parse(inspect.getsource(handler))
         for node in ast.walk(tree):
@@ -315,8 +319,11 @@ def test_no_phase7b_required_handler_returns_a_phase_scope_placeholder_dict():
         cli_main._handle_fraud_intel_train,
         cli_main._handle_fraud_intel_score,
         cli_main._handle_fraud_intel_evaluate,
+        cli_main._evaluate_candidate_cold_start,
+        cli_main._evaluate_live,
         cli_main._handle_fraud_intel_promote,
         cli_main._handle_fraud_intel_model_show,
+        cli_main._handle_fraud_intel_labels_assess,
     ):
         tree = ast.parse(inspect.getsource(handler))
         for node in ast.walk(tree):
@@ -518,6 +525,152 @@ def test_evaluate_scope_marker_no_longer_present(monkeypatch, capsys):
     assert "reference_channel_phase6_only" not in out
 
 
+# ---- fraud-intel evaluate: Phase 7B Stage 0 cold-start / live modes -------------------
+
+
+def _cold_start_report_dict(bundle: ChannelModelBundleRecord, **overrides) -> dict:
+    report = dict(
+        channel=bundle.channel, training_run_id=bundle.training_run_id, dataset_version=bundle.dataset_version,
+        feature_schema_version=bundle.feature_schema_version, gbm_model_version=bundle.gbm_model_version,
+        lr_model_version=bundle.lr_model_version, anomaly_model_version=bundle.anomaly_model_version,
+        preprocessing_artifact_version=bundle.preprocessing_artifact_version,
+        gbm_evaluation={"precision": 0.9, "recall": 0.8, "pr_auc": 0.9, "roc_auc": 0.95, "brier_score": 0.05},
+        lr_shadow_evaluation={"precision": 0.7, "recall": 0.6, "pr_auc": 0.7, "roc_auc": 0.8, "brier_score": 0.1},
+        eligibility_policy_version="v1", realized_split_fractions={"train": 0.6, "calibration": 0.2, "test": 0.2},
+        split_class_counts={
+            "train": {"fraud": 10, "legitimate": 10}, "calibration": {"fraud": 10, "legitimate": 10},
+            "test": {"fraud": 10, "legitimate": 10},
+        },
+        gbm_mlflow_run_id="run-gbm-1", lr_mlflow_run_id="run-lr-1", anomaly_mlflow_run_id="run-anomaly-1",
+        anomaly_normalization={"method": "none"},
+    )
+    report.update(overrides)
+    return report
+
+
+def _cold_start_candidate_bundle(**overrides) -> ChannelModelBundleRecord:
+    base = dict(
+        bundle_id=9, channel="online_banking", bundle_version=4, status="CANDIDATE", created_at=T0,
+        gbm_model_version="gbm-9", lr_model_version="lr-9", anomaly_model_version="anomaly-9",
+        preprocessing_artifact_version="prep-9", feature_schema_version="fsv-9",
+        training_run_id=42, dataset_version="dsv-9",
+    )
+    base.update(overrides)
+    bundle = _bundle(**base)
+    import json as _json
+
+    return bundle.model_copy(update={"evaluation_report_ref": _json.dumps(_cold_start_report_dict(bundle))})
+
+
+def test_evaluate_candidate_only_cold_start_when_no_operational_bundle_exists(monkeypatch, capsys):
+    candidate_bundle = _cold_start_candidate_bundle()
+
+    class _FakePromotionStore:
+        def get_bundle(self, channel, bundle_version):
+            assert (channel, bundle_version) == ("online_banking", 4)
+            return candidate_bundle
+
+    monkeypatch.setattr(cli_main, "_get_operational_bundle", lambda channel, database: None)
+    monkeypatch.setattr(cli_main, "create_default_bundle_promotion_store", lambda database: _FakePromotionStore())
+
+    cli_main.main(
+        ["fraud-intel", "evaluate", "--channel", "online_banking", "--capacity-mode", "count", "--capacity-value", "2",
+         "--recall-target", "0.8", "--candidate-bundle-version", "4", "--database", "aidp_test", "--json"]
+    )
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["evaluation_mode"] == "candidate_training_holdout"
+    assert result["operational_bundle"] is None
+    assert result["shadow_candidate_comparison"] is None
+    assert result["candidate_bundle"] == {"bundle_id": 9, "bundle_version": 4}
+    assert result["candidate_evaluation"]["training_run_id"] == 42
+    assert result["rules_only_baseline"]["test_fraud_prevalence"] == 0.5
+    assert result["promotion_gate_result"]["passed"] is True
+    assert "NOT live operational evaluation" in result["disclaimer"]
+
+
+def test_evaluate_cold_start_report_bundle_mismatch_blocks_evaluation(monkeypatch, capsys):
+    """A tampered/stale evaluation_report_ref that disagrees with its own
+    bundle row must fail evaluation, never silently proceed -- promotion
+    stays blocked because no promotion_gate_result is ever produced."""
+    import json as _json
+
+    mismatched_bundle = _cold_start_candidate_bundle()
+    tampered_report = _cold_start_report_dict(mismatched_bundle, dataset_version="dsv-DIFFERENT")
+    mismatched_bundle = mismatched_bundle.model_copy(update={"evaluation_report_ref": _json.dumps(tampered_report)})
+
+    class _FakePromotionStore:
+        def get_bundle(self, channel, bundle_version):
+            return mismatched_bundle
+
+    monkeypatch.setattr(cli_main, "_get_operational_bundle", lambda channel, database: None)
+    monkeypatch.setattr(cli_main, "create_default_bundle_promotion_store", lambda database: _FakePromotionStore())
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_main.main(
+            ["fraud-intel", "evaluate", "--channel", "online_banking", "--capacity-mode", "count", "--capacity-value", "2",
+             "--recall-target", "0.8", "--candidate-bundle-version", "4", "--database", "aidp_test", "--json"]
+        )
+    assert exc_info.value.code == 2
+    assert json.loads(capsys.readouterr().out)["error"] == "CLIUserError"
+
+
+def test_evaluate_cold_start_missing_report_blocks_evaluation(monkeypatch, capsys):
+    candidate_bundle = _cold_start_candidate_bundle().model_copy(update={"evaluation_report_ref": None})
+
+    class _FakePromotionStore:
+        def get_bundle(self, channel, bundle_version):
+            return candidate_bundle
+
+    monkeypatch.setattr(cli_main, "_get_operational_bundle", lambda channel, database: None)
+    monkeypatch.setattr(cli_main, "create_default_bundle_promotion_store", lambda database: _FakePromotionStore())
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_main.main(
+            ["fraud-intel", "evaluate", "--channel", "online_banking", "--capacity-mode", "count", "--capacity-value", "2",
+             "--recall-target", "0.8", "--candidate-bundle-version", "4", "--database", "aidp_test", "--json"]
+        )
+    assert exc_info.value.code == 2
+    assert json.loads(capsys.readouterr().out)["error"] == "CLIUserError"
+
+
+def test_evaluate_candidate_cold_start_never_promotes():
+    """AST-based (Phase 7A convention, avoids docstring-substring false
+    positives): _evaluate_candidate_cold_start's own source never calls
+    anything named promote_bundle."""
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(cli_main._evaluate_candidate_cold_start))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+            assert name != "promote_bundle"
+
+
+def test_evaluate_live_mode_with_no_eligible_resolved_alerts_is_non_computable_not_a_crash(monkeypatch, capsys):
+    """Live evaluation's population is intrinsically gated on eligible,
+    RESOLVED label_assessments (load_resolved_alert_outcomes' own WHERE
+    clause) -- when none exist yet, evaluation still runs cleanly under
+    evaluation_mode=live_resolved_alerts rather than crashing or
+    fabricating a result."""
+    monkeypatch.setattr("src.fraud_intel.cli_data_access.load_resolved_alert_outcomes", lambda channel, database: [])
+    monkeypatch.setattr(cli_main, "_get_operational_bundle", lambda channel, database: _bundle())
+
+    cli_main.main(
+        ["fraud-intel", "evaluate", "--channel", "online_banking", "--capacity-mode", "count", "--capacity-value", "2",
+         "--recall-target", "0.8", "--database", "aidp_test", "--json"]
+    )
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["evaluation_mode"] == "live_resolved_alerts"
+    assert result["operational_evaluation"]["total_source_alerts"] == 0
+    assert result["candidate_bundle"] is None
+    assert result["candidate_evaluation"] is None
+    assert result["promotion_gate_result"] is None
+
+
 # ---- fraud-intel promote ---------------------------------------------------------------
 
 
@@ -583,6 +736,44 @@ def test_model_show_no_operational_bundle_is_a_cli_user_error(monkeypatch, capsy
         cli_main.main(["fraud-intel", "model", "show", "--channel", "online_banking", "--database", "aidp_test", "--json"])
     assert exc_info.value.code == 2
     assert json.loads(capsys.readouterr().out)["error"] == "CLIUserError"
+
+
+# ---- fraud-intel labels assess (Phase 7B Stage 0) --------------------------------------
+
+
+def test_labels_assess_dispatches_to_assess_channel_labels_with_an_explicit_database(monkeypatch, capsys):
+    captured = {}
+
+    def _fake_assess_channel_labels(*, channel, lifecycle, load_label_bases, store, **kwargs):
+        captured.update(channel=channel, lifecycle=lifecycle, load_label_bases=load_label_bases, store=store)
+        return {"channel": channel, "run_id": 1, "alerts_considered": 3, "assessments_appended": 3, "mature_count": 3, "immature_count": 0, "eligible_count": 2, "unresolved_count": 1}
+
+    fake_store = object()
+    monkeypatch.setattr("src.fraud_intel.labels.eligibility.assess_channel_labels", _fake_assess_channel_labels)
+    monkeypatch.setattr("src.fraud_intel.labels.eligibility.create_default_label_assessment_store", lambda database: fake_store)
+    monkeypatch.setattr("src.fraud_intel.cli_data_access.load_alert_label_bases", lambda channel, database: [])
+
+    cli_main.main(["fraud-intel", "labels", "assess", "--channel", "online_banking", "--database", "aidp_test", "--json"])
+
+    assert captured["channel"] == "online_banking"
+    assert captured["store"] is fake_store
+    result = json.loads(capsys.readouterr().out)
+    assert result == {"channel": "online_banking", "run_id": 1, "alerts_considered": 3, "assessments_appended": 3, "mature_count": 3, "immature_count": 0, "eligible_count": 2, "unresolved_count": 1}
+
+
+def test_labels_assess_never_trains_or_promotes():
+    """AST-based (Phase 7A convention): the handler's own source never
+    calls anything named train_channel_configured or promote_bundle."""
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(cli_main._handle_fraud_intel_labels_assess))
+    forbidden = {"train_channel_configured", "promote_bundle"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+            assert name not in forbidden, f"labels assess handler must never call {name}"
 
 
 # ---- alerts list: analyst-facing surface structurally excludes synthetic labels --------

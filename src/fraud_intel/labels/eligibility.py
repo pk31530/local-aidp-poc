@@ -7,11 +7,12 @@ module's own code -- every unit test supplies `_FakeLabelAssessmentStore`.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Any, Literal, Optional, Protocol
+from typing import Any, Callable, Literal, Optional, Protocol
 
 from pydantic import BaseModel, ConfigDict
 
 from src.common.db import get_connection
+from src.control_plane.runs import RunLifecycle
 import psycopg2.extras
 
 LABEL_ELIGIBILITY_POLICY_VERSION = "v1"
@@ -27,6 +28,23 @@ ANALYST_MATURITY_WINDOW_DAYS = 14
 
 LabelSource = Literal["SYNTHETIC_GENERATOR", "ANALYST_DISPOSITION", "EXTERNAL_CONFIRMATION"]
 ResolvedLabel = Literal["RESOLVED_FRAUD", "RESOLVED_LEGITIMATE", "UNRESOLVED"]
+
+
+class AlertLabelBasis(BaseModel):
+    """One fraud_alerts row's label basis, resolved by its data-access
+    loader (src.fraud_intel.cli_data_access.load_alert_label_bases) to
+    whichever evidentiary source actually exists for it -- the latest
+    analyst_dispositions row when one exists, else the channel_event's own
+    synthetic_event_labels row. Shaped as exactly assess_label()'s own
+    non-`now` keyword arguments, so a basis unpacks straight into it."""
+
+    model_config = ConfigDict(frozen=True)
+
+    alert_id: int
+    label_source: LabelSource
+    basis_timestamp: datetime
+    source_disposition_id: Optional[int]
+    resolved_label: Optional[ResolvedLabel]
 
 # CONFIRMED_FRAUD/CONFIRMED_LEGITIMATE resolve; NEEDS_MORE_INFO/ESCALATED
 # are intentionally absent here and therefore always resolve to UNRESOLVED
@@ -193,3 +211,72 @@ class _FakeLabelAssessmentStore:
         if not matching:
             return None
         return sorted(matching, key=lambda r: (r.evaluated_at, r.assessment_id), reverse=True)[0]
+
+
+# ---- explicit label-eligibility command orchestration (Phase 7B Stage 0) -----------------
+
+
+LoadAlertLabelBases = Callable[[str], list[AlertLabelBasis]]
+
+
+def assess_channel_labels(
+    *,
+    channel: str,
+    lifecycle: RunLifecycle,
+    load_label_bases: LoadAlertLabelBases,
+    store: LabelAssessmentStore,
+    now: Optional[datetime] = None,
+) -> dict[str, Any]:
+    """One `label_eligibility` pipeline run (guide sections 8/19; the
+    command this command is FOR is Stage 0's explicit
+    `aidp fraud-intel labels assess`, never scoring itself -- scoring
+    creates fraud_alerts/alert_evidence, never a label_assessments row).
+    Every re-run appends a NEW assessment per alert via
+    store.append_assessment() (assess_label() is pure, append-only,
+    never an update) -- so history is always preserved across repeated
+    runs. Never trains or promotes a model; a STRUCTURAL failure (the
+    label-basis load itself failing) aborts the whole run and is recorded
+    via fail_from_exception(), which always re-raises."""
+    run = lifecycle.begin("label_eligibility", trigger_source="cli")
+    effective_now = now if now is not None else datetime.now(timezone.utc)
+    try:
+        bases = load_label_bases(channel)
+        mature_count = 0
+        immature_count = 0
+        eligible_count = 0
+        unresolved_count = 0
+        for basis in bases:
+            result = assess_label(
+                alert_id=basis.alert_id,
+                label_source=basis.label_source,
+                basis_timestamp=basis.basis_timestamp,
+                source_disposition_id=basis.source_disposition_id,
+                resolved_label=basis.resolved_label,
+                now=effective_now,
+            )
+            record = store.append_assessment(**result)
+            if record.maturity_status == "MATURE":
+                mature_count += 1
+            else:
+                immature_count += 1
+            if record.eligibility_result:
+                eligible_count += 1
+            if record.resolved_label in (None, "UNRESOLVED"):
+                unresolved_count += 1
+    except Exception as exc:
+        lifecycle.fail_from_exception(run.run_id, exc)
+        raise
+
+    summary = {
+        "channel": channel,
+        "run_id": run.run_id,
+        "policy_version": LABEL_ELIGIBILITY_POLICY_VERSION,
+        "alerts_considered": len(bases),
+        "assessments_appended": len(bases),
+        "mature_count": mature_count,
+        "immature_count": immature_count,
+        "eligible_count": eligible_count,
+        "unresolved_count": unresolved_count,
+    }
+    lifecycle.succeed(run.run_id, records_processed=len(bases))
+    return summary

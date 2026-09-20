@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from src.control_plane.runs import RunLifecycle, RunRecord
 from src.fraud_intel.labels.eligibility import (
     ANALYST_MATURITY_WINDOW_DAYS,
     LABEL_ELIGIBILITY_POLICY_VERSION,
@@ -14,13 +15,54 @@ from src.fraud_intel.labels.eligibility import (
     MATURITY_WINDOW_ELAPSED,
     MATURITY_WINDOW_NOT_ELAPSED,
     SYNTHETIC_IMMEDIATE_MATURITY,
+    AlertLabelBasis,
     LabelAssessmentInputError,
     _FakeLabelAssessmentStore,
+    assess_channel_labels,
     assess_label,
     resolve_label_from_disposition,
 )
 
 T0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+
+class _FakeRunStore:
+    """Same in-memory contract as tests/unit/test_fraud_intel_scoring_dispatch.py's own fixture."""
+
+    def __init__(self):
+        self.rows: dict[int, dict] = {}
+        self._next_id = 1
+
+    def insert(self, row):
+        run_id = self._next_id
+        self._next_id += 1
+        full = {
+            "run_id": run_id, "trigger_source": None, "git_sha": None, "config_snapshot": None,
+            "config_hash": None, "dataset_version": None, "model_version": None, "error_type": None,
+            "error_message": None, "started_at": datetime.now(timezone.utc), "heartbeat_at": None,
+            "completed_at": None, **row,
+        }
+        self.rows[run_id] = full
+        return RunRecord(**full)
+
+    def compare_and_set(self, run_id, allowed_from, updates):
+        current = self.rows.get(run_id)
+        if current is None or current["status"] not in allowed_from:
+            return None
+        current.update(updates)
+        return RunRecord(**current)
+
+    def get(self, run_id):
+        row = self.rows.get(run_id)
+        return RunRecord(**row) if row else None
+
+    def list(self, *, pipeline_name=None, status=None, limit=50):
+        return [RunRecord(**r) for r in list(self.rows.values())[:limit]]
+
+
+def _lifecycle() -> tuple[RunLifecycle, _FakeRunStore]:
+    store = _FakeRunStore()
+    return RunLifecycle(store=store), store
 
 
 def test_policy_version_is_recorded_and_stable():
@@ -174,3 +216,91 @@ def test_get_latest_assessment_ignores_other_alerts():
     latest_for_1 = store.get_latest_assessment(1)
     assert latest_for_1.alert_id == 1
     assert latest_for_1.resolved_label == "RESOLVED_FRAUD"
+
+
+# ---- assess_channel_labels: explicit label-eligibility command orchestration (Phase 7B Stage 0) ---
+
+
+def _bases() -> list[AlertLabelBasis]:
+    return [
+        AlertLabelBasis(alert_id=1, label_source="SYNTHETIC_GENERATOR", basis_timestamp=T0, source_disposition_id=None, resolved_label="RESOLVED_FRAUD"),
+        AlertLabelBasis(alert_id=2, label_source="SYNTHETIC_GENERATOR", basis_timestamp=T0, source_disposition_id=None, resolved_label="RESOLVED_LEGITIMATE"),
+        AlertLabelBasis(alert_id=3, label_source="ANALYST_DISPOSITION", basis_timestamp=T0, source_disposition_id=7, resolved_label="UNRESOLVED"),
+    ]
+
+
+def test_assess_channel_labels_appends_through_its_own_lifecycle_run():
+    lifecycle, run_store = _lifecycle()
+    store = _FakeLabelAssessmentStore()
+
+    summary = assess_channel_labels(channel="online_banking", lifecycle=lifecycle, load_label_bases=lambda channel: _bases(), store=store, now=T0)
+
+    assert summary["channel"] == "online_banking"
+    assert summary["alerts_considered"] == 3
+    assert summary["assessments_appended"] == 3
+    assert len(store.rows) == 3
+    run = run_store.get(summary["run_id"])
+    assert run.pipeline_name == "label_eligibility"
+    assert run.status == "SUCCESS"
+
+
+def test_assess_channel_labels_counts_mature_immature_eligible_unresolved():
+    lifecycle, _ = _lifecycle()
+    store = _FakeLabelAssessmentStore()
+
+    summary = assess_channel_labels(channel="online_banking", lifecycle=lifecycle, load_label_bases=lambda channel: _bases(), store=store, now=T0)
+
+    # alert 1: synthetic, resolved fraud -> MATURE + eligible
+    # alert 2: synthetic, resolved legitimate -> MATURE + eligible
+    # alert 3: analyst-derived, basis_timestamp == now -> IMMATURE (window has not elapsed) + unresolved (resolved_label carried through as UNRESOLVED regardless of maturity)
+    assert summary["mature_count"] == 2
+    assert summary["immature_count"] == 1
+    assert summary["eligible_count"] == 2
+    assert summary["unresolved_count"] == 1
+
+
+def test_assess_channel_labels_repeated_runs_preserve_history():
+    lifecycle, _ = _lifecycle()
+    store = _FakeLabelAssessmentStore()
+
+    first = assess_channel_labels(channel="online_banking", lifecycle=lifecycle, load_label_bases=lambda channel: _bases(), store=store, now=T0)
+    second = assess_channel_labels(channel="online_banking", lifecycle=lifecycle, load_label_bases=lambda channel: _bases(), store=store, now=T0)
+
+    assert first["run_id"] != second["run_id"]
+    # every alert now has TWO assessment rows -- nothing was overwritten
+    assert len(store.rows) == 6
+    for alert_id in (1, 2, 3):
+        matching = [r for r in store.rows if r.alert_id == alert_id]
+        assert len(matching) == 2
+
+
+def test_assess_channel_labels_structural_load_failure_fails_the_run_and_reraises():
+    lifecycle, run_store = _lifecycle()
+    store = _FakeLabelAssessmentStore()
+
+    def _raising_loader(channel):
+        raise RuntimeError("simulated structural failure")
+
+    with pytest.raises(RuntimeError):
+        assess_channel_labels(channel="online_banking", lifecycle=lifecycle, load_label_bases=_raising_loader, store=store, now=T0)
+
+    assert len(store.rows) == 0
+    (run,) = run_store.rows.values()
+    assert run["status"] == "FAILED"
+
+
+def test_assess_channel_labels_never_trains_or_promotes():
+    """AST-based (Phase 7A convention): assess_channel_labels' own source
+    never calls anything named train_channel_configured or promote_bundle."""
+    import ast
+    import inspect
+
+    from src.fraud_intel.labels import eligibility as eligibility_module
+
+    tree = ast.parse(inspect.getsource(eligibility_module.assess_channel_labels))
+    forbidden = {"train_channel_configured", "promote_bundle"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+            assert name not in forbidden, f"assess_channel_labels must never call {name}"
