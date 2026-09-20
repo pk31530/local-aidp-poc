@@ -10,16 +10,19 @@ dashboard — with no cloud account and no paid services.
 
 ![Python](https://img.shields.io/badge/python-3.10+-blue)
 ![Docker Compose](https://img.shields.io/badge/docker--compose-required-blue)
-![Tests](https://img.shields.io/badge/tests-79%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/unit%20tests-passing-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
-**Status: complete, plus a v1.1 hardening pass.** All 10 build phases
-finished and runtime-verified — see `BUILD_LOG.md` for the full history
-(what was built, what broke, how it was fixed, and the exact verification
-commands run). A subsequent hardening pass found and fixed 5 correctness
+**Status: complete, plus v1.1 hardening and a v1.2 control-plane pass.** All
+10 build phases finished and runtime-verified — see `BUILD_LOG.md` for the
+full history (what was built, what broke, how it was fixed, and the exact
+verification commands run). A hardening pass found and fixed 5 correctness
 issues (schema-version validation, model-flavor-aware loading, pipeline
 failure recording, event-replay idempotency, and training/serving target
-leakage) — see `HARDENING_LOG.md`. `CHECKPOINT.md` has the current state.
+leakage) — see `HARDENING_LOG.md`. v1.2 added typed run configuration, a
+central run-lifecycle/provenance service, and a unified `aidp` CLI — see
+`ARCHITECTURE.md`'s "v1.2 control plane" section and `RUNBOOK.md` for the
+command reference. `CHECKPOINT.md` has the current state.
 
 ## What this demonstrates
 
@@ -96,6 +99,20 @@ Equivalent `make` targets are available: `bootstrap`, `start`, `stop`,
 `health`, `seed`, `train`, `demo`, `api`, `dashboard`, `consumer`, `test`,
 `reset`.
 
+A unified CLI (`./scripts/aidp.sh` or `python -m src.cli`) is also
+available as an alternative to the commands above — the legacy commands
+remain fully supported either way:
+
+```bash
+./scripts/aidp.sh config validate --json
+./scripts/aidp.sh pipeline run batch --json
+./scripts/aidp.sh train run --json
+./scripts/aidp.sh run list --limit 10 --json
+```
+
+See `RUNBOOK.md`'s "Unified CLI" section for the full command reference,
+output modes, and exit codes.
+
 Then walk through `DEMO_SCRIPT.md`, or see `RUNBOOK.md` for the full
 operational reference (stopping, resetting, resuming, running the real-time
 streaming demo, running tests).
@@ -116,30 +133,37 @@ All ports are bound to `127.0.0.1` only (not exposed on the network).
 
 ```
 src/
-  common/       config, db, storage, logging, retry, timeutil,
-                features.py (shared feature core), feature_store.py
-                (real-time adapter), scoring.py (shared scoring path)
-  generator/    synthetic customers, history, and live transaction stream
-  ingestion/    Redpanda consumer
-  processing/   raw -> clean -> enrich -> pipeline, risk lookups, views
-  ml/           training + MLflow registration
-  decisioning/  threshold + reason-code engine
-  api/          FastAPI app and schemas
-  dashboard/    Streamlit app
-tests/          unit, integration, smoke
-scripts/        bootstrap, health, seed, train, run-*, reset, start/stop
-infrastructure/ container and service configuration
-config/         application configuration
+  common/         config, db, storage, logging, retry, timeutil,
+                  features.py (shared feature core), feature_store.py
+                  (real-time adapter), scoring.py (shared scoring path)
+  control_plane/  v1.2: typed run configuration, run lifecycle/provenance
+  cli/            v1.2: unified `aidp` CLI (python -m src.cli)
+  generator/      synthetic customers, history, and live transaction stream
+  ingestion/      Redpanda consumer
+  processing/     raw -> clean -> enrich -> pipeline, risk lookups, views
+  ml/             training + MLflow registration
+  decisioning/    threshold + reason-code engine
+  api/            FastAPI app and schemas
+  dashboard/      Streamlit app
+tests/            unit, integration, smoke
+scripts/          bootstrap, health, seed, train, run-*, aidp, reset, start/stop
+infrastructure/   container and service configuration
+config/           application configuration
+.github/          CI workflow (unit tests only, no infrastructure)
 ```
 
 ## Tests
 
 ```bash
-pytest                    # 79 tests: unit + integration + smoke
+pytest tests/unit          # no infrastructure required — what CI runs
+pytest                     # everything: unit + integration + smoke
 ```
 
-Integration and smoke tests use an isolated database (`aidp_test`) and
-Redpanda topic (`transactions-test`) — never the demo data.
+`tests/unit` needs nothing beyond Python and the repo itself — every
+database/MLflow/Kafka call in it is a fake or monkeypatched spy. Integration
+and smoke tests use the full local Docker stack, and an isolated database
+(`aidp_test`) and Redpanda topic (`transactions-test`) — never the demo
+data. See `RUNBOOK.md` for the full breakdown and the CI workflow.
 
 ## Documentation
 
@@ -151,9 +175,10 @@ Redpanda topic (`transactions-test`) — never the demo data.
 | `TROUBLESHOOTING.md` | Real issues hit while building this, and their fixes |
 | `BUILD_LOG.md` | Full phase-by-phase build history with verification output |
 | `HARDENING_LOG.md` | The v1.1 post-completion hardening pass: 5 fixes, each with problem/fix/verification |
+| `AIDP_V1_2_CONTROL_PLANE_BUILD_GUIDE.md` | The v1.2 control-plane build plan: typed config, run lifecycle/provenance, unified CLI, CI |
 | `CHECKPOINT.md` | Current build state (for resuming a session) |
 
-## A note on data and credentials
+## A note on data, credentials, and scope
 
 All data in this project is **synthetic**, generated by `src/generator/`.
 No real transaction, customer, or payment data is used anywhere.
@@ -162,6 +187,15 @@ Credentials live in `.env`, which is git-ignored; `.env.example` is the
 template. The example values are local-development defaults for throwaway
 containers on `127.0.0.1` — they are not secrets and must not be reused
 outside this local POC.
+
+This is a local proof-of-concept for demonstrating architecture patterns —
+it makes no claim of regulatory approval or production readiness. Model
+promotion (registering a new version and aliasing it `champion`) is a
+manual, explicit action (`./scripts/train_model.sh` or `aidp train run`);
+there is no automatic promotion, drift detection, or approval workflow.
+Provenance redaction (see `ARCHITECTURE.md`) is a pattern-based
+defense-in-depth measure over a known set of sensitive-value shapes, not a
+guarantee that every possible secret is caught.
 
 ## License
 

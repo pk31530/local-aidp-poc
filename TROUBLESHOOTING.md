@@ -143,4 +143,93 @@ Then retry. This build already avoids the most common conflict (MLflow on
 Run `./scripts/healthcheck.sh` first. Integration/smoke tests need the
 full stack running (`./scripts/start.sh`) and a trained model
 (`./scripts/train_model.sh`) — they load the real registered model via
-MLflow, same as the API does.
+MLflow, same as the API does. `pytest tests/unit` never needs any of this.
+
+## v1.2 CLI and control-plane
+
+### `aidp` command fails with a validation error
+
+**Symptom**: `aidp pipeline run batch ...` (or `train run`/`stream run`)
+exits `2` with a message describing an invalid field, e.g. a negative
+`--duration`.
+
+**Cause**: the typed config (`BatchRunConfig`/`TrainingRunConfig`/
+`StreamRunConfig`) rejects the value before any workload runs —
+`StreamRunConfig.duration` requires a positive number, for example.
+
+**Fix**: correct the flag value. This is deliberate fail-fast behavior, not
+a bug — nothing is dispatched to the real pipeline/training/streaming code
+until the config validates.
+
+### `--json` output doesn't parse / looks contaminated with log lines
+
+**Symptom**: piping `aidp ... --json` into `jq`/`json.loads` fails because
+extra non-JSON text appears on stdout.
+
+**Cause**: something wrote to stdout instead of stderr during the command.
+`src/common/logging.py`'s `configure_logging()` sends both the
+standard-library logger and structlog's `PrintLogger` to stderr by default
+(`force=False`) — only the CLI itself calls `configure_logging("cli",
+force=True)` once at startup. If you see this, first confirm you're on a
+build that includes the v1.2 CLI logging fix; if you are, check whether a
+third-party library your change pulled in prints directly to stdout (not
+through the logger) rather than assuming the CLI itself regressed.
+
+**Fix**: `--json` mode always emits exactly one JSON object on stdout — if
+anything else appears there, treat it as a bug in whatever produced the
+extra output, not something to work around downstream.
+
+### `pipeline_runs` errors with "column ... does not exist" / "constraint ... does not exist"
+
+**Symptom**: any workload run (via the CLI or a legacy entry point) fails
+with a Postgres error naming a `pipeline_runs` column or constraint added
+in migration `002` (e.g. `trigger_source`, `config_snapshot`).
+
+**Cause**: this is an **existing** database that predates migration `002`
+and hasn't had it applied yet. A fresh install gets the current schema
+automatically; an existing one does not.
+
+**Fix**: apply `infrastructure/postgres/migrations/
+002_pipeline_run_provenance.sql` — see RUNBOOK.md's "Database migrations"
+section for the exact, `aidp_test`-first procedure. Never run
+`scripts/reset_demo.sh` to try to "fix" this — it clears data, not schema.
+
+### `aidp model show <alias>` fails — is it "not found" or is MLflow down?
+
+**Symptom**: `aidp model show champion --json` exits non-zero.
+
+**Cause and how to tell which**: exit code distinguishes the two cases.
+Exit `2` means MLflow's model registry specifically reported that the
+model or alias doesn't exist (detected via MLflow's structured
+`error_code` field, e.g. `INVALID_PARAMETER_VALUE` for a missing alias —
+never by matching message text) — check the alias name and that a model
+has actually been registered (`./scripts/train_model.sh` at least once).
+Exit `3` means something else went wrong reaching MLflow — a connection
+failure, an authentication failure, a server error — check
+`./scripts/healthcheck.sh` and that MLflow is actually up.
+
+### `git_sha` is `null` in a run record
+
+**Symptom**: `aidp run show <id>` shows `"git_sha": null`.
+
+**Cause**: this is a safe, deliberate fallback, not an error. `git rev-parse
+HEAD` either wasn't available (no `git` binary), timed out, or the working
+directory isn't a Git checkout at run time — `provenance.get_git_sha()`
+returns `None` in every one of those cases rather than failing the run.
+
+### A `stream run` / `run_consumer.sh` run stays `RUNNING` forever
+
+**Symptom**: `aidp run show <id>` (or `run list`) shows an old streaming run
+still in `RUNNING`, with no `completed_at`.
+
+**Cause**: a graceful stop — the `--duration` timer elapsing, or an
+operator's Ctrl+C — always records `SUCCESS` (see RUNBOOK.md). A run stuck
+in `RUNNING` means the process ended some other way that bypasses Python's
+exception handling entirely: a `SIGKILL`, a crash, or a power loss. This is
+current v1.2 behavior, not an ideal production guarantee — there is no
+stale-run recovery/reaping mechanism yet to detect and close out a run
+whose process no longer exists.
+
+**Fix**: there isn't an automated one yet. Treat a long-`RUNNING` row with
+no corresponding live process as evidence of an abrupt termination, not a
+live run.
