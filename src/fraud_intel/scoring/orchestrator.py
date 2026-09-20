@@ -43,9 +43,7 @@ from src.fraud_intel.ensemble.policy import (
     max_priority_band,
 )
 from src.fraud_intel.events.base import FraudEvent
-from src.fraud_intel.events.online_banking import OnlineBankingPayload
 from src.fraud_intel.events.source_alert_context import SourceAlertContext
-from src.fraud_intel.features.channels.online_banking import ONLINE_BANKING_FEATURE_COLUMNS, compute_online_banking_features
 from src.fraud_intel.features.core import FeatureComputationContext
 from src.fraud_intel.graph.entity_graph import (
     EntityKey,
@@ -54,6 +52,7 @@ from src.fraud_intel.graph.entity_graph import (
     beneficiary_fan_in_count,
     build_entity_graph,
     compute_graph_risk_score,
+    graph_counterparty_key,
     shared_device_across_distinct_customers_count,
     shortest_path_to_fraud_linked_entity,
     validate_resolved_fraud_evidence,
@@ -61,6 +60,7 @@ from src.fraud_intel.graph.entity_graph import (
 from src.fraud_intel.models.anomaly import AnomalyNormalization, score_anomaly
 from src.fraud_intel.models.preprocessing import ChannelPreprocessor
 from src.fraud_intel.reason_codes.builder import REASON_CODE_VERSION, ReasonCode, build_reason_codes
+from src.fraud_intel.registry import get_channel_adapter
 from src.fraud_intel.rules.provider import RuleEvaluationResult, RuleProvider
 
 GBM_SCORING_FAILED = "GBM_SCORING_FAILED"
@@ -193,8 +193,12 @@ def score_source_alert(
     config_hash: Optional[str] = None,
     git_sha: Optional[str] = None,
 ) -> ScoredAlert:
-    if event.channel != "online_banking":
-        raise ValueError(f"Phase 5 supports only the online_banking reference channel, got {event.channel!r}")
+    # Phase 7A: get_channel_adapter() itself is the channel-validity check
+    # -- event.channel is a closed 7-value Literal (FraudEvent's own
+    # Channel type) and every value is now registered, so this can only
+    # ever raise for a channel that was never registered at all, not for a
+    # legitimate channel this function merely used to special-case.
+    adapter = get_channel_adapter(event.channel)
     if context.current_event.event_id != event.event_id:
         raise ValueError("context.current_event must be the same event passed as `event`")
     if source_alert.event_id != event.event_id:
@@ -207,7 +211,7 @@ def score_source_alert(
         resolved_fraud_evidence, current_event_timestamp=event.event_timestamp
     )
 
-    features = compute_online_banking_features(context)
+    features = adapter.compute_features(context)
     rule_result = rule_provider.evaluate(event=event, source_alert=source_alert, features=features)
     mandatory_review_hit = any(
         rule_result.rule_categories.get(rule_id) == "MANDATORY_REVIEW" for rule_id in rule_result.fired_rule_ids
@@ -221,7 +225,7 @@ def score_source_alert(
     }
     degraded = rule_result.provider_status != "OK"
 
-    feature_row = {column: features[column] for column in ONLINE_BANKING_FEATURE_COLUMNS}
+    feature_row = {column: features[column] for column in adapter.feature_columns}
 
     gbm_probability: Optional[float] = None
     feature_contributions: list[tuple[str, float]] = []
@@ -229,7 +233,7 @@ def score_source_alert(
         X = bundle.preprocessor.transform([feature_row])
         gbm_probability = float(bundle.gbm_model.predict_proba(X)[0][1])
         component_statuses["gbm"] = ComponentStatus(status="OK")
-        feature_contributions = _gbm_feature_contributions(bundle.gbm_model, X, ONLINE_BANKING_FEATURE_COLUMNS)
+        feature_contributions = _gbm_feature_contributions(bundle.gbm_model, X, adapter.feature_columns)
     except Exception:
         component_statuses["gbm"] = ComponentStatus(status="ERROR", error_code=GBM_SCORING_FAILED)
         degraded = True
@@ -260,13 +264,18 @@ def score_source_alert(
     shortest_path: Optional[int] = None
     try:
         graph = build_entity_graph(
-            historical_events=context.historical_events, current_event_timestamp=event.event_timestamp, policy=graph_policy
+            historical_events=context.historical_events, current_event_timestamp=event.event_timestamp,
+            policy=graph_policy, entity_extractor=adapter.extract_entities,
         )
         customer_key: EntityKey = ("customer", event.customer_id)
         device_key: Optional[EntityKey] = ("device", event.device_id) if event.device_id else None
-        recipient_key: Optional[EntityKey] = None
-        if isinstance(event.channel_payload, OnlineBankingPayload) and event.channel_payload.target_account:
-            recipient_key = ("recipient", event.channel_payload.target_account)
+        # Phase 7A: generalizes what was online_banking's own hardcoded
+        # `isinstance(event.channel_payload, OnlineBankingPayload) and
+        # event.channel_payload.target_account` check -- every channel's
+        # own extract_entities() already knows which (if any) entity plays
+        # the counterparty role (recipient/beneficiary/card/atm/
+        # check_payee); ACH deliberately has none (Phase 7A decision 3).
+        recipient_key: Optional[EntityKey] = graph_counterparty_key(adapter.extract_entities(event))
 
         shared_device_count = shared_device_across_distinct_customers_count(graph, device_key) if device_key else 0
         fan_in_count = beneficiary_fan_in_count(graph, recipient_key) if recipient_key else 0

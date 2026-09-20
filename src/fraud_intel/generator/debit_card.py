@@ -63,6 +63,11 @@ def generate_debit_card_events(
             pos_entry_mode=str(rng.choice(POS_ENTRY_MODES)),
             card_present_flag=not is_fraud,
             cross_border_flag=is_hard_fp,
+            # Deterministic synthetic token, never a real PAN (Phase 7A
+            # additive correction) -- draws from a smaller range for a
+            # fraud scenario, simulating the same compromised card token
+            # being used across multiple card-not-present testing events.
+            card_token=f"CARDTOK{int(rng.integers(100, 999)) if is_fraud else int(rng.integers(100000, 999999))}",
         )
         event = FraudEvent(
             event_id=event_id,

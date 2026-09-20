@@ -18,10 +18,13 @@ from src.fraud_intel.models.training import (
     _build_supervised_population,
     _phase4_interim_training_eligible,
 )
+from src.fraud_intel.registry import get_channel_adapter
 
 CUSTOMER = "FIC1000"
 ACCOUNT = "FIA100000"
 T0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+_ONLINE_BANKING_ADAPTER = get_channel_adapter("online_banking")
 
 
 def _event(*, event_timestamp: datetime, event_id: uuid.UUID | None = None, channel: str = "online_banking") -> FraudEvent:
@@ -94,6 +97,7 @@ def test_population_includes_only_source_alerted_events():
     non_alerted_event = _event(event_timestamp=T0 - timedelta(hours=1))
 
     rows = _build_supervised_population(
+        adapter=_ONLINE_BANKING_ADAPTER,
         channel_events=[alerted_event, non_alerted_event],
         source_alerts=[_alert(event_id=alerted_event.event_id, created_at=alerted_event.event_timestamp)],
         synthetic_labels=[
@@ -114,6 +118,7 @@ def test_non_alerted_event_with_a_label_is_excluded_even_though_labeled():
     non_alerted_but_labeled_event = _event(event_timestamp=T0 - timedelta(hours=2))
 
     rows = _build_supervised_population(
+        adapter=_ONLINE_BANKING_ADAPTER,
         channel_events=[alerted_event, non_alerted_but_labeled_event],
         source_alerts=[_alert(event_id=alerted_event.event_id, created_at=alerted_event.event_timestamp)],
         synthetic_labels=[
@@ -133,7 +138,7 @@ def test_every_population_row_has_a_corresponding_source_alerts_entry():
     alerts = [_alert(event_id=e.event_id, created_at=e.event_timestamp) for e in alerted]
     labels = [_label(event_id=e.event_id, synthetic_scenario_label=(i % 2 == 0)) for i, e in enumerate(events)]
 
-    rows = _build_supervised_population(channel_events=events, source_alerts=alerts, synthetic_labels=labels)
+    rows = _build_supervised_population(adapter=_ONLINE_BANKING_ADAPTER, channel_events=events, source_alerts=alerts, synthetic_labels=labels)
 
     alerted_event_ids = {str(e.event_id) for e in alerted}
     assert {row["event_id"] for row in rows} == alerted_event_ids
@@ -142,6 +147,7 @@ def test_every_population_row_has_a_corresponding_source_alerts_entry():
 def test_event_missing_a_label_is_excluded_not_crashed():
     event = _event(event_timestamp=T0)
     rows = _build_supervised_population(
+        adapter=_ONLINE_BANKING_ADAPTER,
         channel_events=[event],
         source_alerts=[_alert(event_id=event.event_id, created_at=event.event_timestamp)],
         synthetic_labels=[],  # no label at all
@@ -166,6 +172,7 @@ def test_non_online_banking_events_are_excluded_in_phase_4():
         ),
     )
     rows = _build_supervised_population(
+        adapter=_ONLINE_BANKING_ADAPTER,
         channel_events=[ach_event],
         source_alerts=[_alert(event_id=ach_event.event_id, created_at=ach_event.event_timestamp)],
         synthetic_labels=[_label(event_id=ach_event.event_id, synthetic_scenario_label=True)],
@@ -181,6 +188,7 @@ def test_non_alerted_prior_events_feed_history_but_never_become_a_row():
     current = _event(event_timestamp=T0)
 
     rows = _build_supervised_population(
+        adapter=_ONLINE_BANKING_ADAPTER,
         channel_events=[prior_non_alerted, current],
         source_alerts=[_alert(event_id=current.event_id, created_at=current.event_timestamp)],
         synthetic_labels=[
@@ -204,6 +212,7 @@ def test_current_events_own_alert_never_counted_as_a_prior_alert_in_features():
     genuinely_prior_alert = _alert(event_id=genuinely_prior_alert_event.event_id, created_at=genuinely_prior_alert_event.event_timestamp)
 
     rows = _build_supervised_population(
+        adapter=_ONLINE_BANKING_ADAPTER,
         channel_events=[event, genuinely_prior_alert_event],
         source_alerts=[own_alert, genuinely_prior_alert],
         synthetic_labels=[
@@ -221,6 +230,7 @@ def test_current_events_own_alert_never_counted_as_a_prior_alert_in_features():
 def test_population_rows_carry_the_full_ordered_online_banking_feature_set():
     event = _event(event_timestamp=T0)
     rows = _build_supervised_population(
+        adapter=_ONLINE_BANKING_ADAPTER,
         channel_events=[event],
         source_alerts=[_alert(event_id=event.event_id, created_at=event.event_timestamp)],
         synthetic_labels=[_label(event_id=event.event_id, synthetic_scenario_label=True)],
@@ -235,6 +245,6 @@ def test_population_is_sorted_by_event_timestamp_then_event_id():
     alerts = [_alert(event_id=e.event_id, created_at=e.event_timestamp) for e in events]
     labels = [_label(event_id=e.event_id, synthetic_scenario_label=False) for e in events]
 
-    rows = _build_supervised_population(channel_events=events, source_alerts=alerts, synthetic_labels=labels)
+    rows = _build_supervised_population(adapter=_ONLINE_BANKING_ADAPTER, channel_events=events, source_alerts=alerts, synthetic_labels=labels)
     timestamps = [row["event_timestamp"] for row in rows]
     assert timestamps == sorted(timestamps)

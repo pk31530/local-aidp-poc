@@ -116,7 +116,8 @@ def test_generate_value_error_is_a_cli_user_error(monkeypatch, capsys):
 def test_train_loads_population_and_dispatches_to_train_channel_configured(monkeypatch, capsys):
     captured = {}
 
-    def _fake_load_population(database):
+    def _fake_load_population(channel, database):
+        captured["channel"] = channel
         captured["database"] = database
         return [], [], []
 
@@ -127,17 +128,39 @@ def test_train_loads_population_and_dispatches_to_train_channel_configured(monke
 
     fake_bundle_store = object()
 
-    monkeypatch.setattr("src.fraud_intel.cli_data_access.load_online_banking_population", _fake_load_population)
+    monkeypatch.setattr("src.fraud_intel.cli_data_access.load_channel_population", _fake_load_population)
     monkeypatch.setattr("src.fraud_intel.models.training.train_channel_configured", _fake_train_channel_configured)
     monkeypatch.setattr(cli_main, "create_default_bundle_store", lambda database: fake_bundle_store)
 
     cli_main.main(["fraud-intel", "train", "--channel", "online_banking", "--database", "aidp_test", "--json"])
 
+    assert captured["channel"] == "online_banking"
     assert captured["database"] == "aidp_test"
     assert captured["config"].channel == "online_banking"
     assert captured["trigger_source"] == "cli"
     result = json.loads(capsys.readouterr().out)
     assert result == {"bundle_id": 9, "status": "CANDIDATE"}
+
+
+@pytest.mark.parametrize("channel", sorted({"ach", "wire", "mobile_deposit", "atm", "debit_card", "p2p"}))
+def test_train_accepts_every_phase7a_registered_channel(monkeypatch, capsys, channel):
+    """Phase 7A: FRAUD_INTEL_IMPLEMENTED_CHANNELS is widened to all 7 --
+    every non-reference channel now reaches the shared training path
+    instead of being rejected by _require_implemented_channel."""
+    def _fake_load_population(channel, database):
+        return [], [], []
+
+    def _fake_train_channel_configured(config, *, trigger_source, channel_events, source_alerts, synthetic_labels, bundle_store):
+        return {"bundle_id": 9, "status": "CANDIDATE", "channel": config.channel}
+
+    monkeypatch.setattr("src.fraud_intel.cli_data_access.load_channel_population", _fake_load_population)
+    monkeypatch.setattr("src.fraud_intel.models.training.train_channel_configured", _fake_train_channel_configured)
+    monkeypatch.setattr(cli_main, "create_default_bundle_store", lambda database: object())
+
+    cli_main.main(["fraud-intel", "train", "--channel", channel, "--database", "aidp_test", "--json"])
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["channel"] == channel
 
 
 # ---- fraud-intel score: real reference-channel dispatch (Phase 6 corrective pass) -----
@@ -172,13 +195,34 @@ def test_score_dispatches_to_score_channel(monkeypatch, capsys):
     assert result == {"run_id": 1, "channel": "online_banking", "bundle_id": 2, "bundle_version": 1, "records_processed": 3, "records_rejected": 0, "alerts": []}
 
 
-def test_score_unsupported_channel_is_a_cli_user_error(capsys):
-    with pytest.raises(SystemExit) as exc_info:
-        cli_main.main(["fraud-intel", "score", "--channel", "wire", "--database", "aidp_test", "--json"])
-    assert exc_info.value.code == 2
+def test_score_accepts_a_non_reference_channel_now_that_all_seven_are_registered(monkeypatch, capsys):
+    """Phase 7A: 'wire' used to be rejected by _require_implemented_channel
+    (Phase 6 corrective pass, reference channel only) -- FRAUD_INTEL_IMPLEMENTED_CHANNELS
+    is now widened to all 7 registered channels, so this reaches score_channel()."""
+    def _fake_score_channel(*, channel, **kwargs):
+        return {"run_id": 1, "channel": channel, "bundle_id": 1, "bundle_version": 1, "records_processed": 0, "records_rejected": 0, "alerts": []}
+
+    monkeypatch.setattr("src.fraud_intel.scoring.dispatch.score_channel", _fake_score_channel)
+    monkeypatch.setattr("src.fraud_intel.scoring.dispatch.create_default_scoring_data_access", lambda database: object())
+    monkeypatch.setattr("src.fraud_intel.scoring.dispatch.create_default_bundle_artifact_loader", lambda: object())
+    monkeypatch.setattr(cli_main, "create_default_alert_queue_store", lambda database: object())
+    monkeypatch.setattr(cli_main, "_get_operational_bundle", lambda channel, database: _bundle())
+
+    cli_main.main(["fraud-intel", "score", "--channel", "wire", "--database", "aidp_test", "--json"])
+
     result = json.loads(capsys.readouterr().out)
-    assert result["error"] == "CLIUserError"
-    assert "Phase 7A" in result["message"]
+    assert result["channel"] == "wire"
+
+
+def test_score_unregistered_channel_name_is_rejected_at_the_argparse_level(capsys):
+    """A genuinely unsupported/unknown channel name (not one of the 7
+    registered channels at all) still fails cleanly -- argparse's own
+    --channel choices reject it before any handler runs, same as every
+    other fixed-choice CLI argument in this codebase (--status,
+    --priority-band, ...)."""
+    with pytest.raises(SystemExit) as exc_info:
+        cli_main.main(["fraud-intel", "score", "--channel", "not_a_real_channel", "--database", "aidp_test", "--json"])
+    assert exc_info.value.code == 2
 
 
 @pytest.mark.parametrize("exc_cls_path", [

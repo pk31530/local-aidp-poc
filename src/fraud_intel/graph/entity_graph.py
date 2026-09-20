@@ -17,7 +17,7 @@ from __future__ import annotations
 import functools
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Literal, Optional, Sequence
+from typing import Callable, Literal, Optional, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 import yaml
@@ -34,6 +34,26 @@ EntityType = Literal[
 EntityKey = tuple[str, str]  # (entity_type, entity_id)
 
 GRAPH_HISTORY_TRUNCATED_REASON_CODE = "GRAPH_HISTORY_TRUNCATED"
+
+# The "other side of the transaction" entity types (Phase 7A) -- used by
+# graph_counterparty_key() to pick, generically across every channel, the
+# ONE entity that plays the role src.fraud_intel.scoring.orchestrator
+# previously hardcoded as online_banking's own "recipient_key" (fed to
+# compute_graph_risk_score()'s fan-in signal). "customer"/"account"/
+# "device"/"ip_address" are never counterparty entities -- they identify
+# the ACTOR, not the other party.
+COUNTERPARTY_ENTITY_TYPES: frozenset[str] = frozenset({"beneficiary", "recipient", "card", "atm", "check_payee"})
+
+
+def graph_counterparty_key(entities: Sequence[EntityKey]) -> Optional[EntityKey]:
+    """The first counterparty-typed entity in `entities` (an adapter's own
+    extract_entities() output), or None if the event has no counterparty
+    entity at all -- e.g. ACH, whose routing numbers/company_id are
+    deliberately NOT graph nodes (Phase 7A decision 3)."""
+    for entity in entities:
+        if entity[0] in COUNTERPARTY_ENTITY_TYPES:
+            return entity
+    return None
 
 
 def _reject_naive_or_non_utc(value: datetime) -> datetime:
@@ -115,6 +135,13 @@ class GraphPolicy(BaseModel):
     max_nodes: int = Field(gt=0)
     max_edges: int = Field(gt=0)
 
+    # Phase 7A decision 4 (applied consistently to graph policy alongside
+    # ensemble policy, since graph weights are equally untuned defaults for
+    # every new channel): optional so online_banking's existing policy file
+    # -- which predates these fields -- stays valid unchanged.
+    calibration_status: Optional[str] = None
+    promotion_note: Optional[str] = None
+
     @model_validator(mode="after")
     def _weights_bounded(self) -> "GraphPolicy":
         total = self.shared_device_weight + self.fan_in_weight + self.fan_out_weight + self.shortest_path_weight
@@ -153,10 +180,14 @@ class EntityGraph(BaseModel):
     edge_count: int
 
 
-def _extract_entities(event: FraudEvent) -> list[EntityKey]:
-    """Reference-channel (online_banking) entity extraction. Future
-    channels (Phase 7A) add their own extraction functions on top of this
-    same EntityGraph core."""
+def extract_entities_online_banking(event: FraudEvent) -> list[EntityKey]:
+    """Reference-channel (online_banking) entity extraction -- also
+    build_entity_graph()'s default `entity_extractor`, so every existing
+    caller/test that doesn't pass one keeps this exact behavior unchanged.
+    Phase 7A's other six channels each define their own extract_entities()
+    in their feature-adapter module (src.fraud_intel.features.channels.*),
+    registered via src.fraud_intel.registry, on top of this same
+    EntityGraph core."""
     entities: list[EntityKey] = [("customer", event.customer_id), ("account", event.account_id)]
     if event.device_id:
         entities.append(("device", event.device_id))
@@ -168,7 +199,11 @@ def _extract_entities(event: FraudEvent) -> list[EntityKey]:
 
 
 def build_entity_graph(
-    *, historical_events: Sequence[FraudEvent], current_event_timestamp: datetime, policy: GraphPolicy
+    *,
+    historical_events: Sequence[FraudEvent],
+    current_event_timestamp: datetime,
+    policy: GraphPolicy,
+    entity_extractor: Callable[[FraudEvent], list[EntityKey]] = extract_entities_online_banking,
 ) -> EntityGraph:
     """Builds the graph from `historical_events` only -- respects the
     as-of-time contract by construction (every event must be strictly
@@ -198,7 +233,7 @@ def build_entity_graph(
     total_edges = 0
 
     for event in reversed(history_capped):
-        entities = _extract_entities(event)
+        entities = entity_extractor(event)
         new_edges = len(entities) * (len(entities) - 1)
         prospective_nodes = set(adjacency.keys()) | set(entities)
         prospective_edges = total_edges + new_edges

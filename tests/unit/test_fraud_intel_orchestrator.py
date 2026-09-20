@@ -316,17 +316,138 @@ def test_source_alert_context_passed_through_unchanged():
     assert alert == alert_before
 
 
-def test_wrong_channel_event_rejected():
-    from src.fraud_intel.events.ach import ACHPayload
+def test_ach_channel_scores_successfully_through_the_shared_orchestrator():
+    """Phase 7A: registering a channel in src.fraud_intel.registry is
+    what makes score_source_alert() accept it -- there is no per-channel
+    scoring pipeline, and no hardcoded 'online_banking only' guard left
+    to reject any of the other six registered channels."""
     from datetime import date
 
+    from src.fraud_intel.events.ach import ACHPayload
+    from src.fraud_intel.registry import get_channel_adapter
+
+    ach_columns = get_channel_adapter("ach").feature_columns
+    ach_preprocessor = ChannelPreprocessor.fit(
+        [{col: 0.0 for col in ach_columns} for _ in range(3)],
+        feature_columns=ach_columns, feature_schema_version="v1", preprocessing_artifact_version="pp-test-ach",
+    )
+    ach_bundle = LoadedChannelBundle(
+        channel="ach", bundle_id=3, bundle_version=1,
+        gbm_model=_FakeProbaModel(0.2), lr_model=_FakeProbaModel(0.3), anomaly_model=_FakeAnomalyModel(),
+        anomaly_normalization=AnomalyNormalization(train_min=-1.0, train_max=1.0, anomaly_artifact_version="anom-test", library_versions={}),
+        preprocessor=ach_preprocessor,
+        gbm_model_version="gbm-7", lr_model_version="lr-7", anomaly_model_version="anomaly-7",
+        preprocessing_artifact_version="pp-test-ach", feature_schema_version="v1",
+        rule_set_version="v1", graph_policy_version="v1", ensemble_policy_version="v1", reason_code_version="v1",
+    )
     ach_event = FraudEvent(
         channel="ach", customer_id=CUSTOMER, account_id=ACCOUNT, event_timestamp=T0, amount_minor_units=10_000,
         direction="debit",
         channel_payload=ACHPayload(sec_code="PPD", originating_routing_number="123456789", receiving_routing_number="987654321", batch_id="B1", effective_entry_date=date(2026, 1, 1), company_id="C1"),
     )
-    with pytest.raises(ValueError, match="online_banking"):
-        _call(event=ach_event, context=_ctx(ach_event))
+
+    result = _call(
+        event=ach_event, context=_ctx(ach_event), bundle=ach_bundle,
+        ensemble_policy=_ensemble_policy(channel="ach"), graph_policy=_graph_policy(channel="ach"),
+    )
+
+    assert isinstance(result, ScoredAlert)
+    assert result.event_id == ach_event.event_id
+    assert result.channel_model_bundle_version == 1
+    assert result.calibrated_gbm_probability == pytest.approx(0.2)
+
+
+def test_unregistered_channel_raises_unknown_channel_error_not_a_generic_value_error():
+    """The registry-level twin of the old 'wrong channel' test -- there is
+    no longer any way to construct this through a real FraudEvent (channel
+    is a closed 7-value Literal and every value is registered), so this
+    exercises get_channel_adapter() directly with a raw, never-registered
+    string, exactly as a defensive caller might."""
+    from src.fraud_intel.registry import UnknownChannelError, get_channel_adapter
+
+    with pytest.raises(UnknownChannelError):
+        get_channel_adapter("not_a_real_channel")
+
+
+def test_phase7a_online_banking_scoring_is_byte_for_byte_unchanged_by_the_registry_refactor():
+    """The Phase 7A regression guard: registering ACH/wire/etc in
+    src.fraud_intel.registry must not change a single field of
+    online_banking's own scoring output for the same inputs. Compares the
+    COMPLETE ScoredAlert (every field except the two wall-clock fields,
+    scored_at and rule_result.evaluated_at/latency_ms) against a fixed,
+    hand-verified snapshot captured from this exact scoring call."""
+    event = FraudEvent(
+        event_id=uuid.UUID("00000000-0000-0000-0000-0000000000e1"), channel="online_banking",
+        customer_id=CUSTOMER, account_id=ACCOUNT, event_timestamp=T0, amount_minor_units=10_000,
+        direction="debit", device_id="DEV-KNOWN",
+        channel_payload=OnlineBankingPayload(session_id="SESS1", login_method="password", mfa_used_flag=True, transaction_type="transfer", target_account="TGT1"),
+    )
+    source_alert = SourceAlertContext(
+        source_alert_id=uuid.UUID("00000000-0000-0000-0000-0000000000a1"),
+        source_system="LocalYamlRuleProvider (simulated upstream)", event_id=event.event_id, source_alert_created_at=T0,
+        source_rule_ids=["RULE1"], source_rule_version="v1", source_alert_reason_codes=["REASON1"],
+        generation_run_id="genrun-1", dataset_version="dsv-1", created_at=T0,
+    )
+
+    result = score_source_alert(
+        event=event, source_alert=source_alert, context=_ctx(event), bundle=_bundle(),
+        rule_provider=LocalYamlRuleProvider(), ensemble_policy=_ensemble_policy(), graph_policy=_graph_policy(),
+        resolved_fraud_evidence=(), score_execution_id=uuid.UUID("00000000-0000-0000-0000-0000000000f1"),
+        config_hash="cfg-hash-1", git_sha="deadbeef",
+    )
+
+    dumped = result.model_dump(mode="json")
+    dumped.pop("scored_at")
+    dumped["rule_result"].pop("evaluated_at")
+    dumped["rule_result"].pop("latency_ms")
+
+    assert dumped == {
+        "anomaly_score": 0.5,
+        "calibrated_gbm_probability": 0.2,
+        "channel_model_bundle_version": 2,
+        "component_statuses": {
+            "anomaly": {"error_code": None, "status": "OK"},
+            "gbm": {"error_code": None, "status": "OK"},
+            "graph": {"error_code": None, "status": "OK"},
+            "rules": {"error_code": None, "status": "OK"},
+        },
+        "config_hash": "cfg-hash-1",
+        "degraded": False,
+        "ensemble_policy_version": "v1",
+        "event_id": "00000000-0000-0000-0000-0000000000e1",
+        "event_time": "2026-01-01T12:00:00Z",
+        "feature_schema_version": "v1",
+        "git_sha": "deadbeef",
+        "graph_policy_version": "v1",
+        "graph_risk_score": 0.0,
+        "lr_probability": 0.3,
+        "operational_priority_score": 0.15500000000000003,
+        "priority_band": "LOW",
+        "reason_code_version": "v1",
+        "reason_codes": [
+            {
+                "code": "UPSTREAM_REASON1",
+                "layer": "rule",
+                "severity": "informational",
+                "text": "Upstream (simulated) source alert reason: REASON1.",
+            }
+        ],
+        "rule_result": {
+            "fired_rule_ids": [],
+            "minimum_priority_band": None,
+            "provider_error_code": None,
+            "provider_name": "LocalYamlRuleProvider",
+            "provider_status": "OK",
+            "provider_version": "v1",
+            "reason_codes": [],
+            "rule_categories": {},
+            "rule_set_version": "v1",
+            "score_contribution": 0.0,
+        },
+        "rule_set_version": "v1",
+        "score_execution_id": "00000000-0000-0000-0000-0000000000f1",
+        "source_alert_id": "00000000-0000-0000-0000-0000000000a1",
+    }
 
 
 # ---- complete Phase 5 bundle version (never mutates Phase 4's row) ------------------

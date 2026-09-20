@@ -5,7 +5,7 @@ computer-vision or Orbograph integration anywhere in this repository.
 """
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -20,3 +20,9 @@ class MobileDepositPayload(BaseModel):
     endorsement_present_flag: bool
     micr_consistency_flag: bool
     image_quality_score: float = Field(ge=0.0, le=1.0)
+    # Phase 7A additive correction: a deterministic, synthetic token
+    # identifying "the same payee" across events for graph fan-in purposes
+    # (guide's approved CHECK_PAYEE entity type) -- NEVER a real payee name
+    # or account number. Optional so every payload constructed before this
+    # field existed remains valid.
+    check_payee_token: Optional[str] = None

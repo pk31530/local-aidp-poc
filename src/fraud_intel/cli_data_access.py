@@ -1,10 +1,8 @@
 """Minimal, real Postgres data access backing the v1.3 CLI's `generate`/
-`train`/`score` commands (Phase 6). Reviewed as SQL, not exercised by any
-unit test -- every CLI test monkeypatches these functions directly, same
-precedent as every other "_Postgres*Store" in this codebase. Reference
-channel (online_banking) only for population loading (train/score);
-`generate` supports all seven channels, since Phase 1's generators already
-exist for all of them.
+`train`/`score` commands (Phase 6, generalized to all 7 channels in Phase
+7A). Reviewed as SQL, not exercised by any unit test -- every CLI test
+monkeypatches these functions directly, same precedent as every other
+"_Postgres*Store" in this codebase.
 """
 from __future__ import annotations
 
@@ -16,7 +14,6 @@ import psycopg2.extras
 
 from src.common.db import get_connection
 from src.fraud_intel.events.base import FraudEvent
-from src.fraud_intel.events.online_banking import OnlineBankingPayload
 from src.fraud_intel.events.source_alert_context import SourceAlertContext, SyntheticGroundTruthLabel
 from src.fraud_intel.generator.ach import generate_ach_events
 from src.fraud_intel.generator.atm import generate_atm_events
@@ -26,6 +23,7 @@ from src.fraud_intel.generator.mobile_deposit import generate_mobile_deposit_eve
 from src.fraud_intel.generator.online_banking import generate_online_banking_events
 from src.fraud_intel.generator.p2p import generate_p2p_events
 from src.fraud_intel.generator.wire import generate_wire_events
+from src.fraud_intel.registry import get_channel_adapter
 
 _GENERATORS = {
     "ach": generate_ach_events,
@@ -94,21 +92,27 @@ def generate_and_write(*, channel: str, count: int, seed: int, database: str, re
     return {"channel": channel, "count": len(results), "generation_run_id": generation_run_id, "dataset_version": dataset_version}
 
 
-def load_online_banking_population(
-    database: str,
+def load_channel_population(
+    channel: str, database: str,
 ) -> tuple[list[FraudEvent], list[SourceAlertContext], list[SyntheticGroundTruthLabel]]:
+    """Phase 7A: generalized from Phase 6's load_online_banking_population()
+    -- the channel's own registered payload class (src.fraud_intel.registry)
+    reconstructs channel_payload, so this one function serves all 7
+    channels instead of one hardcoded to online_banking. get_channel_adapter()
+    itself is the channel-validity check."""
+    payload_class = get_channel_adapter(channel).payload_class
     conn = get_connection(database)
     try:
         with conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute("SELECT * FROM channel_events WHERE channel = 'online_banking'")
+                cur.execute("SELECT * FROM channel_events WHERE channel = %s", (channel,))
                 events = [
                     FraudEvent(
                         event_id=row["event_id"], channel=row["channel"], customer_id=row["customer_id"],
                         account_id=row["account_id"], event_timestamp=row["event_timestamp"],
                         amount_minor_units=row["amount_minor_units"], direction=row["direction"],
                         device_id=row["device_id"], ip_address=row["ip_address"], scenario_id=row["scenario_id"],
-                        schema_version=row["schema_version"], channel_payload=OnlineBankingPayload(**row["channel_payload"]),
+                        schema_version=row["schema_version"], channel_payload=payload_class(**row["channel_payload"]),
                     )
                     for row in cur.fetchall()
                 ]

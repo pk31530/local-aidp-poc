@@ -45,8 +45,14 @@ from src.ingestion.consumer import run_configured
 from src.ml.train import DEFAULT_FEATURES_PATH, train_configured
 from src.processing.pipeline import DEFAULT_INPUT, run_pipeline_configured
 
-FRAUD_INTEL_IMPLEMENTED_CHANNELS = {"online_banking"}
 FRAUD_INTEL_ALL_CHANNELS = {"ach", "wire", "mobile_deposit", "online_banking", "atm", "debit_card", "p2p"}
+# Phase 7A: every channel now has a registered adapter
+# (src.fraud_intel.registry) -- generate/train/score all route through it,
+# so this widens from {"online_banking"} to every channel the registry
+# actually knows about (kept as its own name/copy rather than a bare
+# alias of FRAUD_INTEL_ALL_CHANNELS, so a future channel that is added to
+# the Channel Literal but not yet registered can still be distinguished).
+FRAUD_INTEL_IMPLEMENTED_CHANNELS = set(FRAUD_INTEL_ALL_CHANNELS)
 
 # Not created at module level: structlog's cache_logger_on_first_use binds a
 # logger proxy to whatever stream was active on its first use. main() calls
@@ -168,11 +174,11 @@ def _handle_fraud_intel_generate(args: argparse.Namespace) -> dict:
 def _handle_fraud_intel_train(args: argparse.Namespace) -> dict:
     database = _require_database(args)
     _require_implemented_channel(args.channel)
-    from src.fraud_intel.cli_data_access import load_online_banking_population
+    from src.fraud_intel.cli_data_access import load_channel_population
     from src.fraud_intel.config import ChannelTrainingRunConfig
     from src.fraud_intel.models.training import train_channel_configured
 
-    events, source_alerts, labels = load_online_banking_population(database)
+    events, source_alerts, labels = load_channel_population(args.channel, database)
     try:
         config = ChannelTrainingRunConfig(channel=args.channel)
     except ValidationError as exc:

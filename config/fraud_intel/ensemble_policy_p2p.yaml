@@ -1,0 +1,26 @@
+# p2p channel ensemble policy (Phase 7A). Same shape/validation as
+# config/fraud_intel/ensemble_policy_online_banking.yaml (Phase 5, guide
+# section 16) -- weights mirror online_banking's starting values as an
+# UNTUNED placeholder, since no channel-specific backtest/calibration has
+# been run for p2p yet. Validated at load time by
+# src.fraud_intel.ensemble.policy.EnsemblePolicy.
+channel: p2p
+policy_version: v1
+
+weight_rule: 0.35
+weight_gbm: 0.40
+weight_anomaly: 0.15
+weight_graph: 0.10
+
+rule_score_cap: 1.0
+
+high_threshold: 0.75
+medium_threshold: 0.40
+
+# Phase 7A decision 4: these values are NOT tuned, optimized, validated,
+# or bank-approved -- they are a placeholder copy of online_banking's own
+# starting values, carried over only so scoring is structurally possible
+# for this channel. Phase 7B must report real, channel-specific
+# evaluation metrics before this bundle/policy is ever promoted.
+calibration_status: UNVALIDATED_POC_DEFAULT
+promotion_note: "Requires Phase 7B channel-specific evaluation before promotion"

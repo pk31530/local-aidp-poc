@@ -1,5 +1,7 @@
-"""Phase 2: Online/Mobile Banking reference channel feature adapter, and
-the six remaining channel stubs. No database, Docker, or network access.
+"""Phase 2: Online/Mobile Banking reference channel feature adapter (the
+other six channels' own dedicated adapters are in
+test_fraud_intel_features_<channel>.py, added Phase 7A). No database,
+Docker, or network access.
 """
 from __future__ import annotations
 
@@ -12,10 +14,6 @@ from pydantic import ValidationError
 from src.fraud_intel.events.ach import ACHPayload
 from src.fraud_intel.events.base import FraudEvent
 from src.fraud_intel.events.online_banking import OnlineBankingPayload
-from src.fraud_intel.features.channels.ach import compute_ach_features
-from src.fraud_intel.features.channels.atm import compute_atm_features
-from src.fraud_intel.features.channels.debit_card import compute_debit_card_features
-from src.fraud_intel.features.channels.mobile_deposit import compute_mobile_deposit_features
 from src.fraud_intel.features.channels.online_banking import (
     ONLINE_BANKING_FEATURE_COLUMNS,
     ONLINE_BANKING_FEATURE_SCHEMA_VERSION,
@@ -23,8 +21,6 @@ from src.fraud_intel.features.channels.online_banking import (
     TRANSFER_TRANSACTION_TYPE,
     compute_online_banking_features,
 )
-from src.fraud_intel.features.channels.p2p import compute_p2p_features
-from src.fraud_intel.features.channels.wire import compute_wire_features
 from src.fraud_intel.features.core import FeatureComputationContext, ordered_feature_vector
 
 CUSTOMER = "FIC1000"
@@ -179,17 +175,3 @@ def test_online_banking_feature_columns_ordered_vector():
 
 def test_online_banking_feature_schema_version_defined():
     assert ONLINE_BANKING_FEATURE_SCHEMA_VERSION == "v1"
-
-
-# ---- the six remaining channel stubs ----------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "fn",
-    [compute_ach_features, compute_wire_features, compute_mobile_deposit_features, compute_atm_features, compute_debit_card_features, compute_p2p_features],
-)
-def test_remaining_channel_stub_adapters_raise_not_implemented(fn):
-    current = _ob_event()
-    ctx = _ctx(current)
-    with pytest.raises(NotImplementedError):
-        fn(ctx)

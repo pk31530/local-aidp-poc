@@ -1,8 +1,9 @@
 """Shared, per-channel training framework -- chronological split with a
 purge gap, training-window-only preprocessing, calibrated GBM primary, LR
 shadow challenger, unsupervised anomaly detector (Phase 5, guide section
-14), and candidate channel-bundle registration. Reference channel
-(Online/Mobile Banking) only -- the other six channels are Phase 7A.
+14), and candidate channel-bundle registration. Phase 7A: routes through
+src.fraud_intel.registry.get_channel_adapter(config.channel) for every
+channel -- ONE shared training path, not a per-channel copy.
 
 No real database, MLflow server, or large-scale training is contacted by
 this module's own code -- every unit test replaces `mlflow`,
@@ -32,18 +33,22 @@ from src.control_plane.runs import RunLifecycle
 from src.fraud_intel.config import ChannelTrainingRunConfig
 from src.fraud_intel.events.base import FraudEvent
 from src.fraud_intel.events.source_alert_context import SourceAlertContext, SyntheticGroundTruthLabel
-from src.fraud_intel.features.channels.online_banking import (
-    ONLINE_BANKING_FEATURE_COLUMNS,
-    ONLINE_BANKING_FEATURE_SCHEMA_VERSION,
-    compute_online_banking_features,
-)
 from src.fraud_intel.features.core import FeatureComputationContext
 from src.fraud_intel.models.anomaly import fit_anomaly_model
 from src.fraud_intel.models.bundle import ChannelModelBundleStore, create_default_bundle_store
 from src.fraud_intel.models.calibration import SplitManifest, fit_calibrator
 from src.fraud_intel.models.preprocessing import ChannelPreprocessor
+from src.fraud_intel.registry import ChannelAdapter, get_channel_adapter
 
-EXPERIMENT_NAME = "fraud-intel-online-banking"
+EXPERIMENT_NAME_PREFIX = "fraud-intel"
+
+
+def _experiment_name(channel: str) -> str:
+    return f"{EXPERIMENT_NAME_PREFIX}-{channel}"
+
+
+def _registered_model_name_prefix(channel: str) -> str:
+    return f"{get_settings().mlflow_model_name}-fraud-intel-{channel.replace('_', '-')}"
 
 # Phase 4 interim-only label-eligibility policy (guide sections 8, 11, 19).
 # The guide's REAL, versioned eligibility policy requires label_assessments
@@ -73,16 +78,18 @@ def _phase4_interim_training_eligible(label: SyntheticGroundTruthLabel) -> bool:
 
 def _build_supervised_population(
     *,
+    adapter: ChannelAdapter,
     channel_events: Sequence[FraudEvent],
     source_alerts: Sequence[SourceAlertContext],
     synthetic_labels: Sequence[SyntheticGroundTruthLabel],
 ) -> list[dict[str, Any]]:
     """Pure, in-memory. No database, MLflow, or model-fitting code here --
     only the guide section 11 join: source_alerts -> channel_events ->
-    Phase 2 feature vectors -> Phase-4-interim-eligible synthetic labels.
+    the registered channel adapter's own feature vectors ->
+    Phase-4-interim-eligible synthetic labels.
 
     Returns one dict per supervised training row: {event_id (str),
-    event_timestamp, label (bool), **ordered ONLINE_BANKING_FEATURE_COLUMNS}.
+    event_timestamp, label (bool), **ordered adapter.feature_columns}.
     Non-alerted events are still used as history via
     FeatureComputationContext (both historical_events and
     source_alert_history are built from the FULL channel_events/
@@ -98,8 +105,8 @@ def _build_supervised_population(
         event = events_by_id.get(event_id)
         if event is None:
             continue  # a source alert referencing an unknown event is excluded, never crashes
-        if event.channel != "online_banking":
-            continue  # reference channel only, Phase 4
+        if event.channel != adapter.channel:
+            continue  # this training run's own channel only
 
         label = label_by_event_id.get(event_id)
         if label is None:
@@ -124,14 +131,14 @@ def _build_supervised_population(
             source_alert_history=prior_alerts,
             as_of_time=event.event_timestamp,
         )
-        features = compute_online_banking_features(ctx)
+        features = adapter.compute_features(ctx)
 
         rows.append(
             {
                 "event_id": str(event.event_id),
                 "event_timestamp": event.event_timestamp,
                 "label": bool(label.synthetic_scenario_label),
-                **{column: features[column] for column in ONLINE_BANKING_FEATURE_COLUMNS},
+                **{column: features[column] for column in adapter.feature_columns},
             }
         )
 
@@ -170,8 +177,8 @@ def _validate_partition(df: pl.DataFrame, name: str, *, min_rows: int) -> None:
         )
 
 
-def _rows_as_feature_dicts(part_df: pl.DataFrame) -> list[dict[str, Any]]:
-    return [{column: record[column] for column in ONLINE_BANKING_FEATURE_COLUMNS} for record in part_df.to_dicts()]
+def _rows_as_feature_dicts(part_df: pl.DataFrame, feature_columns: Sequence[str]) -> list[dict[str, Any]]:
+    return [{column: record[column] for column in feature_columns} for record in part_df.to_dicts()]
 
 
 def _train_gbm(X_train, y_train, config: ChannelTrainingRunConfig):
@@ -276,17 +283,20 @@ def train_channel_configured(
     dataset_version: Optional[str] = None
 
     try:
-        if config.channel != "online_banking":
-            raise ValueError(f"Phase 4 supports only the online_banking reference channel, got {config.channel!r}")
+        # Phase 7A: get_channel_adapter() itself is the channel-validity
+        # check -- config.channel is a closed 7-value Literal and every
+        # value is now registered, so this can only ever raise for a
+        # channel that was never registered at all.
+        adapter = get_channel_adapter(config.channel)
 
         store = bundle_store if bundle_store is not None else create_default_bundle_store()
 
         population_rows = _build_supervised_population(
-            channel_events=channel_events, source_alerts=source_alerts, synthetic_labels=synthetic_labels
+            adapter=adapter, channel_events=channel_events, source_alerts=source_alerts, synthetic_labels=synthetic_labels
         )
         if not population_rows:
             raise InsufficientTrainingDataError(
-                "no source-alerted, eligible online_banking rows available to build a supervised population"
+                f"no source-alerted, eligible {config.channel} rows available to build a supervised population"
             )
 
         dataset_version = _dataset_version(population_rows)
@@ -297,7 +307,7 @@ def train_channel_configured(
                     "event_id": row["event_id"],
                     "event_timestamp": row["event_timestamp"],
                     "label": row["label"],
-                    **{column: row[column] for column in ONLINE_BANKING_FEATURE_COLUMNS},
+                    **{column: row[column] for column in adapter.feature_columns},
                 }
                 for row in population_rows
             ]
@@ -325,19 +335,19 @@ def train_channel_configured(
 
         manifest = _split_manifest_from(split_df, all_ids=df["event_id"].to_list())
 
-        train_rows = _rows_as_feature_dicts(train_df)
+        train_rows = _rows_as_feature_dicts(train_df, adapter.feature_columns)
         preprocessor = ChannelPreprocessor.fit(
             train_rows,
-            feature_columns=ONLINE_BANKING_FEATURE_COLUMNS,
-            feature_schema_version=ONLINE_BANKING_FEATURE_SCHEMA_VERSION,
+            feature_columns=adapter.feature_columns,
+            feature_schema_version=adapter.feature_schema_version,
             preprocessing_artifact_version=_preprocessing_artifact_version(train_rows),
         )
 
         X_train = preprocessor.transform(train_rows)
         y_train = train_df["label"].to_list()
-        X_calib = preprocessor.transform(_rows_as_feature_dicts(calib_df))
+        X_calib = preprocessor.transform(_rows_as_feature_dicts(calib_df, adapter.feature_columns))
         y_calib = calib_df["label"].to_list()
-        X_test = preprocessor.transform(_rows_as_feature_dicts(test_df))
+        X_test = preprocessor.transform(_rows_as_feature_dicts(test_df, adapter.feature_columns))
         y_test = test_df["label"].to_list()
 
         gbm_model, gbm_params = _train_gbm(X_train, y_train, config)
@@ -366,11 +376,11 @@ def train_channel_configured(
         anomaly_model, anomaly_normalization = _fit_anomaly(X_train, config, anomaly_artifact_version)
 
         configure_mlflow()
-        mlflow.set_experiment(EXPERIMENT_NAME)
+        mlflow.set_experiment(_experiment_name(config.channel))
 
-        with mlflow.start_run(run_name=f"online_banking-gbm-{dataset_version}") as gbm_run:
+        with mlflow.start_run(run_name=f"{config.channel}-gbm-{dataset_version}") as gbm_run:
             mlflow.log_params(gbm_params)
-            mlflow.log_param("feature_schema_version", ONLINE_BANKING_FEATURE_SCHEMA_VERSION)
+            mlflow.log_param("feature_schema_version", adapter.feature_schema_version)
             for key, value in gbm_eval.items():
                 if key != "confusion_matrix":
                     mlflow.log_metric(key, value)
@@ -379,7 +389,7 @@ def train_channel_configured(
                 gbm_model,
                 artifact_path="model",
                 signature=signature,
-                registered_model_name=f"{get_settings().mlflow_model_name}-fraud-intel-online-banking-gbm",
+                registered_model_name=f"{_registered_model_name_prefix(config.channel)}-gbm",
             )
             gbm_mlflow_run_id = gbm_run.info.run_id
             # Phase 6 corrective pass: the preprocessor was previously only
@@ -396,7 +406,7 @@ def train_channel_configured(
         # anywhere in this function -- guide section 22's deliberate difference
         # from v1.1's unconditional champion-alias behavior.
 
-        with mlflow.start_run(run_name=f"online_banking-lr-shadow-{dataset_version}") as lr_run:
+        with mlflow.start_run(run_name=f"{config.channel}-lr-shadow-{dataset_version}") as lr_run:
             mlflow.log_params(lr_params)
             for key, value in lr_eval.items():
                 if key != "confusion_matrix":
@@ -406,18 +416,18 @@ def train_channel_configured(
                 lr_model,
                 artifact_path="model",
                 signature=lr_signature,
-                registered_model_name=f"{get_settings().mlflow_model_name}-fraud-intel-online-banking-lr-shadow",
+                registered_model_name=f"{_registered_model_name_prefix(config.channel)}-lr-shadow",
             )
             lr_mlflow_run_id = lr_run.info.run_id
             lr_model_version = lr_model_info.registered_model_version
 
-        with mlflow.start_run(run_name=f"online_banking-anomaly-{dataset_version}") as anomaly_run:
+        with mlflow.start_run(run_name=f"{config.channel}-anomaly-{dataset_version}") as anomaly_run:
             mlflow.log_param("anomaly_artifact_version", anomaly_artifact_version)
             mlflow.log_param("contamination", "auto")
             anomaly_model_info = mlflow.sklearn.log_model(
                 anomaly_model,
                 artifact_path="model",
-                registered_model_name=f"{get_settings().mlflow_model_name}-fraud-intel-online-banking-anomaly",
+                registered_model_name=f"{_registered_model_name_prefix(config.channel)}-anomaly",
             )
             anomaly_mlflow_run_id = anomaly_run.info.run_id
             anomaly_model_version = anomaly_model_info.registered_model_version
@@ -441,12 +451,12 @@ def train_channel_configured(
         )
 
         bundle = store.register_candidate(
-            channel="online_banking",
+            channel=config.channel,
             gbm_model_version=str(gbm_model_version),
             lr_model_version=str(lr_model_version),
             anomaly_model_version=str(anomaly_model_version),
             preprocessing_artifact_version=preprocessor.preprocessing_artifact_version,
-            feature_schema_version=ONLINE_BANKING_FEATURE_SCHEMA_VERSION,
+            feature_schema_version=adapter.feature_schema_version,
             rule_set_version=rule_set_version,
             graph_policy_version=graph_policy_version,
             ensemble_policy_version=ensemble_policy_version,
@@ -468,7 +478,7 @@ def train_channel_configured(
             "lr_model_version": str(lr_model_version),
             "anomaly_model_version": str(anomaly_model_version),
             "preprocessing_artifact_version": preprocessor.preprocessing_artifact_version,
-            "feature_schema_version": ONLINE_BANKING_FEATURE_SCHEMA_VERSION,
+            "feature_schema_version": adapter.feature_schema_version,
             "bundle_id": bundle.bundle_id,
             "bundle_version": bundle.bundle_version,
             "realized_split_fractions": realized_fractions,

@@ -37,6 +37,24 @@ def test_ensemble_policy_loads_and_validates_the_real_yaml_file():
     assert policy.rule_score_cap > 0
 
 
+@pytest.mark.parametrize(
+    "channel", sorted({"ach", "wire", "mobile_deposit", "online_banking", "atm", "debit_card", "p2p"})
+)
+def test_ensemble_policy_loads_and_validates_for_every_channel(channel):
+    """Phase 7A: all 7 channels now have a real ensemble_policy_<channel>.yaml
+    file, not just online_banking."""
+    policy = load_ensemble_policy(channel)
+    assert policy.channel == channel
+    assert policy.policy_version == "v1"
+    assert policy.rule_score_cap > 0
+    if channel != "online_banking":
+        # Phase 7A decision 4: every NEW channel's policy must explicitly
+        # declare its POC-default status -- online_banking's own policy
+        # predates these fields and is exempt.
+        assert policy.calibration_status == "UNVALIDATED_POC_DEFAULT"
+        assert policy.promotion_note
+
+
 def test_ensemble_policy_rejects_medium_threshold_above_high():
     with pytest.raises(ValidationError):
         _policy(high_threshold=0.5, medium_threshold=0.6)

@@ -37,6 +37,12 @@ class EnsemblePolicy(BaseModel):
     high_threshold: float = Field(ge=0, le=1)
     medium_threshold: float = Field(ge=0, le=1)
 
+    # Phase 7A decision 4: every NEW (non-online_banking) channel's policy
+    # must explicitly declare these. Optional so online_banking's existing
+    # policy file -- which predates these fields -- stays valid unchanged.
+    calibration_status: Optional[str] = None
+    promotion_note: Optional[str] = None
+
     @model_validator(mode="after")
     def _thresholds_ordered(self) -> "EnsemblePolicy":
         if self.medium_threshold > self.high_threshold:

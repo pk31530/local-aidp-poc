@@ -485,14 +485,66 @@ def test_failure_mid_training_records_failed_and_reraises_original_exception(_fa
     assert record["dataset_version"] is not None  # computed before the failure
 
 
-def test_wrong_channel_config_fails_before_any_work(_fakes):
-    events, alerts, labels = _fixture_population()
+def _ach_event(*, event_timestamp: datetime, event_id: uuid.UUID | None = None) -> FraudEvent:
+    from datetime import date
+
+    from src.fraud_intel.events.ach import ACHPayload
+
+    return FraudEvent(
+        event_id=event_id or uuid.uuid4(), channel="ach", customer_id=CUSTOMER, account_id=ACCOUNT,
+        event_timestamp=event_timestamp, amount_minor_units=10_000, direction="debit",
+        channel_payload=ACHPayload(
+            sec_code="PPD", originating_routing_number="111111111", receiving_routing_number="222222222",
+            batch_id="B1", effective_entry_date=date(2026, 1, 1), company_id="C1",
+        ),
+    )
+
+
+def _ach_fixture_population(n: int = 40):
+    """ACH twin of _fixture_population() -- proves the shared training
+    path works for a genuinely different, registry-driven channel, not
+    just online_banking."""
+    events, alerts, labels = [], [], []
+    for i in range(n):
+        ts = T0 + timedelta(hours=i)
+        event = _ach_event(event_timestamp=ts)
+        events.append(event)
+        alerts.append(_alert(event_id=event.event_id, created_at=ts))
+        labels.append(_label(event_id=event.event_id, synthetic_scenario_label=(i % 2 == 0)))
+    return events, alerts, labels
+
+
+def test_ach_channel_trains_successfully_through_the_shared_training_path(_fakes):
+    """Phase 7A: registering a channel in src.fraud_intel.registry is
+    what makes train_channel_configured() accept it -- there is no
+    per-channel training pipeline, and no hardcoded 'online_banking only'
+    guard left to reject any of the other six registered channels."""
+    events, alerts, labels = _ach_fixture_population()
     config = ChannelTrainingRunConfig(channel="ach")
-    with pytest.raises(ValueError, match="online_banking"):
-        train_channel_configured(
-            config, trigger_source="test", channel_events=events, source_alerts=alerts, synthetic_labels=labels,
-            bundle_store=_FakeChannelModelBundleStore(),
-        )
+    bundle_store = _FakeChannelModelBundleStore()
+
+    result = train_channel_configured(
+        config, trigger_source="test", channel_events=events, source_alerts=alerts, synthetic_labels=labels,
+        bundle_store=bundle_store,
+    )
+
+    assert len(bundle_store.rows) == 1
+    bundle = bundle_store.rows[0]
+    assert bundle.status == "CANDIDATE"
+    assert bundle.channel == "ach"
+    assert bundle.training_run_id == result["run_id"]
+
+
+def test_unregistered_channel_config_raises_unknown_channel_error():
+    """The registry-level twin of the old 'wrong channel' test -- there is
+    no longer any way to construct this through a real ChannelTrainingRunConfig
+    (channel is a closed 7-value Literal and every value is registered), so
+    this exercises get_channel_adapter() directly, exactly as a defensive
+    caller might."""
+    from src.fraud_intel.registry import UnknownChannelError, get_channel_adapter
+
+    with pytest.raises(UnknownChannelError):
+        get_channel_adapter("not_a_real_channel")
 
 
 def test_realized_split_fractions_recorded_in_result_and_bundle_report(_fakes):

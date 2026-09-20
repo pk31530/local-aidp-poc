@@ -61,6 +61,11 @@ def generate_mobile_deposit_events(
             endorsement_present_flag=not is_fraud,
             micr_consistency_flag=not is_fraud,
             image_quality_score=float(rng.uniform(0.3, 0.6)) if is_fraud else float(rng.uniform(0.8, 1.0)),
+            # Deterministic synthetic token, never a real payee name/account
+            # (Phase 7A additive correction) -- draws from a smaller range
+            # for a fraud scenario, simulating the same duplicated/altered
+            # check being redeposited to the same payee across events.
+            check_payee_token=f"PAYEETOK{int(rng.integers(100, 999)) if is_fraud else int(rng.integers(100000, 999999))}",
         )
         event = FraudEvent(
             event_id=event_id,

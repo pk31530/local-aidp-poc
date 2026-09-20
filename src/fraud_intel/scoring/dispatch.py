@@ -242,7 +242,7 @@ class _PostgresScoringDataAccess:
         import psycopg2.extras
 
         from src.common.db import get_connection
-        from src.fraud_intel.events.online_banking import OnlineBankingPayload
+        from src.fraud_intel.registry import get_channel_adapter
 
         conn = get_connection(self._database)
         try:
@@ -269,6 +269,7 @@ class _PostgresScoringDataAccess:
                         (channel, _MAX_PENDING_ALERTS_PER_RUN),
                     )
                     pending_rows = cur.fetchall()
+                    payload_class = get_channel_adapter(channel).payload_class
 
                     items: list[PendingScoringItem] = []
                     for row in pending_rows:
@@ -278,7 +279,7 @@ class _PostgresScoringDataAccess:
                             amount_minor_units=row["ce_amount_minor_units"], direction=row["ce_direction"],
                             device_id=row["ce_device_id"], ip_address=row["ce_ip_address"],
                             scenario_id=row["ce_scenario_id"], schema_version=row["ce_schema_version"],
-                            channel_payload=OnlineBankingPayload(**row["ce_channel_payload"]),
+                            channel_payload=payload_class(**row["ce_channel_payload"]),
                         )
                         source_alert = SourceAlertContext(
                             source_alert_id=row["source_alert_id"], source_system=row["source_system"],
@@ -295,13 +296,17 @@ class _PostgresScoringDataAccess:
                             "ORDER BY event_timestamp DESC LIMIT %s",
                             (event.customer_id, event.event_timestamp, _MAX_HISTORICAL_EVENTS_PER_ALERT),
                         )
+                        # A customer's cross-channel history can include events from
+                        # channels other than `channel` itself -- each row's OWN
+                        # channel picks its own payload class, never the outer one.
                         historical_events = tuple(
                             FraudEvent(
                                 event_id=h["event_id"], channel=h["channel"], customer_id=h["customer_id"],
                                 account_id=h["account_id"], event_timestamp=h["event_timestamp"],
                                 amount_minor_units=h["amount_minor_units"], direction=h["direction"],
                                 device_id=h["device_id"], ip_address=h["ip_address"], scenario_id=h["scenario_id"],
-                                schema_version=h["schema_version"], channel_payload=OnlineBankingPayload(**h["channel_payload"]),
+                                schema_version=h["schema_version"],
+                                channel_payload=get_channel_adapter(h["channel"]).payload_class(**h["channel_payload"]),
                             )
                             for h in cur.fetchall()
                         )

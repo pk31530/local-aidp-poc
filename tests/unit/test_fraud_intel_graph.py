@@ -74,6 +74,26 @@ def test_graph_policy_loads_and_validates_the_real_yaml_file():
     assert policy.graph_max_history_events > 0
 
 
+@pytest.mark.parametrize(
+    "channel", sorted({"ach", "wire", "mobile_deposit", "online_banking", "atm", "debit_card", "p2p"})
+)
+def test_graph_policy_loads_and_validates_for_every_channel(channel):
+    """Phase 7A: all 7 channels now have a real graph_policy_<channel>.yaml
+    file, not just online_banking."""
+    from src.fraud_intel.graph.entity_graph import load_graph_policy
+
+    policy = load_graph_policy(channel)
+    assert policy.channel == channel
+    assert policy.graph_policy_version == "v1"
+    assert policy.graph_max_history_events > 0
+    if channel != "online_banking":
+        # Phase 7A decision 4: every NEW channel's policy must explicitly
+        # declare its POC-default status -- online_banking's own policy
+        # predates these fields and is exempt.
+        assert policy.calibration_status == "UNVALIDATED_POC_DEFAULT"
+        assert policy.promotion_note
+
+
 def test_graph_policy_rejects_weights_summing_above_one():
     with pytest.raises(ValidationError):
         _policy(shared_device_weight=0.5, fan_in_weight=0.5, fan_out_weight=0.5, shortest_path_weight=0.5)
@@ -167,6 +187,39 @@ def test_build_entity_graph_accepts_strictly_prior_events():
     prior_event = _event(customer_id="C1", account_id="A1", event_timestamp=T0 - timedelta(hours=1))
     graph = build_entity_graph(historical_events=[prior_event], current_event_timestamp=T0, policy=_policy())
     assert graph.node_count > 0
+
+
+def test_build_entity_graph_uses_extract_entities_online_banking_by_default():
+    """Phase 7A: build_entity_graph()'s default entity_extractor is
+    extract_entities_online_banking -- omitting the parameter (as every
+    pre-Phase-7A caller/test does) must keep producing IDENTICAL graphs."""
+    from src.fraud_intel.graph.entity_graph import extract_entities_online_banking
+
+    prior_event = _event(customer_id="C1", account_id="A1", event_timestamp=T0 - timedelta(hours=1), device_id="DEV1")
+    default_graph = build_entity_graph(historical_events=[prior_event], current_event_timestamp=T0, policy=_policy())
+    explicit_graph = build_entity_graph(
+        historical_events=[prior_event], current_event_timestamp=T0, policy=_policy(),
+        entity_extractor=extract_entities_online_banking,
+    )
+    assert default_graph == explicit_graph
+
+
+def test_build_entity_graph_respects_a_custom_entity_extractor():
+    """A channel-specific extract_entities() (e.g. ACH's, which never
+    emits a routing-number-derived entity) changes the resulting graph --
+    proves entity_extractor is genuinely wired through, not ignored."""
+    def _customer_and_marker_extractor(event):
+        return [("customer", event.customer_id), ("beneficiary", "MARKER")]
+
+    prior_event = _event(customer_id="C1", account_id="A1", event_timestamp=T0 - timedelta(hours=1), device_id="DEV1")
+    graph = build_entity_graph(
+        historical_events=[prior_event], current_event_timestamp=T0, policy=_policy(),
+        entity_extractor=_customer_and_marker_extractor,
+    )
+    customer_neighbors = {edge.other for edge in graph.adjacency[("customer", "C1")]}
+    assert ("beneficiary", "MARKER") in customer_neighbors
+    assert ("account", "A1") not in graph.adjacency
+    assert ("device", "DEV1") not in graph.adjacency
 
 
 # ---- empty history ------------------------------------------------------------------
