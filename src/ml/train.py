@@ -31,7 +31,6 @@ from sklearn.metrics import (
     recall_score,
     roc_auc_score,
 )
-from sklearn.model_selection import train_test_split
 
 from src.common.config import PROJECT_ROOT, get_settings
 from src.common.db import get_connection
@@ -49,21 +48,28 @@ def _dataset_version(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
 
 
-def _load_dataset(path: Path) -> tuple[pd.DataFrame, pd.Series]:
-    df = pl.read_parquet(path).to_pandas()
+def _load_dataset(path: Path) -> pd.DataFrame:
+    return pl.read_parquet(path).to_pandas()
+
+
+def _split(df: pd.DataFrame):
+    """Reads the "split" column persisted by src.common.splits.assign_split
+    (fix Finding 1) rather than re-deriving train/val/test independently —
+    this guarantees evaluation uses exactly the partition the merchant/
+    country risk lookups were fit on, so no leaked val/test row ever
+    contributed to a feature the model trains on."""
     X = df[MODEL_FEATURE_COLUMNS].astype(float)
     y = df["is_fraud"].astype(int)
-    return X, y
+    split = df["split"]
 
+    train_mask = split == "train"
+    val_mask = split == "val"
+    test_mask = split == "test"
 
-def _split(X: pd.DataFrame, y: pd.Series):
-    X_train, X_temp, y_train, y_temp = train_test_split(
-        X, y, test_size=0.30, stratify=y, random_state=RANDOM_SEED
+    return (
+        X[train_mask], X[val_mask], X[test_mask],
+        y[train_mask], y[val_mask], y[test_mask],
     )
-    X_val, X_test, y_val, y_test = train_test_split(
-        X_temp, y_temp, test_size=0.50, stratify=y_temp, random_state=RANDOM_SEED
-    )
-    return X_train, X_val, X_test, y_train, y_val, y_test
 
 
 def _train_xgboost(X_train, y_train, X_val, y_val):
@@ -132,16 +138,16 @@ def train(features_path: Path = DEFAULT_FEATURES_PATH) -> dict:
     mlflow.set_experiment(EXPERIMENT_NAME)
 
     dataset_version = _dataset_version(features_path)
-    X, y = _load_dataset(features_path)
-    X_train, X_val, X_test, y_train, y_val, y_test = _split(X, y)
+    df = _load_dataset(features_path)
+    X_train, X_val, X_test, y_train, y_val, y_test = _split(df)
 
     log.info(
         "training_data_loaded",
-        total_rows=len(X),
+        total_rows=len(df),
         train_rows=len(X_train),
         val_rows=len(X_val),
         test_rows=len(X_test),
-        fraud_ratio_overall=round(float(y.mean()), 4),
+        fraud_ratio_overall=round(float(df["is_fraud"].astype(int).mean()), 4),
         dataset_version=dataset_version,
     )
 

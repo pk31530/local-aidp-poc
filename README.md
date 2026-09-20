@@ -10,13 +10,16 @@ dashboard — with no cloud account and no paid services.
 
 ![Python](https://img.shields.io/badge/python-3.10+-blue)
 ![Docker Compose](https://img.shields.io/badge/docker--compose-required-blue)
-![Tests](https://img.shields.io/badge/tests-59%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-79%20passing-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
-**Status: complete.** All 10 build phases finished and runtime-verified —
-see `BUILD_LOG.md` for the full history (what was built, what broke, how it
-was fixed, and the exact verification commands run) and `CHECKPOINT.md` for
-the current state.
+**Status: complete, plus a v1.1 hardening pass.** All 10 build phases
+finished and runtime-verified — see `BUILD_LOG.md` for the full history
+(what was built, what broke, how it was fixed, and the exact verification
+commands run). A subsequent hardening pass found and fixed 5 correctness
+issues (schema-version validation, model-flavor-aware loading, pipeline
+failure recording, event-replay idempotency, and training/serving target
+leakage) — see `HARDENING_LOG.md`. `CHECKPOINT.md` has the current state.
 
 ## What this demonstrates
 
@@ -132,7 +135,7 @@ config/         application configuration
 ## Tests
 
 ```bash
-pytest                    # 59 tests: unit + integration + smoke
+pytest                    # 79 tests: unit + integration + smoke
 ```
 
 Integration and smoke tests use an isolated database (`aidp_test`) and
@@ -147,6 +150,7 @@ Redpanda topic (`transactions-test`) — never the demo data.
 | `DEMO_SCRIPT.md` | A repeatable walkthrough of the guide's worked fraud scenario |
 | `TROUBLESHOOTING.md` | Real issues hit while building this, and their fixes |
 | `BUILD_LOG.md` | Full phase-by-phase build history with verification output |
+| `HARDENING_LOG.md` | The v1.1 post-completion hardening pass: 5 fixes, each with problem/fix/verification |
 | `CHECKPOINT.md` | Current build state (for resuming a session) |
 
 ## A note on data and credentials

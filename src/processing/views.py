@@ -39,6 +39,7 @@ FEATURES_COLUMNS = [
     "merchant_risk_score",
     "country_risk_score",
     "is_fraud",
+    "split",
 ]
 
 
