@@ -152,6 +152,17 @@ def _bundle_config_hash(bundle: ChannelModelBundleRecord) -> str:
 # ---- real, MLflow-backed artifact loader (reviewed as code, not exercised) --------
 
 
+def mlflow_model_name_prefix(channel: str) -> str:
+    """The registered-model-name prefix a channel's GBM/LR/anomaly models
+    are logged under (src.fraud_intel.models.training uses the identical
+    formula, src.fraud_intel.models.training._registered_model_name_prefix)
+    -- a pure, testable function so the seven-channel MLflow naming
+    contract can be verified without contacting real MLflow."""
+    from src.common.config import get_settings
+
+    return f"{get_settings().mlflow_model_name}-fraud-intel-{channel.replace('_', '-')}"
+
+
 class _MlflowBundleArtifactLoader:
     """Loads the OPERATIONAL bundle's actual GBM/LR/anomaly model objects
     and its preprocessing/anomaly-normalization artifacts from MLflow,
@@ -164,7 +175,6 @@ class _MlflowBundleArtifactLoader:
     def load(self, bundle: ChannelModelBundleRecord) -> LoadedChannelBundle:
         import mlflow
 
-        from src.common.config import get_settings
         from src.common.mlflow_setup import configure_mlflow
         from src.fraud_intel.models.anomaly import AnomalyNormalization
         from src.fraud_intel.models.preprocessing import ChannelPreprocessor
@@ -185,7 +195,7 @@ class _MlflowBundleArtifactLoader:
             ) from exc
 
         configure_mlflow()
-        model_name_prefix = f"{get_settings().mlflow_model_name}-fraud-intel-{bundle.channel.replace('_', '-')}"
+        model_name_prefix = mlflow_model_name_prefix(bundle.channel)
 
         gbm_model = mlflow.xgboost.load_model(f"models:/{model_name_prefix}-gbm/{bundle.gbm_model_version}")
         lr_model = mlflow.sklearn.load_model(f"models:/{model_name_prefix}-lr-shadow/{bundle.lr_model_version}")

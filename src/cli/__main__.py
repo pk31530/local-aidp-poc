@@ -227,17 +227,74 @@ def _handle_fraud_intel_score(args: argparse.Namespace) -> dict:
 
 
 def _handle_fraud_intel_evaluate(args: argparse.Namespace) -> dict:
-    """Guide/Phase 6 decision 11: a thin, explicitly self-identifying
-    reference-channel-only surface -- never implies the complete
-    cross-channel evaluation report, which is Phase 7A scope."""
-    _require_database(args)
+    """Phase 7A corrective pass: the real evaluation code
+    (src.fraud_intel.evaluation.cross_channel/shadow_candidate), not the
+    Phase 6 placeholder marker. `--capacity-mode`/`--capacity-value`/
+    `--recall-target` are all required -- no implicit default anywhere
+    (Phase 7A decision 6). The OPERATIONAL bundle is resolved for real
+    (`_get_operational_bundle`, same as `model show`); `--candidate-
+    bundle-version` is optional and, when given, adds a clearly-separate
+    shadow-candidate comparison section to the JSON output. This command
+    is single-channel by its own `--channel` flag -- cross-channel
+    aggregation (evaluate_cross_channel()) is a library capability this
+    CLI surface does not (yet) expose as its own flag."""
+    database = _require_database(args)
     _require_implemented_channel(args.channel)
-    return {
-        "scope": "reference_channel_phase6_only",
-        "note": "This is a Phase 6 reference-channel-only evaluation surface, not the complete "
-        "cross-channel evaluation report -- that is Phase 7A scope.",
+
+    from src.fraud_intel.cli_data_access import load_candidate_shadow_scores, load_resolved_alert_outcomes
+    from src.fraud_intel.evaluation.capacity import CountCapacity, FractionCapacity
+    from src.fraud_intel.evaluation.cross_channel import evaluate_channel
+    from src.fraud_intel.evaluation.shadow_candidate import compare_operational_vs_candidate
+
+    try:
+        capacity = (
+            CountCapacity(value=args.capacity_value)
+            if args.capacity_mode == "count"
+            else FractionCapacity(value=args.capacity_value)
+        )
+    except ValidationError as exc:
+        raise CLIUserError(str(exc)) from exc
+
+    bundle = _get_operational_bundle(args.channel, database)
+    if bundle is None:
+        raise CLIUserError(f"no OPERATIONAL bundle for channel {args.channel!r}")
+
+    outcomes = load_resolved_alert_outcomes(args.channel, database)
+    try:
+        operational_result = evaluate_channel(args.channel, outcomes, capacity=capacity, recall_target=args.recall_target)
+    except ValueError as exc:
+        raise CLIUserError(str(exc)) from exc
+
+    operational_dump = operational_result.model_dump(mode="json")
+    rules_only_baseline = operational_dump.pop("rules_only_baseline")
+
+    result: dict = {
         "channel": args.channel,
+        "operational_bundle": {"bundle_id": bundle.bundle_id, "bundle_version": bundle.bundle_version},
+        "operational_evaluation": operational_dump,
+        "rules_only_baseline": rules_only_baseline,
+        "shadow_candidate_comparison": None,
     }
+
+    if args.candidate_bundle_version is not None:
+        promotion_store = create_default_bundle_promotion_store(database)
+        try:
+            candidate_bundle = promotion_store.get_bundle(args.channel, args.candidate_bundle_version)
+        except LookupError as exc:
+            raise CLIUserError(str(exc)) from exc
+        candidate_scores = load_candidate_shadow_scores(args.channel, candidate_bundle.bundle_id, database)
+        try:
+            comparison = compare_operational_vs_candidate(
+                args.channel, outcomes, candidate_scores,
+                operational_bundle_id=bundle.bundle_id, operational_bundle_version=bundle.bundle_version,
+                candidate_bundle_id=candidate_bundle.bundle_id, candidate_bundle_version=candidate_bundle.bundle_version,
+                capacity=capacity, recall_target=args.recall_target,
+            )
+        except ValueError as exc:
+            raise CLIUserError(str(exc)) from exc
+        result["shadow_candidate_comparison"] = comparison.model_dump(mode="json")
+
+    return result
 
 
 class _MlflowModelVersionVerifier:
@@ -463,9 +520,19 @@ def build_parser() -> argparse.ArgumentParser:
     fi_score_p.set_defaults(handler=_handle_fraud_intel_score)
 
     fi_evaluate_p = fraud_intel_sub.add_parser(
-        "evaluate", parents=[json_parent, database_parent], help="reference-channel evaluation surface (Phase 6 scope only)"
+        "evaluate", parents=[json_parent, database_parent],
+        help="real per-channel evaluation (operational + rules-only baseline + optional shadow-candidate comparison)",
     )
     fi_evaluate_p.add_argument("--channel", required=True, choices=sorted(FRAUD_INTEL_IMPLEMENTED_CHANNELS))
+    # No implicit default anywhere (Phase 7A decision 6) -- capacity mode/
+    # value and the recall target must always be explicitly supplied.
+    fi_evaluate_p.add_argument("--capacity-mode", required=True, choices=("count", "fraction"), dest="capacity_mode")
+    fi_evaluate_p.add_argument("--capacity-value", required=True, type=float, dest="capacity_value")
+    fi_evaluate_p.add_argument("--recall-target", required=True, type=float, dest="recall_target")
+    fi_evaluate_p.add_argument(
+        "--candidate-bundle-version", type=int, default=None, dest="candidate_bundle_version",
+        help="optional CANDIDATE bundle_version to shadow-compare against the OPERATIONAL bundle",
+    )
     fi_evaluate_p.set_defaults(handler=_handle_fraud_intel_evaluate)
 
     fi_promote_p = fraud_intel_sub.add_parser(

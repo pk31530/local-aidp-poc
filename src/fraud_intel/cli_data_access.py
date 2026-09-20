@@ -13,6 +13,9 @@ from typing import Any
 import psycopg2.extras
 
 from src.common.db import get_connection
+from src.fraud_intel.ensemble.policy import compute_operational_priority_score, load_ensemble_policy
+from src.fraud_intel.evaluation.cross_channel import AlertOutcome
+from src.fraud_intel.evaluation.shadow_candidate import CandidateShadowScore
 from src.fraud_intel.events.base import FraudEvent
 from src.fraud_intel.events.source_alert_context import SourceAlertContext, SyntheticGroundTruthLabel
 from src.fraud_intel.generator.ach import generate_ach_events
@@ -147,3 +150,110 @@ def load_channel_population(
     finally:
         conn.close()
     return events, source_alerts, labels
+
+
+# ---- evaluation data access (Phase 7A corrective pass) --------------------------------
+
+
+def load_resolved_alert_outcomes(channel: str, database: str) -> list[AlertOutcome]:
+    """Real Postgres read backing `aidp fraud-intel evaluate`. Reviewed as
+    SQL, not exercised by any unit test -- every CLI/evaluation test
+    supplies fixture AlertOutcome rows directly. One row per fraud_alerts
+    row that has both a latest alert_evidence row and a latest,
+    ELIGIBLE, RESOLVED label_assessments row -- never an unresolved or
+    ineligible alert. `baseline_priority_score` is recomputed for real
+    from the stored evidence's own rule_result.score_contribution via the
+    SAME compute_operational_priority_score() mechanism used everywhere
+    else in this codebase, weight_gbm=weight_anomaly=weight_graph=0 on the
+    channel's real EnsemblePolicy -- never a separately-implemented
+    formula (guide section 21)."""
+    policy = load_ensemble_policy(channel)
+    baseline_policy = policy.model_copy(update={"weight_gbm": 0.0, "weight_anomaly": 0.0, "weight_graph": 0.0})
+
+    conn = get_connection(database)
+    try:
+        with conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT fa.source_alert_id, fa.channel, ev.rule_result, ev.operational_priority_score,
+                           ev.priority_band, ev.event_time, la.resolved_label
+                    FROM fraud_alerts fa
+                    JOIN LATERAL (
+                        SELECT * FROM alert_evidence WHERE alert_id = fa.alert_id
+                        ORDER BY scored_at DESC, evidence_id DESC LIMIT 1
+                    ) ev ON true
+                    JOIN LATERAL (
+                        SELECT * FROM label_assessments WHERE alert_id = fa.alert_id
+                        ORDER BY evaluated_at DESC, assessment_id DESC LIMIT 1
+                    ) la ON true
+                    WHERE fa.channel = %s AND la.eligibility_result = true
+                      AND la.resolved_label IN ('RESOLVED_FRAUD', 'RESOLVED_LEGITIMATE')
+                    """,
+                    (channel,),
+                )
+                rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    outcomes = []
+    for row in rows:
+        rule_score_contribution = (row["rule_result"] or {}).get("score_contribution", 0.0)
+        baseline_score = compute_operational_priority_score(
+            rule_score_contribution=rule_score_contribution, calibrated_gbm_probability=0.0,
+            anomaly_score=0.0, graph_risk_score=0.0, policy=baseline_policy,
+        )
+        outcomes.append(
+            AlertOutcome(
+                source_alert_id=row["source_alert_id"], channel=row["channel"], event_timestamp=row["event_time"],
+                operational_priority_score=row["operational_priority_score"], baseline_priority_score=baseline_score,
+                priority_band=row["priority_band"], resolved_label=row["resolved_label"],
+            )
+        )
+    return outcomes
+
+
+def load_candidate_shadow_scores(channel: str, candidate_bundle_id: int, database: str) -> list[CandidateShadowScore]:
+    """Real Postgres read for the OPTIONAL shadow-candidate comparison.
+    Reviewed as SQL, not exercised. Reads `alert_evidence` rows already
+    tagged with the CANDIDATE bundle's own channel_model_bundle_id --
+    those rows are only ever written by a real shadow-scoring pass
+    (Phase 7B+ scope, not built in this corrective pass): a candidate is
+    scored against ALREADY-EXISTING fraud_alerts rows and its evidence is
+    appended with the SAME alert_id and a NEW score_execution_id, exactly
+    like any other rescore (src.fraud_intel.alerts.queue), never a new
+    fraud_alerts row. Until that writer exists, this legitimately (and
+    correctly) returns an empty list -- src.fraud_intel.evaluation.
+    shadow_candidate handles an empty candidate population as
+    non_computable, not a crash."""
+    conn = get_connection(database)
+    try:
+        with conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT fa.source_alert_id, fa.channel, ev.event_time, ev.operational_priority_score, ev.priority_band
+                    FROM alert_evidence ev
+                    JOIN fraud_alerts fa ON fa.alert_id = ev.alert_id
+                    WHERE ev.channel_model_bundle_id = %s AND fa.channel = %s
+                    ORDER BY fa.source_alert_id, ev.scored_at DESC, ev.evidence_id DESC
+                    """,
+                    (candidate_bundle_id, channel),
+                )
+                rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    seen: set = set()
+    scores = []
+    for row in rows:
+        if row["source_alert_id"] in seen:
+            continue  # keep only the latest (first, given the ORDER BY) shadow evidence per alert
+        seen.add(row["source_alert_id"])
+        scores.append(
+            CandidateShadowScore(
+                source_alert_id=row["source_alert_id"], channel=row["channel"], event_timestamp=row["event_time"],
+                candidate_priority_score=row["operational_priority_score"], candidate_priority_band=row["priority_band"],
+            )
+        )
+    return scores

@@ -60,7 +60,7 @@ def _bundle(**overrides) -> ChannelModelBundleRecord:
         ["fraud-intel", "generate", "--channel", "online_banking", "--count", "5", "--json"],
         ["fraud-intel", "train", "--channel", "online_banking", "--json"],
         ["fraud-intel", "score", "--channel", "online_banking", "--json"],
-        ["fraud-intel", "evaluate", "--channel", "online_banking", "--json"],
+        ["fraud-intel", "evaluate", "--channel", "online_banking", "--capacity-mode", "count", "--capacity-value", "10", "--recall-target", "0.8", "--json"],
         ["fraud-intel", "promote", "--channel", "online_banking", "--bundle-version", "1", "--promoted-by", "a1", "--json"],
         ["fraud-intel", "model", "show", "--channel", "online_banking", "--json"],
         ["alerts", "list", "--json"],
@@ -289,7 +289,9 @@ def test_no_phase7b_required_handler_raises_not_implemented_error():
         cli_main._handle_fraud_intel_generate,
         cli_main._handle_fraud_intel_train,
         cli_main._handle_fraud_intel_score,
+        cli_main._handle_fraud_intel_evaluate,
         cli_main._handle_fraud_intel_promote,
+        cli_main._handle_fraud_intel_model_show,
     ):
         tree = ast.parse(inspect.getsource(handler))
         for node in ast.walk(tree):
@@ -299,14 +301,169 @@ def test_no_phase7b_required_handler_raises_not_implemented_error():
                 assert name != "NotImplementedError", f"{handler.__name__} still raises NotImplementedError"
 
 
-# ---- fraud-intel evaluate: explicit Phase 6 scope marker -----------------------------
+def test_no_phase7b_required_handler_returns_a_phase_scope_placeholder_dict():
+    """The old Phase 6 evaluate() stub returned a literal dict containing
+    a "scope"/"reference_channel_phaseN_only" placeholder marker instead
+    of doing real work -- proves no Phase 7B-required handler still
+    contains that pattern (a dict literal with a 'scope' key) anywhere in
+    its own source."""
+    import ast
+    import inspect
+
+    for handler in (
+        cli_main._handle_fraud_intel_generate,
+        cli_main._handle_fraud_intel_train,
+        cli_main._handle_fraud_intel_score,
+        cli_main._handle_fraud_intel_evaluate,
+        cli_main._handle_fraud_intel_promote,
+        cli_main._handle_fraud_intel_model_show,
+    ):
+        tree = ast.parse(inspect.getsource(handler))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Dict):
+                keys = [k.value for k in node.keys if isinstance(k, ast.Constant)]
+                assert "scope" not in keys, f"{handler.__name__} still returns a 'scope' placeholder dict: {keys}"
 
 
-def test_evaluate_self_identifies_as_phase6_reference_channel_scope(capsys):
-    cli_main.main(["fraud-intel", "evaluate", "--channel", "online_banking", "--database", "aidp_test", "--json"])
+# ---- fraud-intel evaluate: real Phase 7A evaluation (corrective pass) -----------------
+
+
+def _outcome_fixtures():
+    import uuid
+
+    from src.fraud_intel.evaluation.cross_channel import AlertOutcome
+
+    ids = [uuid.uuid4() for _ in range(4)]
+    labels = ["RESOLVED_FRAUD", "RESOLVED_FRAUD", "RESOLVED_LEGITIMATE", "RESOLVED_LEGITIMATE"]
+    scores = [0.9, 0.7, 0.3, 0.1]
+    bands = ["HIGH", "MEDIUM", "LOW", "LOW"]
+    return [
+        AlertOutcome(
+            source_alert_id=ids[i], channel="online_banking", event_timestamp=T0, operational_priority_score=scores[i],
+            baseline_priority_score=scores[i], priority_band=bands[i], resolved_label=labels[i],
+        )
+        for i in range(4)
+    ]
+
+
+def test_evaluate_returns_operational_and_baseline_sections_without_a_candidate(monkeypatch, capsys):
+    outcomes = _outcome_fixtures()
+    monkeypatch.setattr("src.fraud_intel.cli_data_access.load_resolved_alert_outcomes", lambda channel, database: outcomes)
+    monkeypatch.setattr(cli_main, "_get_operational_bundle", lambda channel, database: _bundle())
+
+    cli_main.main(
+        ["fraud-intel", "evaluate", "--channel", "online_banking", "--capacity-mode", "count", "--capacity-value", "2", "--recall-target", "0.8", "--database", "aidp_test", "--json"]
+    )
+
     result = json.loads(capsys.readouterr().out)
-    assert result["scope"] == "reference_channel_phase6_only"
     assert result["channel"] == "online_banking"
+    assert result["operational_bundle"] == {"bundle_id": _bundle().bundle_id, "bundle_version": _bundle().bundle_version}
+    assert "rules_only_baseline" not in result["operational_evaluation"]  # clearly separated out, not nested
+    assert result["rules_only_baseline"]["pr_auc"]["status"] in ("ok", "non_computable_single_class", "non_computable_empty")
+    assert result["shadow_candidate_comparison"] is None
+    assert result["operational_evaluation"]["total_source_alerts"] == 4
+
+
+def test_evaluate_includes_shadow_candidate_comparison_when_requested(monkeypatch, capsys):
+    import uuid
+
+    from src.fraud_intel.evaluation.shadow_candidate import CandidateShadowScore
+
+    outcomes = _outcome_fixtures()
+    candidate_scores = [
+        CandidateShadowScore(
+            source_alert_id=o.source_alert_id, channel="online_banking", event_timestamp=T0,
+            candidate_priority_score=o.operational_priority_score, candidate_priority_band=o.priority_band,
+        )
+        for o in outcomes
+    ]
+    candidate_bundle = _bundle(bundle_id=5, bundle_version=3)
+
+    class _FakePromotionStore:
+        def get_bundle(self, channel, bundle_version):
+            assert channel == "online_banking"
+            assert bundle_version == 3
+            return candidate_bundle
+
+    monkeypatch.setattr("src.fraud_intel.cli_data_access.load_resolved_alert_outcomes", lambda channel, database: outcomes)
+    monkeypatch.setattr("src.fraud_intel.cli_data_access.load_candidate_shadow_scores", lambda channel, bundle_id, database: candidate_scores)
+    monkeypatch.setattr(cli_main, "_get_operational_bundle", lambda channel, database: _bundle())
+    monkeypatch.setattr(cli_main, "create_default_bundle_promotion_store", lambda database: _FakePromotionStore())
+
+    cli_main.main(
+        ["fraud-intel", "evaluate", "--channel", "online_banking", "--capacity-mode", "count", "--capacity-value", "2",
+         "--recall-target", "0.8", "--candidate-bundle-version", "3", "--database", "aidp_test", "--json"]
+    )
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["shadow_candidate_comparison"] is not None
+    assert result["shadow_candidate_comparison"]["candidate_bundle_id"] == 5
+    assert result["shadow_candidate_comparison"]["candidate_bundle_version"] == 3
+    assert result["shadow_candidate_comparison"]["matched_source_alert_count"] == 4
+
+
+def test_evaluate_unknown_candidate_bundle_version_is_a_cli_user_error(monkeypatch, capsys):
+    outcomes = _outcome_fixtures()
+
+    class _FakePromotionStore:
+        def get_bundle(self, channel, bundle_version):
+            raise LookupError(f"no bundle version {bundle_version} for channel {channel!r}")
+
+    monkeypatch.setattr("src.fraud_intel.cli_data_access.load_resolved_alert_outcomes", lambda channel, database: outcomes)
+    monkeypatch.setattr(cli_main, "_get_operational_bundle", lambda channel, database: _bundle())
+    monkeypatch.setattr(cli_main, "create_default_bundle_promotion_store", lambda database: _FakePromotionStore())
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_main.main(
+            ["fraud-intel", "evaluate", "--channel", "online_banking", "--capacity-mode", "count", "--capacity-value", "2",
+             "--recall-target", "0.8", "--candidate-bundle-version", "999", "--database", "aidp_test", "--json"]
+        )
+    assert exc_info.value.code == 2
+    assert json.loads(capsys.readouterr().out)["error"] == "CLIUserError"
+
+
+def test_evaluate_no_operational_bundle_is_a_cli_user_error(monkeypatch, capsys):
+    monkeypatch.setattr(cli_main, "_get_operational_bundle", lambda channel, database: None)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_main.main(
+            ["fraud-intel", "evaluate", "--channel", "online_banking", "--capacity-mode", "count", "--capacity-value", "2", "--recall-target", "0.8", "--database", "aidp_test", "--json"]
+        )
+    assert exc_info.value.code == 2
+    assert json.loads(capsys.readouterr().out)["error"] == "CLIUserError"
+
+
+def test_evaluate_missing_required_capacity_or_recall_flags_fails_at_argparse_level(capsys):
+    with pytest.raises(SystemExit) as exc_info:
+        cli_main.main(["fraud-intel", "evaluate", "--channel", "online_banking", "--database", "aidp_test", "--json"])
+    assert exc_info.value.code == 2
+
+
+def test_evaluate_invalid_capacity_value_is_a_cli_user_error(monkeypatch, capsys):
+    monkeypatch.setattr("src.fraud_intel.cli_data_access.load_resolved_alert_outcomes", lambda channel, database: [])
+    monkeypatch.setattr(cli_main, "_get_operational_bundle", lambda channel, database: _bundle())
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_main.main(
+            ["fraud-intel", "evaluate", "--channel", "online_banking", "--capacity-mode", "count", "--capacity-value", "-5",
+             "--recall-target", "0.8", "--database", "aidp_test", "--json"]
+        )
+    assert exc_info.value.code == 2
+    assert json.loads(capsys.readouterr().out)["error"] == "CLIUserError"
+
+
+def test_evaluate_scope_marker_no_longer_present(monkeypatch, capsys):
+    """The removed Phase 6 placeholder marker must not reappear anywhere
+    in real output."""
+    outcomes = _outcome_fixtures()
+    monkeypatch.setattr("src.fraud_intel.cli_data_access.load_resolved_alert_outcomes", lambda channel, database: outcomes)
+    monkeypatch.setattr(cli_main, "_get_operational_bundle", lambda channel, database: _bundle())
+
+    cli_main.main(
+        ["fraud-intel", "evaluate", "--channel", "online_banking", "--capacity-mode", "count", "--capacity-value", "2", "--recall-target", "0.8", "--database", "aidp_test", "--json"]
+    )
+    out = capsys.readouterr().out
+    assert "reference_channel_phase6_only" not in out
 
 
 # ---- fraud-intel promote ---------------------------------------------------------------
