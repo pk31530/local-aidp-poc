@@ -34,6 +34,54 @@ with `&`):
 ./scripts/run_consumer.sh     # streaming consumer (needs the API's model, not the API itself)
 ```
 
+## Unified CLI
+
+`python -m src.cli` (or `./scripts/aidp.sh`, a thin wrapper that activates
+`.venv` when present and forwards every argument) is a single command
+surface over the batch/training/streaming entry points plus read-only run
+and model-registry queries. The legacy entry points below (`python -m
+src.processing.pipeline`, `python -m src.ml.train`, `./scripts/
+run_consumer.sh`) **remain fully supported** — the CLI calls the exact same
+underlying functions, just with `trigger_source="cli"` instead of
+`trigger_source="legacy"`.
+
+```bash
+./scripts/aidp.sh config validate --json
+./scripts/aidp.sh pipeline run batch --input data/batch/some_file.csv --json
+./scripts/aidp.sh train run --features-path data/output/features/transactions.parquet --json
+./scripts/aidp.sh stream run --duration 30 --json
+./scripts/aidp.sh run show 42 --json
+./scripts/aidp.sh run list --limit 10 --json
+./scripts/aidp.sh model show champion --json
+```
+
+Human-readable output (indented text) is the default; `--json` emits
+exactly one JSON object on stdout and nothing else — no logs, no banners,
+no progress messages. **Every log line, in both modes, goes to stderr**,
+never stdout — this is what keeps `--json` output pipeable/parseable.
+
+Exit codes:
+
+| Code | Meaning |
+|---|---|
+| `0` | Success |
+| `2` | Validation/user-input error — bad CLI arguments, invalid typed configuration, `run show`/`model show` for something that doesn't exist, an out-of-range `--limit` |
+| `3` | Operational failure — an unhandled exception from a real workload or infrastructure call (DB/Kafka/MinIO/MLflow unavailable, etc.) |
+
+`aidp model show <alias>` is **read-only** — it queries MLflow's model
+registry metadata (name, alias, version, model type, MLflow run id) via the
+same lookup `load_champion_model()` uses, but never loads model weights and
+never promotes, retrains, or otherwise modifies the registry. `aidp run
+list` always applies a bounded limit (default 10, hard cap 500).
+
+**Stopping `stream run` / `run_consumer.sh` with Ctrl+C** records the run as
+`SUCCESS` — an operator-initiated stop is treated as a graceful, expected
+way to end a local consumer, the same as its `--duration` timer elapsing.
+This is current v1.2 behavior, not an ideal production guarantee: an abrupt
+process crash, `SIGKILL`, or power loss bypasses all Python exception
+handling and can leave the run recorded as `RUNNING` indefinitely — there is
+no stale-run recovery/reaping mechanism yet. See `TROUBLESHOOTING.md`.
+
 ## Running the real-time demo
 
 With the consumer already running (above), in another terminal:
@@ -77,14 +125,78 @@ Expected when everything (including the API and dashboard) is running:
 
 ```bash
 pytest                          # everything: unit + integration + smoke
-pytest tests/unit                # fast, no live dependencies beyond Postgres/MLflow config reads
+pytest tests/unit                # no infrastructure required — safe to run anywhere, anytime
 pytest tests/integration          # needs the full stack running; uses the isolated aidp_test DB + transactions-test topic
 pytest tests/smoke                # the full generate->publish->consume->score->store->retrieve path
 ```
 
-Integration and smoke tests never touch the demo database (`aidp`) or the
-`transactions` topic — they use `aidp_test` and `transactions-test`
-exclusively (fix H4).
+`tests/unit` covers the batch/training/streaming lifecycle wiring, the
+typed configs, the CLI, and the provenance/lifecycle service — every
+database/MLflow/Kafka call in it is a fake or a monkeypatched spy, never a
+live connection. `tests/integration` and `tests/smoke` exercise the real
+code paths against real infrastructure and never touch the demo database
+(`aidp`) or the `transactions` topic — they use `aidp_test` and
+`transactions-test` exclusively (fix H4). CI (see below) runs only
+`tests/unit`; run `tests/integration`/`tests/smoke` locally, with the stack
+up, before relying on a change that touches the database/Kafka/MLflow paths
+directly.
+
+## Database migrations
+
+Fresh installs get the current `pipeline_runs` shape automatically —
+`infrastructure/postgres/lib/schema.sql` is applied once, at container
+first-start, to both `aidp` and `aidp_test` (see `infrastructure/postgres/
+init.sql`). An **existing** database created before a given migration was
+added needs that migration applied manually; it is never applied
+automatically to a running database.
+
+**Always validate against `aidp_test` first.** Never assume `aidp` should
+be migrated automatically just because `aidp_test` was.
+
+```bash
+# 1. Confirm the target database and inspect its current state (read-only)
+docker exec -i aidp-postgres psql -U aidp -d aidp_test \
+  -c "SELECT current_database();"
+docker exec -i aidp-postgres psql -U aidp -d aidp_test \
+  -c "\d pipeline_runs"
+docker exec -i aidp-postgres psql -U aidp -d aidp_test \
+  -c "SELECT count(*) FROM pipeline_runs;"
+
+# 2. Apply, with ON_ERROR_STOP so a failure aborts the whole transaction
+#    instead of leaving a half-applied schema
+docker exec -i aidp-postgres psql -v ON_ERROR_STOP=1 \
+  -U aidp -d aidp_test -f - \
+  < infrastructure/postgres/migrations/002_pipeline_run_provenance.sql
+
+# 3. Verify: same row count as step 1, plus the new columns/constraints
+docker exec -i aidp-postgres psql -U aidp -d aidp_test \
+  -c "\d pipeline_runs"
+docker exec -i aidp-postgres psql -U aidp -d aidp_test \
+  -c "SELECT count(*) FROM pipeline_runs;"
+```
+
+Only after `aidp_test` is verified — and only with separate, explicit
+intent — repeat the same three steps against `-d aidp`. Every migration
+file under `infrastructure/postgres/migrations/` only adds columns and
+widens existing `CHECK` constraints; none of them drop data or narrow a
+constraint, so re-running an already-applied migration is a safe no-op.
+
+**Never use `scripts/reset_demo.sh` as a migration mechanism.** It clears
+demo *data* (rows, seed/output files, data-lake objects) — it does not
+alter schema, and running it does not substitute for applying a migration.
+Running it against a database that still needs a migration just leaves you
+with an empty, still-out-of-date schema.
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on every push to `main` and every pull
+request (plus a manual `workflow_dispatch` trigger): install dependencies,
+a byte-compile sanity check, `aidp config validate`, and `pytest
+tests/unit`. It needs no repository secrets, starts no Docker service,
+makes no network call to any AiDP infrastructure, and never trains,
+registers, promotes, or applies a migration. `tests/integration` and
+`tests/smoke` are intentionally **not** part of CI — they need the local
+Docker stack and stay a local/manual verification step.
 
 ## Resetting demo data
 

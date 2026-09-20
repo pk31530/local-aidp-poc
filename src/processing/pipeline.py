@@ -9,16 +9,18 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
-import time
 from pathlib import Path
 
 import polars as pl
 
 from src.common.config import PROJECT_ROOT, get_settings
-from src.common.db import get_connection
 from src.common.logging import configure_logging, get_logger
 from src.common.splits import assign_split
+from src.control_plane.config import BatchRunConfig
+from src.control_plane.provenance import get_git_sha
+from src.control_plane.runs import RunLifecycle
 from src.processing.clean import clean_transactions
 from src.processing.enrich import enrich_transactions
 from src.processing.raw import validate_batch_file
@@ -66,43 +68,50 @@ def _write_and_upload(df: pl.DataFrame, layer: str, upload: bool) -> Path:
     return local_path
 
 
-def record_pipeline_run(status: str, records_processed: int, records_rejected: int, started_at: float) -> None:
-    conn = get_connection()
-    try:
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO pipeline_runs (pipeline_name, status, records_processed, records_rejected, started_at, completed_at)
-                    VALUES ('batch', %s, %s, %s, to_timestamp(%s), now())
-                    """,
-                    (status, records_processed, records_rejected, started_at),
-                )
-    finally:
-        conn.close()
-
-
 def run_pipeline(input_path: Path, upload_to_minio: bool = True) -> dict:
+    """Legacy entry point — signature and defaults unchanged. Builds a typed
+    config and delegates all workload/lifecycle logic to
+    run_pipeline_configured(); trigger_source="legacy" identifies calls made
+    this way rather than through the future CLI (trigger_source="cli")."""
+    config = BatchRunConfig(input_path=input_path, upload_to_minio=upload_to_minio)
+    return run_pipeline_configured(config, trigger_source="legacy")
+
+
+def run_pipeline_configured(config: BatchRunConfig, *, trigger_source: str = "legacy") -> dict:
     configure_logging("processing.pipeline")
     log = get_logger(__name__)
     settings = get_settings()
-    started_at = time.time()
 
-    log.info("pipeline_started", input=str(input_path))
+    log.info("pipeline_started", input=str(config.input_path))
+
+    lifecycle = RunLifecycle()
+    run = lifecycle.begin(
+        "batch",
+        trigger_source=trigger_source,
+        git_sha=get_git_sha(),
+        config_snapshot=config.redacted_snapshot(),
+        config_hash=config.config_hash(),
+    )
 
     records_processed = 0
     records_rejected = 0
+    dataset_version = None
 
     try:
+        # Reading/hashing the input file happens inside the protected block —
+        # a missing/unreadable/corrupted file must still record FAILED, not
+        # crash before any run record exists.
+        dataset_version = hashlib.sha256(config.input_path.read_bytes()).hexdigest()[:16]
+
         # ---- RAW ----
-        raw_df, rejected_raw = validate_batch_file(input_path)
-        _write_and_upload(raw_df, "raw", upload_to_minio)
+        raw_df, rejected_raw = validate_batch_file(config.input_path)
+        raw_path = _write_and_upload(raw_df, "raw", config.upload_to_minio)
         _write_rejected(rejected_raw, OUTPUT_DIR / "rejected" / "raw_rejected.csv")
         records_rejected = len(rejected_raw)
 
         # ---- CLEAN ----
         clean_df, rejected_clean = clean_transactions(raw_df)
-        _write_and_upload(clean_df, "clean", upload_to_minio)
+        clean_path = _write_and_upload(clean_df, "clean", config.upload_to_minio)
         _write_rejected(rejected_clean, OUTPUT_DIR / "rejected" / "clean_rejected.csv")
         records_rejected += len(rejected_clean)
 
@@ -113,11 +122,12 @@ def run_pipeline(input_path: Path, upload_to_minio: bool = True) -> dict:
         # ---- risk lookups (derived from the train partition only) ----
         risk_lookups = compute_risk_lookups(clean_df.filter(pl.col("split") == "train"))
         MODELS_DIR.mkdir(parents=True, exist_ok=True)
-        risk_lookups.save(MODELS_DIR / "risk_lookups.json")
-        if upload_to_minio:
+        risk_lookups_path = MODELS_DIR / "risk_lookups.json"
+        risk_lookups.save(risk_lookups_path)
+        if config.upload_to_minio:
             from src.common.storage import upload_file
 
-            upload_file(MODELS_DIR / "risk_lookups.json", "aidp-model-output", "risk_lookups.json")
+            upload_file(risk_lookups_path, "aidp-model-output", "risk_lookups.json")
 
         # ---- CURATED + FEATURES (one enrichment pass, two projections) ----
         customers_df = pl.read_parquet(CUSTOMERS_PATH)
@@ -127,10 +137,10 @@ def run_pipeline(input_path: Path, upload_to_minio: bool = True) -> dict:
         enriched_df = enrich_transactions(clean_df, customers_df, failed_attempts_df, risk_lookups)
 
         curated_df = to_curated(enriched_df)
-        _write_and_upload(curated_df, "curated", upload_to_minio)
+        curated_path = _write_and_upload(curated_df, "curated", config.upload_to_minio)
 
         features_df = to_features(enriched_df)
-        _write_and_upload(features_df, "features", upload_to_minio)
+        features_path = _write_and_upload(features_df, "features", config.upload_to_minio)
 
         records_processed = curated_df.height
         summary = {
@@ -144,20 +154,34 @@ def run_pipeline(input_path: Path, upload_to_minio: bool = True) -> dict:
             "total_rejected": records_rejected,
         }
         log.info("pipeline_complete", **summary)
-    except Exception:
+    except Exception as exc:
         log.error(
             "pipeline_failed",
             records_processed=records_processed,
             records_rejected=records_rejected,
             exc_info=True,
         )
-        record_pipeline_run(
-            "FAILED", records_processed=records_processed, records_rejected=records_rejected, started_at=started_at
+        lifecycle.fail_from_exception(
+            run.run_id,
+            exc,
+            records_processed=records_processed,
+            records_rejected=records_rejected,
+            dataset_version=dataset_version,
         )
         raise
 
-    record_pipeline_run(
-        "SUCCESS", records_processed=records_processed, records_rejected=records_rejected, started_at=started_at
+    lifecycle.succeed(
+        run.run_id,
+        records_processed=records_processed,
+        records_rejected=records_rejected,
+        dataset_version=dataset_version,
+        artifacts={
+            "raw_path": str(raw_path),
+            "clean_path": str(clean_path),
+            "curated_path": str(curated_path),
+            "features_path": str(features_path),
+            "risk_lookups_path": str(risk_lookups_path),
+        },
     )
 
     return summary

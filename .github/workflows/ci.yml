@@ -1,0 +1,41 @@
+name: CI
+
+# Safe, infrastructure-free validation: installs dependencies, does a syntax
+# sanity check, validates configuration locally, and runs the unit-test
+# suite. Never starts Docker, never touches a database, never trains or
+# promotes a model, never applies a migration, and needs no repository
+# secrets.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Byte-compile sanity check
+        run: python -m compileall src
+
+      - name: Validate configuration (local files/env only, no network)
+        run: python -m src.cli config validate --json
+
+      - name: Run unit tests (no infrastructure required)
+        run: pytest tests/unit -q

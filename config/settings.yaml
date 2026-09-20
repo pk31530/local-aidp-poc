@@ -39,10 +39,11 @@ data_lake:
     model_output: aidp-model-output
     mlflow_artifacts: mlflow-artifacts
 
-# Message schema/versioning note (fix M3, informational only — not enforced in v1):
-# Every message published to `transactions` carries a top-level "schema_version"
-# integer field (starts at 1). Consumers should tolerate unknown future minor
-# fields and reject/DLQ messages whose schema_version they do not recognize.
-# A schema registry (e.g. Redpanda's built-in one) is a natural v1.1 upgrade,
-# not required for this POC.
+# Message schema/versioning note (fix M3): every message published to
+# `transactions` carries a top-level "schema_version" integer field (starts
+# at 1). This is enforced, not informational — src/common/schemas.py rejects
+# any schema_version outside SUPPORTED_SCHEMA_VERSIONS, and the consumer
+# DLQ's the resulting ValidationError (v1.1 hardening fix 1). A schema
+# registry (e.g. Redpanda's built-in one) is a natural future upgrade, not
+# required for this POC.
 schema_version: 1

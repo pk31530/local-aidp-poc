@@ -97,12 +97,28 @@ CREATE TABLE IF NOT EXISTS model_versions (
     is_active         BOOLEAN NOT NULL DEFAULT false
 );
 
+-- v1.2 control-plane provenance (see
+-- infrastructure/postgres/migrations/002_pipeline_run_provenance.sql for the
+-- existing-install migration; this CREATE TABLE only ever runs against a
+-- fresh, empty data directory, so the two must be kept in agreement).
 CREATE TABLE IF NOT EXISTS pipeline_runs (
     run_id              BIGSERIAL PRIMARY KEY,
-    pipeline_name       TEXT NOT NULL CHECK (pipeline_name IN ('batch', 'stream')),
-    status              TEXT NOT NULL CHECK (status IN ('RUNNING', 'SUCCESS', 'FAILED')),
+    pipeline_name       TEXT NOT NULL CHECK (pipeline_name IN ('batch', 'train', 'stream')),
+    status              TEXT NOT NULL CHECK (status IN ('PENDING', 'RUNNING', 'SUCCESS', 'FAILED', 'CANCELLED')),
+    trigger_source      TEXT CHECK (trigger_source IS NULL OR trigger_source IN ('cli', 'legacy', 'github_actions', 'api', 'test')),
+    git_sha             TEXT,
+    config_snapshot     JSONB,
+    config_hash         TEXT,
+    dataset_version     TEXT,
+    model_version       TEXT,
     records_processed   INT NOT NULL DEFAULT 0,
     records_rejected    INT NOT NULL DEFAULT 0,
+    artifacts           JSONB NOT NULL DEFAULT '{}'::jsonb,
+    error_type          TEXT,
+    error_message       TEXT CHECK (error_message IS NULL OR char_length(error_message) <= 2000),
     started_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    heartbeat_at        TIMESTAMPTZ,
     completed_at        TIMESTAMPTZ
 );
+CREATE INDEX IF NOT EXISTS idx_pipeline_runs_pipeline_name ON pipeline_runs (pipeline_name);
+CREATE INDEX IF NOT EXISTS idx_pipeline_runs_status ON pipeline_runs (status);
