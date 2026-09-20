@@ -21,6 +21,18 @@ def configure_mlflow() -> None:
     mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
 
 
+def _resolve_model_version(model_name: str, alias: str):
+    """Shared lookup: the registered model version behind an alias, its
+    MLflow run, and the model_type param used to pick a flavor-specific
+    loader. Used by both load_champion_model() (which also loads weights)
+    and get_model_alias_info() (metadata only, no weights)."""
+    client = mlflow.tracking.MlflowClient()
+    mv = client.get_model_version_by_alias(model_name, alias)
+    run = client.get_run(mv.run_id)
+    model_type = run.data.params.get("model_type", "xgboost")
+    return client, mv, run, model_type
+
+
 def load_champion_model(model_name: str):
     """Loads the `champion`-aliased model version with whichever MLflow
     flavor it was actually registered under.
@@ -33,12 +45,27 @@ def load_champion_model(model_name: str):
 
     Returns (model, version).
     """
-    client = mlflow.tracking.MlflowClient()
-    mv = client.get_model_version_by_alias(model_name, "champion")
-    run = client.get_run(mv.run_id)
-    model_type = run.data.params.get("model_type", "xgboost")
-
+    _, mv, _, model_type = _resolve_model_version(model_name, "champion")
     model_uri = f"models:/{model_name}@champion"
     load_fn = mlflow.xgboost.load_model if model_type == "xgboost" else mlflow.sklearn.load_model
     model = load_fn(model_uri)
     return model, mv.version
+
+
+def get_model_alias_info(model_name: str, alias: str) -> dict:
+    """Metadata only for a registered model alias — never loads model
+    weights. Used by the CLI's `model show` command, which must not
+    promote, retrain, or otherwise modify the registry.
+
+    Returns only model_name, alias, version, model_type, and the MLflow
+    run_id — never parameters, tags, artifact/storage paths, or any
+    credential/environment information.
+    """
+    _, mv, run, model_type = _resolve_model_version(model_name, alias)
+    return {
+        "model_name": model_name,
+        "alias": alias,
+        "version": mv.version,
+        "model_type": model_type,
+        "run_id": mv.run_id,
+    }
