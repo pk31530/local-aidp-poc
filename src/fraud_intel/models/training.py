@@ -1,16 +1,16 @@
-"""Phase 4: shared, per-channel training framework -- chronological split
-with a purge gap, training-window-only preprocessing, calibrated GBM
-primary, LR shadow challenger, candidate channel-bundle registration.
-Reference channel (Online/Mobile Banking) only -- the other six channels
-are Phase 7A.
+"""Shared, per-channel training framework -- chronological split with a
+purge gap, training-window-only preprocessing, calibrated GBM primary, LR
+shadow challenger, unsupervised anomaly detector (Phase 5, guide section
+14), and candidate channel-bundle registration. Reference channel
+(Online/Mobile Banking) only -- the other six channels are Phase 7A.
 
 No real database, MLflow server, or large-scale training is contacted by
-this module's own code in Phase 4 -- every unit test replaces `mlflow`,
-`_train_gbm`/`_train_lr`, and the bundle store with fakes, exactly like
-tests/unit/test_train.py's existing v1.1 pattern. `channel_events`/
-`source_alerts`/`synthetic_labels` are required parameters, not loaded
-from a database, because no real Postgres-backed loader exists until
-Phase 6/7B applies migration 003.
+this module's own code -- every unit test replaces `mlflow`,
+`_train_gbm`/`_train_lr`/`_fit_anomaly`, and the bundle store with fakes,
+exactly like tests/unit/test_train.py's existing v1.1 pattern.
+`channel_events`/`source_alerts`/`synthetic_labels` are required
+parameters, not loaded from a database, because no real Postgres-backed
+loader exists until Phase 6/7B applies migration 003.
 """
 from __future__ import annotations
 
@@ -38,6 +38,7 @@ from src.fraud_intel.features.channels.online_banking import (
     compute_online_banking_features,
 )
 from src.fraud_intel.features.core import FeatureComputationContext
+from src.fraud_intel.models.anomaly import fit_anomaly_model
 from src.fraud_intel.models.bundle import ChannelModelBundleStore, create_default_bundle_store
 from src.fraud_intel.models.calibration import SplitManifest, fit_calibrator
 from src.fraud_intel.models.preprocessing import ChannelPreprocessor
@@ -152,6 +153,11 @@ def _preprocessing_artifact_version(train_rows: Sequence[dict[str, Any]]) -> str
     return "pp-" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 
+def _anomaly_artifact_version(train_rows: Sequence[dict[str, Any]]) -> str:
+    canonical = json.dumps(train_rows, sort_keys=True, separators=(",", ":"), default=str)
+    return "anom-" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
 def _validate_partition(df: pl.DataFrame, name: str, *, min_rows: int) -> None:
     if df.height < min_rows:
         raise InsufficientTrainingDataError(
@@ -200,6 +206,17 @@ def _train_lr(X_train, y_train, config: ChannelTrainingRunConfig):
     return model, params
 
 
+def _fit_anomaly(X_train, config: ChannelTrainingRunConfig, anomaly_artifact_version: str):
+    """Thin, monkeypatch-friendly indirection to
+    src.fraud_intel.models.anomaly.fit_anomaly_model -- same pattern as
+    _train_gbm/_train_lr. Label-agnostic (no y_train parameter at all):
+    IsolationForest fit on the SAME source-alerted training-window matrix
+    GBM/LR train on (guide section 14, Phase 5 decision 2) -- this detects
+    what is unusual WITHIN the alerted population, not across all bank
+    transactions."""
+    return fit_anomaly_model(X_train, random_seed=config.random_seed, anomaly_artifact_version=anomaly_artifact_version)
+
+
 def _evaluate(y_true, y_pred, y_proba) -> dict:
     """Same multi-metric shape as src.ml.train._evaluate -- accuracy is
     computed but explicitly marked supplementary, never the headline."""
@@ -234,7 +251,19 @@ def train_channel_configured(
     source_alerts: Sequence[SourceAlertContext],
     synthetic_labels: Sequence[SyntheticGroundTruthLabel],
     bundle_store: Optional[ChannelModelBundleStore] = None,
+    rule_set_version: Optional[str] = None,
+    graph_policy_version: Optional[str] = None,
+    ensemble_policy_version: Optional[str] = None,
+    reason_code_version: Optional[str] = None,
 ) -> dict:
+    """Phase 5 decision 3: rule_set_version/graph_policy_version/
+    ensemble_policy_version/reason_code_version are optional, pass-through
+    metadata recording which versioned SCORING-time policies this bundle
+    was registered against -- training itself never loads or evaluates
+    any of them. Omitting them (as every Phase 4-era caller still does)
+    reproduces Phase 4's original, deliberately-incomplete bundle exactly;
+    passing all four (as Phase 5's own tests do) produces a bundle with
+    every REQUIRED_OPERATIONAL_COMPONENTS field populated."""
     lifecycle = RunLifecycle()
     run = lifecycle.begin(
         "train",
@@ -331,6 +360,11 @@ def train_channel_configured(
         lr_test_pred = [1 if p >= 0.5 else 0 for p in lr_test_proba]
         lr_eval = _evaluate(y_test, lr_test_pred, lr_test_proba)  # shadow only -- logged, never scored on
 
+        # Anomaly (guide section 14, Phase 5): unsupervised, X_train only --
+        # no y_train argument anywhere in this call.
+        anomaly_artifact_version = _anomaly_artifact_version(train_rows)
+        anomaly_model, anomaly_normalization = _fit_anomaly(X_train, config, anomaly_artifact_version)
+
         configure_mlflow()
         mlflow.set_experiment(EXPERIMENT_NAME)
 
@@ -368,6 +402,17 @@ def train_channel_configured(
             lr_mlflow_run_id = lr_run.info.run_id
             lr_model_version = lr_model_info.registered_model_version
 
+        with mlflow.start_run(run_name=f"online_banking-anomaly-{dataset_version}") as anomaly_run:
+            mlflow.log_param("anomaly_artifact_version", anomaly_artifact_version)
+            mlflow.log_param("contamination", "auto")
+            anomaly_model_info = mlflow.sklearn.log_model(
+                anomaly_model,
+                artifact_path="model",
+                registered_model_name=f"{get_settings().mlflow_model_name}-fraud-intel-online-banking-anomaly",
+            )
+            anomaly_mlflow_run_id = anomaly_run.info.run_id
+            anomaly_model_version = anomaly_model_info.registered_model_version
+
         evaluation_report_ref = json.dumps(
             {
                 "gbm": {k: v for k, v in gbm_eval.items() if k != "confusion_matrix"},
@@ -376,6 +421,8 @@ def train_channel_configured(
                 "realized_split_fractions": realized_fractions,
                 "gbm_mlflow_run_id": gbm_mlflow_run_id,
                 "lr_mlflow_run_id": lr_mlflow_run_id,
+                "anomaly_mlflow_run_id": anomaly_mlflow_run_id,
+                "anomaly_normalization": anomaly_normalization.to_json_dict(),
             },
             sort_keys=True,
         )
@@ -384,9 +431,13 @@ def train_channel_configured(
             channel="online_banking",
             gbm_model_version=str(gbm_model_version),
             lr_model_version=str(lr_model_version),
-            anomaly_model_version=None,  # anomaly training is Phase 5 -- see module docstring
+            anomaly_model_version=str(anomaly_model_version),
             preprocessing_artifact_version=preprocessor.preprocessing_artifact_version,
             feature_schema_version=ONLINE_BANKING_FEATURE_SCHEMA_VERSION,
+            rule_set_version=rule_set_version,
+            graph_policy_version=graph_policy_version,
+            ensemble_policy_version=ensemble_policy_version,
+            reason_code_version=reason_code_version,
             training_run_id=run.run_id,
             dataset_version=dataset_version,
             evaluation_report_ref=evaluation_report_ref,
@@ -402,6 +453,7 @@ def train_channel_configured(
         model_version=str(gbm_model_version),
         artifacts={
             "lr_model_version": str(lr_model_version),
+            "anomaly_model_version": str(anomaly_model_version),
             "preprocessing_artifact_version": preprocessor.preprocessing_artifact_version,
             "feature_schema_version": ONLINE_BANKING_FEATURE_SCHEMA_VERSION,
             "bundle_id": bundle.bundle_id,
@@ -416,6 +468,7 @@ def train_channel_configured(
         "bundle_version": bundle.bundle_version,
         "gbm_model_version": str(gbm_model_version),
         "lr_model_version": str(lr_model_version),
+        "anomaly_model_version": str(anomaly_model_version),
         "dataset_version": dataset_version,
         "gbm_evaluation": gbm_eval,
         "lr_shadow_evaluation": lr_eval,

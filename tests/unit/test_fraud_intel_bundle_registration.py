@@ -16,6 +16,8 @@ from src.fraud_intel.models.bundle import (
 
 
 def _complete_fields(**overrides) -> dict:
+    # Phase 5 decision 3: four additional fields (rule/graph/ensemble/
+    # reason-code versions) are now part of REQUIRED_OPERATIONAL_COMPONENTS.
     base = dict(
         channel="online_banking",
         gbm_model_version="1",
@@ -23,6 +25,10 @@ def _complete_fields(**overrides) -> dict:
         anomaly_model_version="1",
         preprocessing_artifact_version="pp-abc123",
         feature_schema_version="v1",
+        rule_set_version="v1",
+        graph_policy_version="v1",
+        ensemble_policy_version="v1",
+        reason_code_version="v1",
         training_run_id=42,
         dataset_version="ds-abc123",
         evaluation_report_ref="{}",

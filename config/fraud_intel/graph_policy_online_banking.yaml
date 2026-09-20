@@ -1,0 +1,28 @@
+# Online/Mobile Banking entity-graph policy (guide section 15, Phase 5
+# decision 4). Every field is a plain numeric bound or weight -- no
+# arbitrary expressions, validated at load time by
+# src.fraud_intel.graph.entity_graph.GraphPolicy.
+channel: online_banking
+graph_policy_version: v1
+
+# Signal caps: raw counts are divided by these caps and clipped to 1.0
+# before weighting.
+shared_device_cap: 5
+shared_device_weight: 0.3
+fan_in_cap: 10
+fan_in_weight: 0.3
+fan_out_cap: 10
+fan_out_weight: 0.2
+# 1 / (1 + shortest_path_hops); 0 if no fraud-linked entity is reachable.
+shortest_path_weight: 0.2
+
+# Resource bounds (Phase 5 decision 8) -- the graph is rebuilt per scoring
+# call and never allowed to grow unbounded. graph_max_history_events caps
+# how many of the most recent historical events are considered at all;
+# max_nodes/max_edges are a second, independent backstop against
+# pathologically dense history (e.g. one entity linked to thousands of
+# others). Both truncation paths set EntityGraph.truncated = true and
+# surface GRAPH_HISTORY_TRUNCATED as a stable, testable reason code.
+graph_max_history_events: 5000
+max_nodes: 20000
+max_edges: 200000

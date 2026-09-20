@@ -1,0 +1,22 @@
+# Online/Mobile Banking ensemble policy (guide section 16). Weights and
+# thresholds are versioned, config-driven data -- tuned on the calibration
+# window only (guide section 12), never arbitrary expressions. Validated
+# at load time by src.fraud_intel.ensemble.policy.EnsemblePolicy.
+#
+# Synthetic calibration does not represent Citizens Bank production
+# calibration (guide sections 7, 23, 27).
+channel: online_banking
+policy_version: v1
+
+weight_rule: 0.35
+weight_gbm: 0.40
+weight_anomaly: 0.15
+weight_graph: 0.10
+
+# rule_score_contribution (an unbounded sum of fired SCORE_CONTRIBUTING
+# rules) is capped to this value, then normalized to [0, 1], before being
+# weighted (Phase 5 decision 7).
+rule_score_cap: 1.0
+
+high_threshold: 0.75
+medium_threshold: 0.40

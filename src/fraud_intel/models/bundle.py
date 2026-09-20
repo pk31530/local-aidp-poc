@@ -14,15 +14,34 @@ from pydantic import BaseModel, ConfigDict
 from src.common.db import get_connection
 
 # Components required before a bundle may become OPERATIONAL (guide
-# section 22). Phase 4's own candidate registration deliberately leaves
-# anomaly_model_version unset -- anomaly training is Phase 5's job -- so a
-# Phase 4 bundle is correctly, structurally NOT promotion-eligible yet.
+# section 22). Phase 4's own candidate registration deliberately left
+# anomaly_model_version unset -- anomaly training was Phase 5's job -- so
+# that bundle is correctly, structurally NOT promotion-eligible.
+#
+# Phase 5 decision 3 adds four more required fields -- rule_set_version,
+# graph_policy_version, ensemble_policy_version, reason_code_version --
+# recording which versioned policies a bundle was registered against.
+# These are kept OPTIONAL on ChannelModelBundleRecord itself (so Phase 4's
+# already-registered, immutable bundle stays valid and unchanged) but are
+# now part of REQUIRED_OPERATIONAL_COMPONENTS, so Phase 5's own complete
+# bundle must supply all nine before it can ever be promotion-eligible.
+#
+# channel_model_bundles (Phase 1 schema.sql / migration 003) does NOT yet
+# have columns for these four -- Phase 6's migration 004 and schema.sql
+# must add rule_set_version, graph_policy_version, ensemble_policy_version,
+# and reason_code_version before any real (Postgres-backed) bundle
+# persistence can occur. Not implemented in Phase 5 -- no migration is
+# edited or applied here; every Phase 5 test uses the in-memory fake store.
 REQUIRED_OPERATIONAL_COMPONENTS = (
     "gbm_model_version",
     "lr_model_version",
     "anomaly_model_version",
     "preprocessing_artifact_version",
     "feature_schema_version",
+    "rule_set_version",
+    "graph_policy_version",
+    "ensemble_policy_version",
+    "reason_code_version",
 )
 
 
@@ -48,6 +67,10 @@ class ChannelModelBundleRecord(BaseModel):
     anomaly_model_version: Optional[str] = None
     preprocessing_artifact_version: Optional[str] = None
     feature_schema_version: Optional[str] = None
+    rule_set_version: Optional[str] = None
+    graph_policy_version: Optional[str] = None
+    ensemble_policy_version: Optional[str] = None
+    reason_code_version: Optional[str] = None
     training_run_id: Optional[int] = None
     dataset_version: Optional[str] = None
     evaluation_report_ref: Optional[str] = None
@@ -100,6 +123,19 @@ class _PostgresChannelModelBundleStore:
         self._database = database
 
     def register_candidate(self, **fields: Any) -> ChannelModelBundleRecord:
+        # NOTE (Phase 5): the INSERT's column list is built dynamically
+        # from `fields`, so it already accepts rule_set_version/
+        # graph_policy_version/ensemble_policy_version/reason_code_version
+        # once a caller passes them -- but the RETURNING clause below is
+        # NOT yet updated to select those four columns, because they do
+        # not exist in channel_model_bundles until Phase 6's migration 004
+        # adds them. Passing those four kwargs to this method today would
+        # fail with a real "column does not exist" error, which is
+        # correct and intentional: this method is not exercised by any
+        # Phase 5 test (every test uses _FakeChannelModelBundleStore), and
+        # must not silently pretend to support columns that do not exist
+        # yet. Update the RETURNING clause in the same commit that adds
+        # migration 004's four new columns.
         conn = get_connection(self._database)
         try:
             with conn:

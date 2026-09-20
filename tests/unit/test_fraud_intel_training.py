@@ -207,6 +207,19 @@ class _FakeModel:
         return [[0.0, 1.0] for _ in range(len(X))]
 
 
+class _FakeAnomalyModel:
+    def fit(self, X):
+        return self
+
+    def decision_function(self, X):
+        return [0.0 for _ in range(len(X))]
+
+
+class _FakeAnomalyNormalization:
+    def to_json_dict(self):
+        return {"train_min": 0.0, "train_max": 1.0}
+
+
 class _FakeModelInfo:
     def __init__(self, version):
         self.registered_model_version = version
@@ -226,7 +239,17 @@ class _FakeMlflowRunContext:
 class _FakeMlflow:
     def __init__(self):
         self.xgboost = type("M", (), {"log_model": staticmethod(lambda *a, **k: _FakeModelInfo("gbm-7"))})()
-        self.sklearn = type("M", (), {"log_model": staticmethod(lambda *a, **k: _FakeModelInfo("lr-7"))})()
+        self.sklearn = type(
+            "M",
+            (),
+            {
+                "log_model": staticmethod(
+                    lambda *a, registered_model_name="", **k: _FakeModelInfo(
+                        "anomaly-7" if "anomaly" in registered_model_name else "lr-7"
+                    )
+                )
+            },
+        )()
         self.models = type("M", (), {"infer_signature": staticmethod(lambda *a, **k: "fake-signature")})()
 
     def set_experiment(self, name):
@@ -298,6 +321,9 @@ def _fakes(monkeypatch):
     monkeypatch.setattr(training_module, "configure_mlflow", lambda: None)
     monkeypatch.setattr(training_module, "_train_gbm", lambda X, y, config: (_FakeModel(), {"n_estimators": 1}))
     monkeypatch.setattr(training_module, "_train_lr", lambda X, y, config: (_FakeModel(), {"max_iter": 1}))
+    monkeypatch.setattr(
+        training_module, "_fit_anomaly", lambda X, config, version: (_FakeAnomalyModel(), _FakeAnomalyNormalization())
+    )
     yield store_holder
 
 
@@ -315,9 +341,16 @@ def test_successful_run_registers_a_candidate_bundle_and_no_alias(_fakes):
     bundle = bundle_store.rows[0]
     assert bundle.status == "CANDIDATE"
     assert bundle.channel == "online_banking"
-    assert bundle.anomaly_model_version is None
+    # Phase 5: anomaly training is now unconditional -- this bundle is
+    # complete with respect to the 5 Phase-4-era components. It remains
+    # incomplete with respect to Phase 5's 4 policy-version fields (rule/
+    # graph/ensemble/reason-code), since this test doesn't pass them --
+    # see test_fraud_intel_orchestrator.py / the Phase 5 "complete bundle"
+    # test for the fully-populated case.
+    assert bundle.anomaly_model_version == "anomaly-7"
     assert bundle.gbm_model_version == "gbm-7"
     assert bundle.lr_model_version == "lr-7"
+    assert bundle.rule_set_version is None
     assert bundle.training_run_id == result["run_id"]
     assert bundle.dataset_version == result["dataset_version"]
 
