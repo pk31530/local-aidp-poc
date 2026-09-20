@@ -176,10 +176,11 @@ Each run should record as much of the following as is applicable:
 
 ## 6. Before opening Claude Code
 
-Run these commands in Terminal:
+Run these commands in Terminal (replace `/path/to/local-aidp-poc` with your
+own clone's location):
 
 ```bash
-cd /Users/prabhatkumar/Documents/AiDP/local-aidp-poc
+cd /path/to/local-aidp-poc
 git fetch origin
 git switch feat/aidp-v1-1-hardening
 git pull --ff-only
@@ -816,4 +817,3 @@ AiDP v1.2 is complete when:
 - All unit tests and approved integration tests pass.
 - Documentation reflects actual behaviour.
 - The branch is clean, pushed and reviewed through a pull request.
-
