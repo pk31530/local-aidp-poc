@@ -36,6 +36,7 @@ from typing import Any, Optional
 import pandas as pd
 import streamlit as st
 
+from src.common.config import get_settings
 from src.common.db import get_connection
 from src.fraud_intel.alerts.queue import (
     AlertEvidenceRecord,
@@ -47,8 +48,13 @@ from src.fraud_intel.alerts.queue import (
 
 # This dashboard tab is scoped to the local synthetic POC database only --
 # never `aidp` -- matching every `aidp fraud-intel`/`aidp alerts` CLI
-# command's own required (never defaulted) `--database` contract.
-DATABASE = "aidp_test"
+# command's own required (never defaulted) `--database` contract. Phase 8
+# corrective pass: sourced from the SAME existing, already-configured
+# `postgres_test_db` setting `src/dashboard/data.py` and
+# `tests/integration`/`tests/smoke` use (aidp_test by default,
+# overridable via .env's POSTGRES_TEST_DB) -- not an independent literal
+# that could drift from the rest of the dashboard's own database choice.
+DATABASE = get_settings().postgres_test_db
 
 FRAUD_INTEL_CHANNELS = ("online_banking", "mobile_deposit", "ach", "wire", "atm", "debit_card", "p2p")
 PRIORITY_BANDS = ("LOW", "MEDIUM", "HIGH")

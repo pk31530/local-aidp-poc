@@ -17,9 +17,19 @@ from src.common.db import get_connection
 
 CONFUSION_MATRIX_PATH = PROJECT_ROOT / "data" / "models" / "last_confusion_matrix.json"
 
+# Phase 8 corrective pass: the dashboard (every tab, including the legacy
+# v1.1 ones below) must never resolve a bare get_connection() call to
+# `settings.postgres_db`'s default ("aidp") -- it explicitly targets the
+# existing `postgres_test_db` setting (aidp_test by default, overridable
+# via .env's POSTGRES_TEST_DB), the SAME setting `tests/integration`/
+# `tests/smoke` already use, rather than introducing a new one. See
+# RUNBOOK.md's "v1.3 fraud intelligence" section.
+def _dashboard_database() -> str:
+    return get_settings().postgres_test_db
+
 
 def _query_df(sql: str, params: tuple = ()) -> pd.DataFrame:
-    conn = get_connection()
+    conn = get_connection(_dashboard_database())
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(sql, params)
@@ -117,7 +127,7 @@ def get_platform_health() -> dict:
     results: dict[str, bool] = {}
 
     try:
-        conn = get_connection()
+        conn = get_connection(settings.postgres_test_db)
         conn.close()
         results["PostgreSQL"] = True
     except Exception:

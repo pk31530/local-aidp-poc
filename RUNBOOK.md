@@ -409,6 +409,19 @@ pinned bundle/policy provenance, and disposition history — analyst
 disposition capture remains CLI-only, via `aidp alerts disposition` above).
 Reads `aidp_test` only; never `aidp`.
 
+**Database-selection contract (Phase 8 corrective pass)**: every
+dashboard database connection — the entire `src/dashboard/data.py`
+module (including the legacy v1.1 tabs' own Postgres health check) and
+`src/dashboard/fraud_intel_tab.py` alike — resolves through the existing
+`Settings.postgres_test_db` field (`src/common/config.py`; defaults to
+`aidp_test`, overridable via `.env`'s `POSTGRES_TEST_DB`, the same
+setting `tests/integration`/`tests/smoke` already use). No dashboard code
+path ever calls `get_connection()` with no argument, which would
+otherwise silently resolve to `Settings.postgres_db`'s default (`aidp`) —
+this was a real defect (the platform-health Postgres probe did exactly
+that) found and fixed after Phase 8's initial implementation; see
+`tests/smoke/test_dashboard.py`'s explicit-database tests for the proof.
+
 ## Make targets
 
 ```
