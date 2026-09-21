@@ -33,7 +33,6 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 
-from src.common.config import get_settings
 from src.common.mlflow_setup import configure_mlflow
 from src.common.splits import assign_chronological_split, realized_split_fractions
 from src.control_plane.provenance import get_git_sha
@@ -45,6 +44,7 @@ from src.fraud_intel.features.core import FeatureComputationContext
 from src.fraud_intel.models.anomaly import fit_anomaly_model
 from src.fraud_intel.models.bundle import ChannelModelBundleStore, create_default_bundle_store
 from src.fraud_intel.models.calibration import SplitManifest, fit_calibrator
+from src.fraud_intel.models.mlflow_naming import registered_model_name
 from src.fraud_intel.models.preprocessing import ChannelPreprocessor
 from src.fraud_intel.registry import ChannelAdapter, get_channel_adapter
 
@@ -54,9 +54,6 @@ EXPERIMENT_NAME_PREFIX = "fraud-intel"
 def _experiment_name(channel: str) -> str:
     return f"{EXPERIMENT_NAME_PREFIX}-{channel}"
 
-
-def _registered_model_name_prefix(channel: str) -> str:
-    return f"{get_settings().mlflow_model_name}-fraud-intel-{channel.replace('_', '-')}"
 
 # Phase 4 interim-only label-eligibility policy (guide sections 8, 11, 19).
 # The guide's REAL, versioned eligibility policy requires label_assessments
@@ -455,7 +452,7 @@ def train_channel_configured(
                 gbm_model,
                 artifact_path="model",
                 signature=signature,
-                registered_model_name=f"{_registered_model_name_prefix(config.channel)}-gbm",
+                registered_model_name=registered_model_name(config.channel, "gbm"),
             )
             gbm_mlflow_run_id = gbm_run.info.run_id
             # Phase 6 corrective pass: the preprocessor was previously only
@@ -482,7 +479,7 @@ def train_channel_configured(
                 lr_model,
                 artifact_path="model",
                 signature=lr_signature,
-                registered_model_name=f"{_registered_model_name_prefix(config.channel)}-lr-shadow",
+                registered_model_name=registered_model_name(config.channel, "lr-shadow"),
             )
             lr_mlflow_run_id = lr_run.info.run_id
             lr_model_version = lr_model_info.registered_model_version
@@ -493,7 +490,7 @@ def train_channel_configured(
             anomaly_model_info = mlflow.sklearn.log_model(
                 anomaly_model,
                 artifact_path="model",
-                registered_model_name=f"{_registered_model_name_prefix(config.channel)}-anomaly",
+                registered_model_name=registered_model_name(config.channel, "anomaly"),
             )
             anomaly_mlflow_run_id = anomaly_run.info.run_id
             anomaly_model_version = anomaly_model_info.registered_model_version

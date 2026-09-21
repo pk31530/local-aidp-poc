@@ -21,11 +21,11 @@ from src.fraud_intel.events.wire import WirePayload
 from src.fraud_intel.features.core import FeatureComputationContext
 from src.fraud_intel.graph.entity_graph import EntityType, load_graph_policy
 from src.fraud_intel.ensemble.policy import load_ensemble_policy
-from src.fraud_intel.models.training import _experiment_name, _registered_model_name_prefix
+from src.fraud_intel.models.mlflow_naming import MODEL_COMPONENTS, UnknownModelComponentError, registered_model_name
+from src.fraud_intel.models.training import _experiment_name
 from src.fraud_intel.reason_codes.builder import REASON_CODE_VERSION, build_reason_codes
 from src.fraud_intel.registry import CHANNEL_ADAPTERS, get_channel_adapter
 from src.fraud_intel.rules.provider import LocalYamlRuleProvider, _load_rule_set_config
-from src.fraud_intel.scoring.dispatch import mlflow_model_name_prefix
 
 ALL_CHANNELS = sorted({"ach", "wire", "mobile_deposit", "online_banking", "atm", "debit_card", "p2p"})
 
@@ -131,17 +131,26 @@ def test_rule_provider_evaluates_for_every_channel(channel):
 # ---- MLflow model/artifact naming contract ---------------------------------------------
 
 
-def test_mlflow_naming_helpers_agree_between_training_and_scoring():
-    """training.py's registration-time naming and dispatch.py's load-time
-    naming must produce the IDENTICAL prefix for every channel, or a real
-    trained model could never be found again at scoring time."""
+def test_canonical_model_names_match_expected_pattern_for_all_seven_channels():
+    """Phase 7B Stage 5 corrective pass: training, scoring's artifact
+    loader, and promotion's verifier all call the SAME
+    registered_model_name() -- there is no longer a separate
+    training-side/scoring-side implementation to drift apart."""
     for channel in ALL_CHANNELS:
-        assert _registered_model_name_prefix(channel) == mlflow_model_name_prefix(channel)
+        for component in MODEL_COMPONENTS:
+            name = registered_model_name(channel, component)
+            assert name == f"fraud-detection-model-fraud-intel-{channel.replace('_', '-')}-{component}"
+
+
+def test_lr_component_is_named_lr_shadow_never_lr():
+    assert registered_model_name("online_banking", "lr-shadow") == "fraud-detection-model-fraud-intel-online-banking-lr-shadow"
+    with pytest.raises(UnknownModelComponentError):
+        registered_model_name("online_banking", "lr")
 
 
 def test_mlflow_naming_is_distinct_per_channel():
-    prefixes = {mlflow_model_name_prefix(channel) for channel in ALL_CHANNELS}
-    assert len(prefixes) == len(ALL_CHANNELS)
+    names = {registered_model_name(channel, "gbm") for channel in ALL_CHANNELS}
+    assert len(names) == len(ALL_CHANNELS)
     experiment_names = {_experiment_name(channel) for channel in ALL_CHANNELS}
     assert len(experiment_names) == len(ALL_CHANNELS)
 

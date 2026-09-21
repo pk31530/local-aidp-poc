@@ -30,6 +30,7 @@ from src.fraud_intel.events.source_alert_context import SourceAlertContext
 from src.fraud_intel.features.core import FeatureComputationContext
 from src.fraud_intel.graph.entity_graph import GraphPolicy, ResolvedFraudEntityEvidence, load_graph_policy
 from src.fraud_intel.models.bundle import ChannelModelBundleRecord
+from src.fraud_intel.models.mlflow_naming import registered_model_name
 from src.fraud_intel.reason_codes.builder import REASON_CODE_VERSION
 from src.fraud_intel.rules.provider import LocalYamlRuleProvider, RuleProvider, _load_rule_set_config
 from src.fraud_intel.scoring.orchestrator import LoadedChannelBundle
@@ -152,17 +153,6 @@ def _bundle_config_hash(bundle: ChannelModelBundleRecord) -> str:
 # ---- real, MLflow-backed artifact loader (reviewed as code, not exercised) --------
 
 
-def mlflow_model_name_prefix(channel: str) -> str:
-    """The registered-model-name prefix a channel's GBM/LR/anomaly models
-    are logged under (src.fraud_intel.models.training uses the identical
-    formula, src.fraud_intel.models.training._registered_model_name_prefix)
-    -- a pure, testable function so the seven-channel MLflow naming
-    contract can be verified without contacting real MLflow."""
-    from src.common.config import get_settings
-
-    return f"{get_settings().mlflow_model_name}-fraud-intel-{channel.replace('_', '-')}"
-
-
 class _MlflowBundleArtifactLoader:
     """Loads the OPERATIONAL bundle's actual GBM/LR/anomaly model objects
     and its preprocessing/anomaly-normalization artifacts from MLflow,
@@ -195,11 +185,11 @@ class _MlflowBundleArtifactLoader:
             ) from exc
 
         configure_mlflow()
-        model_name_prefix = mlflow_model_name_prefix(bundle.channel)
-
-        gbm_model = mlflow.xgboost.load_model(f"models:/{model_name_prefix}-gbm/{bundle.gbm_model_version}")
-        lr_model = mlflow.sklearn.load_model(f"models:/{model_name_prefix}-lr-shadow/{bundle.lr_model_version}")
-        anomaly_model = mlflow.sklearn.load_model(f"models:/{model_name_prefix}-anomaly/{bundle.anomaly_model_version}")
+        gbm_model = mlflow.xgboost.load_model(f"models:/{registered_model_name(bundle.channel, 'gbm')}/{bundle.gbm_model_version}")
+        lr_model = mlflow.sklearn.load_model(f"models:/{registered_model_name(bundle.channel, 'lr-shadow')}/{bundle.lr_model_version}")
+        anomaly_model = mlflow.sklearn.load_model(
+            f"models:/{registered_model_name(bundle.channel, 'anomaly')}/{bundle.anomaly_model_version}"
+        )
 
         preprocessor = ChannelPreprocessor.from_json_dict(mlflow.artifacts.load_dict(f"runs:/{gbm_run_id}/preprocessor.json"))
         anomaly_normalization = AnomalyNormalization.from_json_dict(

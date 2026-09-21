@@ -459,19 +459,25 @@ def _handle_fraud_intel_evaluate(args: argparse.Namespace) -> dict:
 
 class _MlflowModelVersionVerifier:
     """Metadata-only -- never loads model weights, mirrors
-    src.common.mlflow_setup's existing pattern."""
+    src.common.mlflow_setup's existing pattern. Phase 7B Stage 5: when the
+    caller supplies `expected_run_id` (from the candidate's own
+    evaluation_report_ref), also confirms the registered version points
+    at that exact MLflow run -- not merely that the version exists."""
 
-    def verify(self, model_name: str, version: str) -> bool:
+    def verify(self, model_name: str, version: str, *, expected_run_id: str | None = None) -> bool:
         import mlflow
 
         client = mlflow.tracking.MlflowClient()
-        client.get_model_version(model_name, version)
+        model_version = client.get_model_version(model_name, version)
+        if expected_run_id is not None and model_version.run_id != expected_run_id:
+            return False
         return True
 
 
 def _handle_fraud_intel_promote(args: argparse.Namespace) -> dict:
     database = _require_database(args)
-    from src.fraud_intel.models.promotion import promote_bundle
+    from src.fraud_intel.evaluation.cold_start import ColdStartReportError
+    from src.fraud_intel.models.promotion import ColdStartPromotionGateFailedError, promote_bundle
 
     store = create_default_bundle_promotion_store(database)
     try:
@@ -479,10 +485,17 @@ def _handle_fraud_intel_promote(args: argparse.Namespace) -> dict:
             channel=args.channel,
             bundle_version=args.bundle_version,
             promoted_by=args.promoted_by,
+            database=database,
             model_version_verifier=_MlflowModelVersionVerifier(),
             store=store,
         )
-    except (IncompleteBundleError, BundleVerificationFailedError, BundlePromotionRaceError) as exc:
+    except (
+        IncompleteBundleError,
+        BundleVerificationFailedError,
+        BundlePromotionRaceError,
+        ColdStartReportError,
+        ColdStartPromotionGateFailedError,
+    ) as exc:
         raise CLIUserError(str(exc)) from exc
     return result.model_dump(mode="json")
 

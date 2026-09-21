@@ -18,7 +18,11 @@ from src.fraud_intel.alerts.queue import (
     _FakeAlertQueueStore,
 )
 from src.fraud_intel.models.bundle import ChannelModelBundleRecord, IncompleteBundleError
-from src.fraud_intel.models.promotion import BundlePromotionRaceError, BundleVerificationFailedError
+from src.fraud_intel.models.promotion import (
+    BundlePromotionRaceError,
+    BundleVerificationFailedError,
+    ColdStartPromotionGateFailedError,
+)
 
 T0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
@@ -795,11 +799,15 @@ def test_promote_dispatches_and_returns_the_promoted_bundle(monkeypatch, capsys)
     promoted = _bundle(bundle_id=2, bundle_version=1, promoted_by="analyst1", promoted_at=T0)
     captured = {}
 
-    def _fake_promote_bundle(*, channel, bundle_version, promoted_by, model_version_verifier, store):
-        captured.update(channel=channel, bundle_version=bundle_version, promoted_by=promoted_by, store=store)
+    def _fake_create_default_bundle_promotion_store(database):
+        captured["store_database"] = database
+        return fake_store
+
+    def _fake_promote_bundle(*, channel, bundle_version, promoted_by, database, model_version_verifier, store):
+        captured.update(channel=channel, bundle_version=bundle_version, promoted_by=promoted_by, database=database, store=store)
         return promoted
 
-    monkeypatch.setattr(cli_main, "create_default_bundle_promotion_store", lambda database: fake_store)
+    monkeypatch.setattr(cli_main, "create_default_bundle_promotion_store", _fake_create_default_bundle_promotion_store)
     monkeypatch.setattr("src.fraud_intel.models.promotion.promote_bundle", _fake_promote_bundle)
 
     cli_main.main(
@@ -810,15 +818,41 @@ def test_promote_dispatches_and_returns_the_promoted_bundle(monkeypatch, capsys)
     assert captured["bundle_version"] == 1
     assert captured["promoted_by"] == "analyst1"
     assert captured["store"] is fake_store
+    # Phase 7B Stage 5: the promotion store and promote_bundle()'s own
+    # RunLifecycle must be given the SAME explicit database -- there is
+    # only one `database` local variable in the handler, used for both.
+    assert captured["database"] == "aidp_test"
+    assert captured["store_database"] == "aidp_test"
+    assert captured["database"] == captured["store_database"]
     result = json.loads(capsys.readouterr().out)
     assert result["bundle_id"] == 2
     assert result["status"] == "OPERATIONAL"
 
 
-@pytest.mark.parametrize("exc_cls", [IncompleteBundleError, BundleVerificationFailedError, BundlePromotionRaceError])
+@pytest.mark.parametrize(
+    "exc_cls",
+    [IncompleteBundleError, BundleVerificationFailedError, BundlePromotionRaceError, ColdStartPromotionGateFailedError],
+)
 def test_promote_maps_domain_errors_to_cli_user_error(monkeypatch, capsys, exc_cls):
     def _raise(**kwargs):
         raise exc_cls("refused")
+
+    monkeypatch.setattr(cli_main, "create_default_bundle_promotion_store", lambda database: object())
+    monkeypatch.setattr("src.fraud_intel.models.promotion.promote_bundle", _raise)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_main.main(
+            ["fraud-intel", "promote", "--channel", "online_banking", "--bundle-version", "1", "--promoted-by", "analyst1", "--database", "aidp_test", "--json"]
+        )
+    assert exc_info.value.code == 2
+    assert json.loads(capsys.readouterr().out)["error"] == "CLIUserError"
+
+
+def test_promote_maps_cold_start_report_error_to_cli_user_error(monkeypatch, capsys):
+    from src.fraud_intel.evaluation.cold_start import ColdStartReportError
+
+    def _raise(**kwargs):
+        raise ColdStartReportError("bundle's evaluation_report_ref does not match its own bundle row")
 
     monkeypatch.setattr(cli_main, "create_default_bundle_promotion_store", lambda database: object())
     monkeypatch.setattr("src.fraud_intel.models.promotion.promote_bundle", _raise)
