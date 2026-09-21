@@ -102,7 +102,7 @@ def generate_and_write(*, channel: str, count: int, seed: int, database: str, re
                 existing_run_id_by_event: dict[str, str] = {}
                 if event_ids:
                     dict_cur.execute(
-                        "SELECT event_id, generation_run_id FROM channel_events WHERE event_id = ANY(%s)",
+                        "SELECT event_id, generation_run_id FROM channel_events WHERE event_id = ANY(%s::uuid[])",
                         (event_ids,),
                     )
                     existing_run_id_by_event = {str(row["event_id"]): row["generation_run_id"] for row in dict_cur.fetchall()}
@@ -273,7 +273,7 @@ def load_channel_population(
                     # (channel, generation_run_id) pair.
                     return [], [], []
 
-                cur.execute("SELECT * FROM source_alerts WHERE event_id = ANY(%s)", (event_ids,))
+                cur.execute("SELECT * FROM source_alerts WHERE event_id = ANY(%s::uuid[])", (event_ids,))
                 source_alerts = [
                     SourceAlertContext(
                         source_alert_id=row["source_alert_id"], source_system=row["source_system"],
@@ -287,7 +287,7 @@ def load_channel_population(
                     for row in cur.fetchall()
                 ]
 
-                cur.execute("SELECT * FROM synthetic_event_labels WHERE event_id = ANY(%s)", (event_ids,))
+                cur.execute("SELECT * FROM synthetic_event_labels WHERE event_id = ANY(%s::uuid[])", (event_ids,))
                 labels = [
                     SyntheticGroundTruthLabel(
                         event_id=row["event_id"], scenario_id=row["scenario_id"],

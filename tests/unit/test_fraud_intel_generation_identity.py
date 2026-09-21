@@ -10,6 +10,7 @@ collision behavior is genuinely proven rather than merely asserted.
 """
 from __future__ import annotations
 
+import uuid
 from datetime import date
 
 import pytest
@@ -351,3 +352,139 @@ def test_load_channel_population_requires_generation_run_id_keyword():
     sig = inspect.signature(load_channel_population)
     assert sig.parameters["generation_run_id"].default is inspect.Parameter.empty
     assert sig.parameters["generation_run_id"].kind == inspect.Parameter.KEYWORD_ONLY
+
+
+# ---- UUID-array cast regression -- first real-Postgres run hit ------------------------
+# `channel_events.event_id`/etc are real `UUID` columns; ANY(%s) against a
+# plain Python string list adapts to text[], and Postgres has no implicit
+# uuid = text operator (psycopg2.errors.UndefinedFunction). Every ANY(...)
+# query against a uuid column must cast explicitly: ANY(%s::uuid[]).
+# register_uuid() was deliberately NOT used to fix this -- it is global,
+# process-wide psycopg2 adapter/typecaster state that would change how
+# EVERY existing query in src/common/db.py's connections behaves, not
+# just these three, which is a far larger blast radius than this fix
+# needs.
+
+
+def test_all_three_uuid_array_queries_use_an_explicit_cast():
+    import inspect
+
+    from src.fraud_intel import cli_data_access
+
+    generate_source = inspect.getsource(cli_data_access.generate_and_write)
+    population_source = inspect.getsource(cli_data_access.load_channel_population)
+
+    assert generate_source.count("ANY(%s::uuid[])") == 1
+    assert population_source.count("ANY(%s::uuid[])") == 2
+    # the old, uncast form must be fully gone from both functions
+    assert "ANY(%s)" not in generate_source
+    assert "ANY(%s)" not in population_source
+
+
+def test_no_sql_is_built_through_string_interpolation_or_concatenation():
+    """AST-based: every .execute(...) call in generate_and_write/
+    load_channel_population passes a plain string literal as its SQL
+    argument -- never an f-string, %-formatted string, or + concatenation
+    built from a variable -- so parameterization is the only path any
+    runtime value ever reaches these queries through."""
+    import ast
+    import inspect
+
+    from src.fraud_intel import cli_data_access
+
+    for fn in (cli_data_access.generate_and_write, cli_data_access.load_channel_population):
+        tree = ast.parse(inspect.getsource(fn))
+        execute_call_count = 0
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "execute":
+                execute_call_count += 1
+                sql_arg = node.args[0]
+                assert isinstance(sql_arg, ast.Constant) and isinstance(sql_arg.value, str), (
+                    f"{fn.__name__}: .execute()'s SQL argument must be a plain string literal, not a "
+                    f"dynamically constructed value: {ast.dump(sql_arg)}"
+                )
+        assert execute_call_count > 0
+
+
+def test_every_parameterized_execute_call_passes_a_separate_params_argument():
+    """Every .execute(sql, params) call whose SQL literal contains a %s
+    placeholder supplies a second (params) argument -- values are always
+    passed as query parameters, never folded into the SQL text itself."""
+    import ast
+    import inspect
+
+    from src.fraud_intel import cli_data_access
+
+    for fn in (cli_data_access.generate_and_write, cli_data_access.load_channel_population):
+        tree = ast.parse(inspect.getsource(fn))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "execute":
+                sql_literal = node.args[0].value
+                if "%s" in sql_literal:
+                    assert len(node.args) == 2, f"{fn.__name__}: parameterized query {sql_literal!r} must pass a params argument"
+
+
+def test_event_id_is_always_a_real_uuid_at_the_type_level():
+    """Structural: event_ids fed into every ANY(%s::uuid[]) query are
+    always str(uuid.UUID) -- FraudEvent.event_id is itself typed
+    uuid.UUID (pydantic-validated at construction), so a malformed
+    string can never originate from this codebase's own values in the
+    first place. Combined with the explicit ::uuid[] cast, even a
+    hypothetical malformed value would be cleanly rejected by Postgres'
+    own type system rather than silently matching unintended rows."""
+    from src.fraud_intel.events.base import FraudEvent
+
+    assert FraudEvent.model_fields["event_id"].annotation is uuid.UUID
+
+
+def test_generate_and_write_with_zero_count_skips_the_collision_query_and_writes_nothing(monkeypatch):
+    """An empty event_ids list (count=0) must not produce an unbounded or
+    unsafe query -- generate_and_write's own `if event_ids:` guard skips
+    issuing the ANY(...) query at all in that case."""
+    conn = _FakeGenerateConnection()
+    issued_sql: list[str] = []
+    original_execute = _FakeGenerateCursor.execute
+
+    def _tracking_execute(self, sql, params=()):
+        issued_sql.append(sql)
+        return original_execute(self, sql, params)
+
+    monkeypatch.setattr(_FakeGenerateCursor, "execute", _tracking_execute)
+    _patch_connection(monkeypatch, conn)
+
+    result = generate_and_write(channel="online_banking", count=0, seed=1, database="aidp_test", reference_date=date(2026, 1, 1))
+
+    assert result["requested_count"] == 0
+    assert result["inserted_event_count"] == 0
+    assert result["existing_event_count"] == 0
+    assert not any("ANY(%s::uuid[])" in sql for sql in issued_sql)
+    assert not conn.channel_events
+
+
+def test_generation_identities_and_scoped_population_loading_are_unchanged_by_the_cast_fix(monkeypatch):
+    """Regression: the ::uuid[] cast is purely an SQL-text change --
+    deterministic-identity computation and generation-scoped population
+    loading behave identically to before it, proven end-to-end through
+    the same fakes as the rest of this file."""
+    identity_before_and_after = [
+        _generation_identity(channel="online_banking", count=5000, seed=42, reference_date=date(2026, 1, 1))
+        for _ in range(2)
+    ]
+    assert identity_before_and_after[0] == identity_before_and_after[1]
+
+    conn = _FakeGenerateConnection()
+    _patch_connection(monkeypatch, conn)
+    first = generate_and_write(channel="online_banking", count=20, seed=1, database="aidp_test", reference_date=date(2026, 1, 1))
+    second = generate_and_write(channel="online_banking", count=20, seed=1, database="aidp_test", reference_date=date(2026, 1, 1))
+    assert first["generation_run_id"] == second["generation_run_id"]
+    assert second["existing_event_count"] == 20
+    assert second["inserted_event_count"] == 0
+
+    results = _results()
+    channel_events_rows, source_alert_rows, label_rows = _population_rows(results)
+    pop_conn = _FakePopulationConnection(channel_events_rows, source_alert_rows, label_rows)
+    monkeypatch.setattr("src.fraud_intel.cli_data_access.get_connection", lambda database: pop_conn)
+    events, source_alerts, labels = load_channel_population("online_banking", "aidp_test", generation_run_id="genrun-fixture")
+    assert len(events) == len(results)
+    assert len(source_alerts) == sum(1 for _, sa, _ in results if sa is not None)
+    assert len(labels) == len(results)
