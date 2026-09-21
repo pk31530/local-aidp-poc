@@ -271,9 +271,37 @@ def _split_manifest_from(split_df: pl.DataFrame, all_ids: Sequence[str]) -> Spli
     return SplitManifest(train_ids=train_ids, calibration_ids=calibration_ids, purge_ids=purge_ids, test_ids=test_ids)
 
 
+class AmbiguousGenerationProvenanceError(ValueError):
+    """The source_alerts feeding this training population carry more than
+    one distinct (generation_run_id, dataset_version) pair -- training
+    must never silently pick one and mix generations together."""
+
+
+def _source_generation_provenance(source_alerts: Sequence[SourceAlertContext]) -> tuple[str, str]:
+    """The Stage-2 generation identity (`genrun-...`/`dsv-...`, minted by
+    src.fraud_intel.cli_data_access.generate_and_write) that every row
+    contributing to this training population was generated under --
+    NOT to be confused with _dataset_version() below, which is a
+    completely different, training-DERIVED content hash of the
+    supervised population itself. Both values end up in
+    evaluation_report_ref under clearly distinct names specifically so
+    they are never conflated (source_generation_run_id/
+    source_dataset_version here vs. dataset_version/
+    supervised_population_hash for the derived hash)."""
+    run_ids = {alert.generation_run_id for alert in source_alerts}
+    dataset_versions = {alert.dataset_version for alert in source_alerts}
+    if len(run_ids) != 1 or len(dataset_versions) != 1:
+        raise AmbiguousGenerationProvenanceError(
+            f"training population spans more than one Stage-2 generation -- "
+            f"generation_run_id(s)={sorted(run_ids)!r}, dataset_version(s)={sorted(dataset_versions)!r}"
+        )
+    return next(iter(run_ids)), next(iter(dataset_versions))
+
+
 def train_channel_configured(
     config: ChannelTrainingRunConfig,
     *,
+    database: str,
     trigger_source: str = "legacy",
     channel_events: Sequence[FraudEvent],
     source_alerts: Sequence[SourceAlertContext],
@@ -291,8 +319,21 @@ def train_channel_configured(
     any of them. Omitting them (as every Phase 4-era caller still does)
     reproduces Phase 4's original, deliberately-incomplete bundle exactly;
     passing all four (as Phase 5's own tests do) produces a bundle with
-    every REQUIRED_OPERATIONAL_COMPONENTS field populated."""
-    lifecycle = RunLifecycle()
+    every REQUIRED_OPERATIONAL_COMPONENTS field populated.
+
+    Phase 7B Stage 3 corrective pass: `database` is REQUIRED, with no
+    default of any kind, specifically so this function can never silently
+    fall back to `.env`'s POSTGRES_DB default (production `aidp`) the way
+    the bare `RunLifecycle()`/`create_default_bundle_store()` calls used
+    to. Every caller -- CLI or test -- must say explicitly which database
+    both the `train` pipeline_runs record AND the candidate bundle row
+    are written to, and both are guaranteed to be the SAME database
+    (there is exactly one `database` value in this function, used for
+    both)."""
+    if not database:
+        raise ValueError("database is required and must not be empty -- train_channel_configured() never assumes a default")
+
+    lifecycle = RunLifecycle(database=database)
     run = lifecycle.begin(
         "train",
         trigger_source=trigger_source,
@@ -310,7 +351,7 @@ def train_channel_configured(
         # channel that was never registered at all.
         adapter = get_channel_adapter(config.channel)
 
-        store = bundle_store if bundle_store is not None else create_default_bundle_store()
+        store = bundle_store if bundle_store is not None else create_default_bundle_store(database)
 
         population_rows = _build_supervised_population(
             adapter=adapter, channel_events=channel_events, source_alerts=source_alerts, synthetic_labels=synthetic_labels
@@ -319,6 +360,10 @@ def train_channel_configured(
             raise InsufficientTrainingDataError(
                 f"no source-alerted, eligible {config.channel} rows available to build a supervised population"
             )
+
+        population_event_ids = {row["event_id"] for row in population_rows}
+        contributing_alerts = [alert for alert in source_alerts if str(alert.event_id) in population_event_ids]
+        source_generation_run_id, source_dataset_version = _source_generation_provenance(contributing_alerts)
 
         dataset_version = _dataset_version(population_rows)
 
@@ -472,6 +517,17 @@ def train_channel_configured(
                 "channel": config.channel,
                 "training_run_id": run.run_id,
                 "dataset_version": dataset_version,
+                # Phase 7B Stage 3 corrective pass: `dataset_version` above
+                # (and channel_model_bundles.dataset_version, unchanged --
+                # no migration) is the training-DERIVED content hash of the
+                # supervised population, aliased here under an unambiguous
+                # name; source_generation_run_id/source_dataset_version are
+                # the DIFFERENT, Stage-2 generation identity every row of
+                # that population actually came from. Never conflate the
+                # two -- see _source_generation_provenance()'s docstring.
+                "supervised_population_hash": dataset_version,
+                "source_generation_run_id": source_generation_run_id,
+                "source_dataset_version": source_dataset_version,
                 "feature_schema_version": adapter.feature_schema_version,
                 "gbm_model_version": str(gbm_model_version),
                 "lr_model_version": str(lr_model_version),
@@ -524,6 +580,9 @@ def train_channel_configured(
             "bundle_id": bundle.bundle_id,
             "bundle_version": bundle.bundle_version,
             "realized_split_fractions": realized_fractions,
+            "supervised_population_hash": dataset_version,
+            "source_generation_run_id": source_generation_run_id,
+            "source_dataset_version": source_dataset_version,
         },
     )
 
@@ -535,6 +594,9 @@ def train_channel_configured(
         "lr_model_version": str(lr_model_version),
         "anomaly_model_version": str(anomaly_model_version),
         "dataset_version": dataset_version,
+        "supervised_population_hash": dataset_version,
+        "source_generation_run_id": source_generation_run_id,
+        "source_dataset_version": source_dataset_version,
         "gbm_evaluation": gbm_eval,
         "lr_shadow_evaluation": lr_eval,
         "realized_split_fractions": realized_fractions,

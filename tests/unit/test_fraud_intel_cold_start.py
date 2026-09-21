@@ -24,6 +24,8 @@ T0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
 def _report_dict(bundle: ChannelModelBundleRecord, **overrides) -> dict:
     report = dict(
         channel=bundle.channel, training_run_id=bundle.training_run_id, dataset_version=bundle.dataset_version,
+        supervised_population_hash=bundle.dataset_version,
+        source_generation_run_id="genrun-3e8516ce803e5d82", source_dataset_version="dsv-3e8516ce803e5d82",
         feature_schema_version=bundle.feature_schema_version, gbm_model_version=bundle.gbm_model_version,
         lr_model_version=bundle.lr_model_version, anomaly_model_version=bundle.anomaly_model_version,
         preprocessing_artifact_version=bundle.preprocessing_artifact_version,

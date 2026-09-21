@@ -195,7 +195,11 @@ def _handle_fraud_intel_train(args: argparse.Namespace) -> dict:
         load_channel_population,
     )
     from src.fraud_intel.config import ChannelTrainingRunConfig
+    from src.fraud_intel.ensemble.policy import load_ensemble_policy
+    from src.fraud_intel.graph.entity_graph import load_graph_policy
     from src.fraud_intel.models.training import train_channel_configured
+    from src.fraud_intel.reason_codes.builder import REASON_CODE_VERSION
+    from src.fraud_intel.rules.provider import _load_rule_set_config
 
     try:
         events, source_alerts, labels = load_channel_population(
@@ -208,13 +212,33 @@ def _handle_fraud_intel_train(args: argparse.Namespace) -> dict:
         config = ChannelTrainingRunConfig(channel=args.channel)
     except ValidationError as exc:
         raise CLIUserError(str(exc)) from exc
+
+    # Phase 7B Stage 3 corrective pass: pin the channel's CURRENT rule/
+    # graph/ensemble/reason-code policy versions into the new candidate --
+    # train_channel_configured() itself never loads or evaluates any of
+    # these (Phase 5 decision 3, unchanged); wiring them here is what
+    # makes the resulting bundle promotion-eligible (validate_promotion_
+    # eligible()) instead of the Phase-4-style deliberately-incomplete
+    # bundle every prior CLI train invocation produced.
+    try:
+        rule_set_version = _load_rule_set_config(args.channel).rule_set_version
+        graph_policy_version = load_graph_policy(args.channel).graph_policy_version
+        ensemble_policy_version = load_ensemble_policy(args.channel).policy_version
+    except (FileNotFoundError, ValidationError) as exc:
+        raise CLIUserError(f"failed to load current policy versions for channel {args.channel!r}: {exc}") from exc
+
     return train_channel_configured(
         config,
+        database=database,
         trigger_source="cli",
         channel_events=events,
         source_alerts=source_alerts,
         synthetic_labels=labels,
         bundle_store=create_default_bundle_store(database),
+        rule_set_version=rule_set_version,
+        graph_policy_version=graph_policy_version,
+        ensemble_policy_version=ensemble_policy_version,
+        reason_code_version=REASON_CODE_VERSION,
     )
 
 

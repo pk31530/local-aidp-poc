@@ -46,6 +46,17 @@ class TrainingEvaluationReport(BaseModel):
     channel: str
     training_run_id: int
     dataset_version: str
+    # Phase 7B Stage 3 corrective pass: dataset_version above remains the
+    # training-derived supervised-population content hash (matches
+    # channel_model_bundles.dataset_version -- unchanged, no migration),
+    # aliased here under an unambiguous name; source_generation_run_id/
+    # source_dataset_version are the DIFFERENT Stage-2 generation identity
+    # every row of that population was actually generated under. Neither
+    # has a corresponding bundle-row column, so neither is added to
+    # _CROSS_CHECK_FIELDS below -- they are traceability-only.
+    supervised_population_hash: str
+    source_generation_run_id: str
+    source_dataset_version: str
     feature_schema_version: str
     gbm_model_version: str
     lr_model_version: str

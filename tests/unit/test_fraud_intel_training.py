@@ -19,7 +19,7 @@ from src.fraud_intel.events.base import FraudEvent
 from src.fraud_intel.events.online_banking import OnlineBankingPayload
 from src.fraud_intel.events.source_alert_context import SourceAlertContext, SyntheticGroundTruthLabel
 from src.fraud_intel.models import training as training_module
-from src.fraud_intel.models.bundle import _FakeChannelModelBundleStore
+from src.fraud_intel.models.bundle import _FakeChannelModelBundleStore, validate_promotion_eligible
 from src.fraud_intel.models.calibration import CalibrationLeakageError, SplitManifest, fit_calibrator
 from src.fraud_intel.models.preprocessing import ChannelPreprocessor, FeatureSchemaMismatchError
 from src.fraud_intel.models.training import InsufficientTrainingDataError, train_channel_configured
@@ -336,7 +336,7 @@ def test_successful_run_registers_a_candidate_bundle_and_no_alias(_fakes):
     bundle_store = _FakeChannelModelBundleStore()
 
     result = train_channel_configured(
-        config, trigger_source="test", channel_events=events, source_alerts=alerts, synthetic_labels=labels,
+        config, trigger_source="test", database="aidp_test", channel_events=events, source_alerts=alerts, synthetic_labels=labels,
         bundle_store=bundle_store,
     )
 
@@ -357,6 +357,15 @@ def test_successful_run_registers_a_candidate_bundle_and_no_alias(_fakes):
     assert bundle.training_run_id == result["run_id"]
     assert bundle.dataset_version == result["dataset_version"]
 
+    # Phase 7B Stage 3 corrective pass: the Stage-2 generation identity
+    # (source_generation_run_id/source_dataset_version, from _alert()'s
+    # own genrun-1/dsv-1 fixture values) is distinct from, and never
+    # conflated with, the training-derived supervised_population_hash
+    # (== dataset_version).
+    assert result["source_generation_run_id"] == "genrun-1"
+    assert result["source_dataset_version"] == "dsv-1"
+    assert result["supervised_population_hash"] == result["dataset_version"]
+
     run_store = _fakes["run_store"]
     assert len(run_store.rows) == 1
     record = next(iter(run_store.rows.values()))
@@ -365,6 +374,9 @@ def test_successful_run_registers_a_candidate_bundle_and_no_alias(_fakes):
     assert record["model_version"] == "gbm-7"
     assert record["artifacts"]["lr_model_version"] == "lr-7"
     assert record["artifacts"]["bundle_id"] == bundle.bundle_id
+    assert record["artifacts"]["source_generation_run_id"] == "genrun-1"
+    assert record["artifacts"]["source_dataset_version"] == "dsv-1"
+    assert record["artifacts"]["supervised_population_hash"] == result["dataset_version"]
 
 
 def test_no_mlflow_alias_call_anywhere_in_training_module():
@@ -389,7 +401,7 @@ def test_lr_evaluation_is_recorded_separately_from_gbm_and_never_feeds_it(_fakes
     events, alerts, labels = _fixture_population()
     config = ChannelTrainingRunConfig(channel="online_banking")
     result = train_channel_configured(
-        config, trigger_source="test", channel_events=events, source_alerts=alerts, synthetic_labels=labels,
+        config, trigger_source="test", database="aidp_test", channel_events=events, source_alerts=alerts, synthetic_labels=labels,
         bundle_store=_FakeChannelModelBundleStore(),
     )
     assert "gbm_evaluation" in result
@@ -411,11 +423,11 @@ def test_deterministic_seeds_produce_identical_params_across_two_runs(_fakes):
 
     with patch.object(training_module, "_train_gbm", _capture):
         train_channel_configured(
-            config, trigger_source="test", channel_events=events, source_alerts=alerts, synthetic_labels=labels,
+            config, trigger_source="test", database="aidp_test", channel_events=events, source_alerts=alerts, synthetic_labels=labels,
             bundle_store=_FakeChannelModelBundleStore(),
         )
         train_channel_configured(
-            config, trigger_source="test", channel_events=events, source_alerts=alerts, synthetic_labels=labels,
+            config, trigger_source="test", database="aidp_test", channel_events=events, source_alerts=alerts, synthetic_labels=labels,
             bundle_store=_FakeChannelModelBundleStore(),
         )
     assert captured == [123, 123]
@@ -430,7 +442,7 @@ def test_insufficient_training_data_rejected_before_any_registration(_fakes):
 
     with pytest.raises(InsufficientTrainingDataError):
         train_channel_configured(
-            config, trigger_source="test", channel_events=events, source_alerts=alerts, synthetic_labels=labels,
+            config, trigger_source="test", database="aidp_test", channel_events=events, source_alerts=alerts, synthetic_labels=labels,
             bundle_store=bundle_store,
         )
 
@@ -455,7 +467,7 @@ def test_single_class_population_rejected_before_any_registration(_fakes):
 
     with pytest.raises(InsufficientTrainingDataError, match="class"):
         train_channel_configured(
-            config, trigger_source="test", channel_events=events, source_alerts=alerts, synthetic_labels=labels,
+            config, trigger_source="test", database="aidp_test", channel_events=events, source_alerts=alerts, synthetic_labels=labels,
             bundle_store=bundle_store,
         )
     assert bundle_store.rows == []
@@ -473,7 +485,7 @@ def test_failure_mid_training_records_failed_and_reraises_original_exception(_fa
     with patch.object(training_module, "_train_gbm", _boom):
         with pytest.raises(RuntimeError, match="gbm exploded"):
             train_channel_configured(
-                config, trigger_source="test", channel_events=events, source_alerts=alerts, synthetic_labels=labels,
+                config, trigger_source="test", database="aidp_test", channel_events=events, source_alerts=alerts, synthetic_labels=labels,
                 bundle_store=_FakeChannelModelBundleStore(),
             )
 
@@ -524,7 +536,7 @@ def test_ach_channel_trains_successfully_through_the_shared_training_path(_fakes
     bundle_store = _FakeChannelModelBundleStore()
 
     result = train_channel_configured(
-        config, trigger_source="test", channel_events=events, source_alerts=alerts, synthetic_labels=labels,
+        config, trigger_source="test", database="aidp_test", channel_events=events, source_alerts=alerts, synthetic_labels=labels,
         bundle_store=bundle_store,
     )
 
@@ -551,9 +563,195 @@ def test_realized_split_fractions_recorded_in_result_and_bundle_report(_fakes):
     events, alerts, labels = _fixture_population()
     config = ChannelTrainingRunConfig(channel="online_banking")
     result = train_channel_configured(
-        config, trigger_source="test", channel_events=events, source_alerts=alerts, synthetic_labels=labels,
+        config, trigger_source="test", database="aidp_test", channel_events=events, source_alerts=alerts, synthetic_labels=labels,
         bundle_store=_FakeChannelModelBundleStore(),
     )
     assert set(result["realized_split_fractions"].keys()) == {"train", "calibration", "test"}
     total = sum(result["realized_split_fractions"].values())
     assert total == pytest.approx(1.0)
+
+
+# ============================ Phase 7B Stage 3: database isolation =================
+
+
+def test_empty_database_is_rejected_before_any_lifecycle_or_mlflow_contact(_fakes, monkeypatch):
+    """Reject fast, before RunLifecycle() is even constructed -- no
+    pipeline_runs row, no MLflow call, no bundle write, for either an
+    empty string or omitting the keyword is caught the same way (Python's
+    own TypeError enforces the missing-argument case; this test proves
+    the explicit '' case, which Python's own machinery would otherwise
+    happily accept as a valid str)."""
+    events, alerts, labels = _fixture_population()
+    config = ChannelTrainingRunConfig(channel="online_banking")
+
+    def _must_not_be_called(*a, **k):
+        raise AssertionError("RunLifecycle must not be constructed for an empty database")
+
+    monkeypatch.setattr(training_module, "RunLifecycle", _must_not_be_called)
+
+    with pytest.raises(ValueError, match="database"):
+        train_channel_configured(
+            config, trigger_source="test", database="", channel_events=events, source_alerts=alerts,
+            synthetic_labels=labels, bundle_store=_FakeChannelModelBundleStore(),
+        )
+
+
+class _SpyRunLifecycle:
+    """Records the database it was constructed with, and which of
+    begin()/succeed()/fail_from_exception() were called on THIS SAME
+    instance -- delegates to a real RunLifecycle backed by a shared fake
+    store so the rest of train_channel_configured() still works
+    end-to-end."""
+
+    instances: list["_SpyRunLifecycle"] = []
+    shared_store = None
+
+    def __init__(self, database=None):
+        self.database = database
+        self.calls: list[str] = []
+        self._real = RealRunLifecycle(store=_SpyRunLifecycle.shared_store)
+        _SpyRunLifecycle.instances.append(self)
+
+    def begin(self, *a, **k):
+        self.calls.append("begin")
+        return self._real.begin(*a, **k)
+
+    def succeed(self, *a, **k):
+        self.calls.append("succeed")
+        return self._real.succeed(*a, **k)
+
+    def fail_from_exception(self, *a, **k):
+        self.calls.append("fail_from_exception")
+        return self._real.fail_from_exception(*a, **k)
+
+
+def test_run_lifecycle_is_constructed_for_the_given_database_and_reused_throughout(_fakes, monkeypatch):
+    _SpyRunLifecycle.instances = []
+    _SpyRunLifecycle.shared_store = _fakes["run_store"]
+    monkeypatch.setattr(training_module, "RunLifecycle", _SpyRunLifecycle)
+
+    events, alerts, labels = _fixture_population()
+    config = ChannelTrainingRunConfig(channel="online_banking")
+    train_channel_configured(
+        config, trigger_source="test", database="aidp_test", channel_events=events, source_alerts=alerts,
+        synthetic_labels=labels, bundle_store=_FakeChannelModelBundleStore(),
+    )
+
+    assert len(_SpyRunLifecycle.instances) == 1
+    instance = _SpyRunLifecycle.instances[0]
+    assert instance.database == "aidp_test"
+    assert instance.calls == ["begin", "succeed"]  # begin() and succeed() -- the SAME lifecycle instance
+
+
+def test_a_failed_training_attempt_still_uses_the_given_database_not_a_fallback(_fakes, monkeypatch):
+    _SpyRunLifecycle.instances = []
+    _SpyRunLifecycle.shared_store = _fakes["run_store"]
+    monkeypatch.setattr(training_module, "RunLifecycle", _SpyRunLifecycle)
+
+    events, alerts, labels = _fixture_population()
+    config = ChannelTrainingRunConfig(channel="online_banking")
+
+    def _boom(X, y, config):
+        raise RuntimeError("gbm exploded")
+
+    from unittest.mock import patch
+
+    with patch.object(training_module, "_train_gbm", _boom):
+        with pytest.raises(RuntimeError):
+            train_channel_configured(
+                config, trigger_source="test", database="aidp_test", channel_events=events, source_alerts=alerts,
+                synthetic_labels=labels, bundle_store=_FakeChannelModelBundleStore(),
+            )
+
+    assert len(_SpyRunLifecycle.instances) == 1
+    instance = _SpyRunLifecycle.instances[0]
+    # Still the database explicitly given to this call -- never silently
+    # swapped for a default, even on the failure path.
+    assert instance.database == "aidp_test"
+    assert instance.calls == ["begin", "fail_from_exception"]
+
+
+def test_bundle_store_and_lifecycle_receive_the_same_database_when_bundle_store_is_not_injected(_fakes, monkeypatch):
+    """When bundle_store is omitted (unlike every other test in this file,
+    which injects a fake), train_channel_configured() must build its own
+    default store scoped to the SAME database RunLifecycle was given --
+    never two different databases for the two writes."""
+    captured_lifecycle_database = {}
+    captured_bundle_store_database = {}
+
+    class _RecordingLifecycle(_SpyRunLifecycle):
+        def __init__(self, database=None):
+            captured_lifecycle_database["database"] = database
+            super().__init__(database=database)
+
+    def _recording_create_default_bundle_store(database=None):
+        captured_bundle_store_database["database"] = database
+        return _FakeChannelModelBundleStore()
+
+    _SpyRunLifecycle.instances = []
+    _SpyRunLifecycle.shared_store = _fakes["run_store"]
+    monkeypatch.setattr(training_module, "RunLifecycle", _RecordingLifecycle)
+    monkeypatch.setattr(training_module, "create_default_bundle_store", _recording_create_default_bundle_store)
+
+    events, alerts, labels = _fixture_population()
+    config = ChannelTrainingRunConfig(channel="online_banking")
+    train_channel_configured(
+        config, trigger_source="test", database="aidp_test", channel_events=events, source_alerts=alerts,
+        synthetic_labels=labels,
+        # bundle_store deliberately NOT passed -- exercises the internal
+        # create_default_bundle_store(database) fallback branch.
+    )
+
+    assert captured_lifecycle_database["database"] == "aidp_test"
+    assert captured_bundle_store_database["database"] == "aidp_test"
+
+
+# ============================ Phase 7B Stage 3: full promotion-eligible bundle ======
+
+
+def test_training_with_all_four_policy_versions_produces_a_promotion_eligible_candidate(_fakes):
+    """When a caller (the CLI, in real use) supplies all four pinned
+    policy versions, the resulting bundle is COMPLETE according to
+    validate_promotion_eligible() -- while still status=CANDIDATE and
+    never auto-promoted. Training itself never loads or evaluates these
+    four values (Phase 5 decision 3, unchanged by this corrective pass)
+    -- it only records whatever the caller passes."""
+    events, alerts, labels = _fixture_population()
+    config = ChannelTrainingRunConfig(channel="online_banking")
+    bundle_store = _FakeChannelModelBundleStore()
+
+    train_channel_configured(
+        config, trigger_source="test", database="aidp_test", channel_events=events, source_alerts=alerts,
+        synthetic_labels=labels, bundle_store=bundle_store,
+        rule_set_version="rsv-1", graph_policy_version="gpv-1",
+        ensemble_policy_version="epv-1", reason_code_version="v1",
+    )
+
+    assert len(bundle_store.rows) == 1
+    bundle = bundle_store.rows[0]
+    assert bundle.status == "CANDIDATE"
+    validate_promotion_eligible(bundle)  # must not raise -- every REQUIRED_OPERATIONAL_COMPONENTS field is populated
+    assert bundle.is_promotion_eligible() is True
+
+
+def test_ambiguous_generation_provenance_is_rejected_before_any_model_fitting(_fakes):
+    """Two source alerts contributing to the same population but tagged
+    with different generation_run_id values -- training must refuse
+    rather than silently pick one and mix Stage-2 generations together."""
+    from src.fraud_intel.models.training import AmbiguousGenerationProvenanceError
+
+    events, alerts, labels = _fixture_population(n=20)
+    # Retag one contributing alert with a different generation identity.
+    alerts[0] = SourceAlertContext(
+        source_system=alerts[0].source_system, event_id=alerts[0].event_id,
+        source_alert_created_at=alerts[0].source_alert_created_at, source_rule_ids=alerts[0].source_rule_ids,
+        source_rule_version=alerts[0].source_rule_version, source_alert_reason_codes=alerts[0].source_alert_reason_codes,
+        generation_run_id="genrun-DIFFERENT", dataset_version="dsv-DIFFERENT", created_at=alerts[0].created_at,
+    )
+    config = ChannelTrainingRunConfig(channel="online_banking")
+
+    with pytest.raises(AmbiguousGenerationProvenanceError):
+        train_channel_configured(
+            config, trigger_source="test", database="aidp_test", channel_events=events, source_alerts=alerts,
+            synthetic_labels=labels, bundle_store=_FakeChannelModelBundleStore(),
+        )

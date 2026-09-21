@@ -153,9 +153,17 @@ def test_train_loads_population_and_dispatches_to_train_channel_configured(monke
         captured["generation_run_id"] = generation_run_id
         return [], [], []
 
-    def _fake_train_channel_configured(config, *, trigger_source, channel_events, source_alerts, synthetic_labels, bundle_store):
+    def _fake_train_channel_configured(
+        config, *, database, trigger_source, channel_events, source_alerts, synthetic_labels, bundle_store,
+        rule_set_version, graph_policy_version, ensemble_policy_version, reason_code_version,
+    ):
         captured["config"] = config
+        captured["train_database"] = database
         captured["trigger_source"] = trigger_source
+        captured["rule_set_version"] = rule_set_version
+        captured["graph_policy_version"] = graph_policy_version
+        captured["ensemble_policy_version"] = ensemble_policy_version
+        captured["reason_code_version"] = reason_code_version
         return {"bundle_id": 9, "status": "CANDIDATE"}
 
     fake_bundle_store = object()
@@ -171,9 +179,18 @@ def test_train_loads_population_and_dispatches_to_train_channel_configured(monke
 
     assert captured["channel"] == "online_banking"
     assert captured["database"] == "aidp_test"
+    assert captured["train_database"] == "aidp_test"  # load_channel_population() and train_channel_configured() share the same database
     assert captured["generation_run_id"] == "genrun-abc"
     assert captured["config"].channel == "online_banking"
     assert captured["trigger_source"] == "cli"
+    # Phase 7B Stage 3 corrective pass: the CLI loads the channel's real,
+    # current policy versions (config/fraud_intel/*_online_banking.yaml)
+    # and passes them all through -- the resulting candidate is complete,
+    # not the old Phase-4-style deliberately-incomplete bundle.
+    assert captured["rule_set_version"] == "v1"
+    assert captured["graph_policy_version"] == "v1"
+    assert captured["ensemble_policy_version"] == "v1"
+    assert captured["reason_code_version"] == "v1"
     result = json.loads(capsys.readouterr().out)
     assert result == {"bundle_id": 9, "status": "CANDIDATE"}
 
@@ -227,7 +244,10 @@ def test_train_accepts_every_phase7a_registered_channel(monkeypatch, capsys, cha
     def _fake_load_population(channel, database, *, generation_run_id):
         return [], [], []
 
-    def _fake_train_channel_configured(config, *, trigger_source, channel_events, source_alerts, synthetic_labels, bundle_store):
+    def _fake_train_channel_configured(
+        config, *, database, trigger_source, channel_events, source_alerts, synthetic_labels, bundle_store,
+        rule_set_version, graph_policy_version, ensemble_policy_version, reason_code_version,
+    ):
         return {"bundle_id": 9, "status": "CANDIDATE", "channel": config.channel}
 
     monkeypatch.setattr("src.fraud_intel.cli_data_access.load_channel_population", _fake_load_population)
@@ -240,6 +260,22 @@ def test_train_accepts_every_phase7a_registered_channel(monkeypatch, capsys, cha
 
     result = json.loads(capsys.readouterr().out)
     assert result["channel"] == channel
+
+
+def test_train_policy_version_load_failure_is_a_cli_user_error(monkeypatch, capsys):
+    monkeypatch.setattr("src.fraud_intel.cli_data_access.load_channel_population", lambda channel, database, *, generation_run_id: ([], [], []))
+    monkeypatch.setattr(
+        "src.fraud_intel.rules.provider._load_rule_set_config",
+        lambda channel: (_ for _ in ()).throw(FileNotFoundError("no such rules file")),
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_main.main(
+            ["fraud-intel", "train", "--channel", "online_banking", "--generation-run-id", "genrun-abc",
+             "--database", "aidp_test", "--json"]
+        )
+    assert exc_info.value.code == 2
+    assert json.loads(capsys.readouterr().out)["error"] == "CLIUserError"
 
 
 # ---- fraud-intel score: real reference-channel dispatch (Phase 6 corrective pass) -----
@@ -609,6 +645,8 @@ def test_evaluate_scope_marker_no_longer_present(monkeypatch, capsys):
 def _cold_start_report_dict(bundle: ChannelModelBundleRecord, **overrides) -> dict:
     report = dict(
         channel=bundle.channel, training_run_id=bundle.training_run_id, dataset_version=bundle.dataset_version,
+        supervised_population_hash=bundle.dataset_version,
+        source_generation_run_id="genrun-3e8516ce803e5d82", source_dataset_version="dsv-3e8516ce803e5d82",
         feature_schema_version=bundle.feature_schema_version, gbm_model_version=bundle.gbm_model_version,
         lr_model_version=bundle.lr_model_version, anomaly_model_version=bundle.anomaly_model_version,
         preprocessing_artifact_version=bundle.preprocessing_artifact_version,
