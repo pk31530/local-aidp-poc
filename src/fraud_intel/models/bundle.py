@@ -44,6 +44,17 @@ REQUIRED_OPERATIONAL_COMPONENTS = (
     "reason_code_version",
 )
 
+# Phase 7B Stage 3 corrective pass: the fixed, AiDP-specific namespace half
+# of the two-int-key `pg_advisory_xact_lock(int, int)` call
+# _PostgresChannelModelBundleStore.register_candidate() uses to serialize
+# candidate-bundle-version allocation per channel. Arbitrary but MUST stay
+# fixed forever once assigned -- same convention as
+# src.fraud_intel.generator._shared.CHANNEL_SALTS. Must fit Postgres' int4
+# range (0 .. 2^31-1); derived once as the low 31 bits of
+# sha256(b"aidp_fraud_intel_channel_model_bundles") purely so the value is
+# reproducible and documented, never recomputed at runtime.
+_BUNDLE_VERSION_LOCK_NAMESPACE = 0x22CE32AA
+
 
 class IncompleteBundleError(ValueError):
     """A bundle is missing a component required for OPERATIONAL status.
@@ -104,19 +115,33 @@ class ChannelModelBundleStore(Protocol):
 class _PostgresChannelModelBundleStore:
     """The real, Postgres-backed store. Not exercised by any Phase 4 unit
     test (see module docstring) -- reviewed as SQL instead, exactly like
-    src.control_plane.runs._PostgresRunStore in v1.2 Phase 2. Not used
-    anywhere until Phase 6/7B applies migration 003 and wires real
-    training runs to it.
+    src.control_plane.runs._PostgresRunStore in v1.2 Phase 2.
 
-    Concurrency safety: `SELECT ... FOR UPDATE` locks every existing row
-    for this channel for the duration of the transaction, so a second,
-    concurrent registration for the same channel cannot compute the same
-    "next" version while the first is still in flight. For the very first
-    bundle of a channel (no existing rows to lock), the table's
-    UNIQUE(channel, bundle_version) constraint (Phase 1 schema) is the
-    backstop -- at most one of two racing first-inserts can succeed; the
-    loser gets a real, visible constraint-violation error, never a silent
-    duplicate version.
+    Concurrency safety (Phase 7B Stage 3 corrective pass -- the original
+    `SELECT ... FOR UPDATE` here turned out to be rejected outright by
+    real Postgres: `FeatureNotSupported: FOR UPDATE is not allowed with
+    aggregate functions`, first surfaced on the very first real training
+    run, since this method had never before been exercised against a
+    real database): a session-level problem needs a session-level lock,
+    not a row lock -- and a row lock cannot serialize a channel's very
+    FIRST bundle anyway, since no row yet exists to lock. A transaction-
+    scoped Postgres advisory lock (`pg_advisory_xact_lock`, auto-released
+    at COMMIT/ROLLBACK -- never an explicit unlock call) has neither
+    problem: it locks a (namespace, channel-hash) KEY, not a row, so it
+    serializes concurrent registrations for the SAME channel (including
+    a channel's first-ever bundle) while leaving every other channel free
+    to register independently. `_BUNDLE_VERSION_LOCK_NAMESPACE` is an
+    arbitrary but fixed-forever-once-assigned constant (same convention
+    as src.fraud_intel.generator._shared.CHANNEL_SALTS), combined with
+    `hashtext(channel)` (computed server-side from the parameterized
+    channel value, never string-interpolated) via the two-int-key
+    `pg_advisory_xact_lock(int, int)` overload. Two DIFFERENT channels
+    whose `hashtext()` values happened to collide would serialize
+    together unnecessarily -- an extremely unlikely, purely-performance,
+    never-a-correctness cost, since correctness comes from the lock
+    PLUS the MAX-then-INSERT happening in the same transaction, not from
+    perfect key uniqueness. The table's UNIQUE(channel, bundle_version)
+    constraint (Phase 1 schema) remains an independent backstop.
     """
 
     def __init__(self, database: Optional[str] = None):
@@ -140,9 +165,21 @@ class _PostgresChannelModelBundleStore:
         try:
             with conn:
                 with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    # Transaction-scoped advisory lock FIRST -- serializes
+                    # any concurrent registration for this exact channel;
+                    # released automatically when this `with conn:` block
+                    # commits or rolls back, never by an explicit unlock.
+                    cur.execute(
+                        "SELECT pg_advisory_xact_lock(%s, hashtext(%s))",
+                        (_BUNDLE_VERSION_LOCK_NAMESPACE, fields["channel"]),
+                    )
+
+                    # Same connection, same transaction, same cursor as the
+                    # lock above and the INSERT below -- no aggregate
+                    # function combined with FOR UPDATE anywhere.
                     cur.execute(
                         "SELECT COALESCE(MAX(bundle_version), 0) AS max_version "
-                        "FROM channel_model_bundles WHERE channel = %s FOR UPDATE",
+                        "FROM channel_model_bundles WHERE channel = %s",
                         (fields["channel"],),
                     )
                     next_version = cur.fetchone()["max_version"] + 1
