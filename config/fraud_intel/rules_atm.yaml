@@ -1,0 +1,22 @@
+# ATM channel rules (guide section 10). Fields reference ATMPayload's own
+# fields and the shared Phase 2 feature names.
+channel: atm
+rule_set_version: v1
+rules:
+  - id: ATM_INTERNATIONAL_GEO_RAPID_WITHDRAWALS
+    category: MANDATORY_REVIEW
+    when:
+      - {field: atm_geo_bucket, op: eq, value: international}
+      - {field: events_last_1h, op: gte, value: 3}
+    reason_code: ATM_INTERNATIONAL_GEO_RAPID_WITHDRAWALS
+  - id: ATM_HIGH_AMOUNT_VS_AVERAGE
+    category: SCORE_CONTRIBUTING
+    when:
+      - {field: amount_vs_entity_average, op: gt, value: 4.0}
+    score_contribution: 0.15
+    reason_code: ATM_HIGH_AMOUNT_VS_AVERAGE
+  - id: ATM_NIGHT_TRANSACTION
+    category: INFORMATIONAL
+    when:
+      - {field: night_transaction_flag, op: is_true}
+    reason_code: ATM_NIGHT_TRANSACTION

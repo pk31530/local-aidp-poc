@@ -1,0 +1,24 @@
+# Wire channel rules (guide section 10). Fields reference WirePayload's
+# own fields, the shared Phase 2 feature names, and current-event
+# intrinsic fields.
+channel: wire
+rule_set_version: v1
+rules:
+  - id: WIRE_INTERNATIONAL_NEW_DEVICE_HIGH_AMOUNT
+    category: MANDATORY_REVIEW
+    when:
+      - {field: wire_type, op: eq, value: international}
+      - {field: is_new_device, op: is_true}
+      - {field: amount_minor_units, op: gt, value: 1000000}
+    reason_code: WIRE_INTERNATIONAL_NEW_DEVICE_HIGH_AMOUNT
+  - id: WIRE_HIGH_AMOUNT_VS_AVERAGE
+    category: SCORE_CONTRIBUTING
+    when:
+      - {field: amount_vs_entity_average, op: gt, value: 5.0}
+    score_contribution: 0.2
+    reason_code: WIRE_HIGH_AMOUNT_VS_AVERAGE
+  - id: WIRE_NIGHT_TRANSACTION
+    category: INFORMATIONAL
+    when:
+      - {field: night_transaction_flag, op: is_true}
+    reason_code: WIRE_NIGHT_TRANSACTION

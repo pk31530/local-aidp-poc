@@ -1,0 +1,27 @@
+# atm channel entity-graph policy (Phase 7A). Same shape/validation as
+# config/fraud_intel/graph_policy_online_banking.yaml (Phase 5, guide
+# section 15) -- weights mirror online_banking's starting values as an
+# UNTUNED placeholder, since no channel-specific backtest/calibration has
+# been run for atm yet. Validated at load time by
+# src.fraud_intel.graph.entity_graph.GraphPolicy.
+channel: atm
+graph_policy_version: v1
+
+shared_device_cap: 5
+shared_device_weight: 0.3
+fan_in_cap: 10
+fan_in_weight: 0.3
+fan_out_cap: 10
+fan_out_weight: 0.2
+shortest_path_weight: 0.2
+
+graph_max_history_events: 5000
+max_nodes: 20000
+max_edges: 200000
+
+# Phase 7A decision 4 (applied consistently alongside the ensemble
+# policy): these values are NOT tuned, optimized, validated, or
+# bank-approved. Phase 7B must report real, channel-specific evaluation
+# metrics before this policy is ever promoted.
+calibration_status: UNVALIDATED_POC_DEFAULT
+promotion_note: "Requires Phase 7B channel-specific evaluation before promotion"

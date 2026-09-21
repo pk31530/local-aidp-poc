@@ -252,6 +252,178 @@ It never starts Docker, never touches a database, never applies a
 migration, and never trains or promotes a model — see RUNBOOK.md's
 "Continuous integration" section.
 
+## v1.3 fraud intelligence
+
+Built on `feat/aidp-v1-3-fraud-intelligence` on top of the v1.2 control
+plane. A separate, seven-channel synthetic fraud-alert triage platform
+(`src/fraud_intel/`) sharing v1.2's `RunLifecycle`/typed-config
+conventions but with its own tables (migrations `003`/`004`), its own CLI
+subcommands (`aidp fraud-intel ...`, `aidp alerts ...`), and its own
+read-only dashboard tab. It does not replace or modify the v1.1/v1.2
+single-channel `transactions`/`fraud_decisions` pipeline described above.
+
+**This section documents what Phase 7B actually verified, in this exact
+POC repository, against `aidp_test` — not aspirations.** As of Phase 7B
+completion: seven channels (`online_banking`, `mobile_deposit`, `ach`,
+`wire`, `atm`, `debit_card`, `p2p`), each with exactly one `OPERATIONAL`
+`channel_model_bundles` row, 35,000 generated `channel_events`, 3,134
+`source_alerts`/`fraud_alerts`, 3,134 current-operational-bundle
+`alert_evidence` rows (3,575 including ACH's retired bundle-3 history),
+and 3,134 eligible `label_assessments`. All of it is **synthetic,
+local-only POC evidence** — see "POC scope and disclaimers" below.
+
+### Seven channels, one shared framework
+
+`src/fraud_intel/registry.py` (`get_channel_adapter(channel)`) is the one
+place a channel is "known" — one shared training/scoring/evaluation
+framework parameterized per channel, not seven copies. Each channel has
+its own generator (`src/fraud_intel/generator/<channel>.py`), payload
+schema (`src/fraud_intel/events/<channel>.py`), feature adapter, and
+config files (`config/fraud_intel/rules_<channel>.yaml`,
+`graph_policy_<channel>.yaml`, `ensemble_policy_<channel>.yaml`).
+
+### Generation-scoped everything
+
+Every real generate/train/score/labels-assess/evaluate command requires
+an explicit `--generation-run-id` (and, for generation itself,
+`--database`) — there is no silent "whichever data happens to be in the
+table" default anywhere in this subsystem, and no command may ever fall
+back to the `.env` default `POSTGRES_DB` (`aidp`). `generation_run_id`/
+`dataset_version` are deterministic SHA-256 fingerprints of
+`(channel, count, seed, reference_date, GENERATION_SPEC_VERSION)`
+(`src/fraud_intel/cli_data_access._generation_identity()`), so re-running
+the exact same generation command is a safe, idempotent no-op
+(`ON CONFLICT ... DO NOTHING`) that recomputes the identical IDs rather
+than minting new ones.
+
+### Shared cross-channel, customer-scoped feature history
+
+`src/fraud_intel/features/history.py`'s `select_customer_historical_events()`/
+`select_customer_historical_source_alerts()` are the **single** shared
+selectors used by all three of: real training
+(`src/fraud_intel/models/training.py::_build_supervised_population()`),
+real scoring (`src/fraud_intel/scoring/dispatch.py::_PostgresScoringDataAccess.list_pending()`),
+and live-resolved-alert scoring-context reconstruction
+(`src/fraud_intel/cli_data_access.py::load_resolved_alert_scoring_contexts()`).
+History is **customer-scoped across ALL seven channels** (guide §15 — the
+1,000-customer synthetic pool, `generate_customers()`, is
+channel-independent and reused by every channel with the same seed), and
+**strictly earlier than the target event's own timestamp** — ties broken
+deterministically by `(event_timestamp, event_id)`, never insertion order.
+This was a real corrective pass, not a design given up front: an initial
+version scoped training's own history construction to one channel only,
+which silently diverged from real scoring's (always-correct) cross-channel
+context, first surfaced as a real ACH score mismatch between a
+pre-promotion diagnostic and real persisted scoring. Fixed by extracting
+the shared selectors above (commit `6a4683c`), verified by a real,
+zero-diff parity re-derivation across all affected alerts.
+
+### Immutable alert identity, versioned evidence, current-vs-initial state
+
+`fraud_alerts` is the alert's immutable identity row, written once
+(`create_alert_if_new()`, first-write-wins on `(source_system,
+source_alert_id)`) — its own `initial_operational_priority_score`/
+`initial_priority_band`/`initial_ensemble_policy_version` fields are
+frozen at first-scoring time and **never updated by a later rescore**.
+`alert_evidence` is separate, append-only, versioned scoring state — one
+row per scoring attempt, uniquely keyed `(alert_id, score_execution_id)`.
+"Current" state always means the alert's **latest** evidence row, selected
+by `scored_at DESC, evidence_id DESC` (the `LATEST_EVIDENCE_ORDER_SQL`
+constant in `src/fraud_intel/alerts/queue.py`) — with **no** bundle
+filter (the repository's one, consistently-applied contract is "absolute
+latest evidence," not "current OPERATIONAL bundle's evidence"). Both
+`aidp alerts show` (single alert) and `aidp alerts list` / the dashboard's
+ranked queue (batch, via `list_alerts_with_current_state()`, a single
+`LEFT JOIN LATERAL` query — no N+1) source "current" from this exact same
+rule, so they can never disagree. This, too, was a real corrective pass:
+`aidp alerts list` originally read only `fraud_alerts.initial_priority_band`,
+so a rescored alert's real current band was invisible to it — found for
+real when ACH's replacement-bundle promotion (bundle 3 → bundle 4)
+produced real MEDIUM-band evidence that `alerts list --priority-band
+MEDIUM` still reported as zero rows.
+
+### Manual, whole-bundle promotion with lifecycle auditing
+
+A `channel_model_bundles` row bundles nine required components (GBM/LR-
+shadow/anomaly model versions, preprocessing artifact, feature-schema
+version, and four policy versions: rule set, graph policy, ensemble
+policy, reason-code version) as one atomic, immutable unit —
+`validate_promotion_eligible()` refuses a bundle missing any of the nine.
+Promotion (`aidp fraud-intel promote`) is always a manual, explicit
+`--promoted-by <operator>` action; there is no automatic promotion
+anywhere. `promote_bundle()` (`src/fraud_intel/models/promotion.py`)
+verifies every component/policy against the CURRENTLY loaded config before
+promoting, locks the channel's full bundle history (`FOR UPDATE`) inside
+one transaction, retires the previous `OPERATIONAL` bundle (if any) and
+promotes the candidate atomically, and — for a channel's **first-ever**
+promotion only — freshly recomputes the cold-start promotion gate from the
+candidate's own immutable training-time held-out report (never a cached
+value). A second-or-later promotion for an already-`OPERATIONAL` channel
+does not re-run that gate at the code level (verified directly in this
+build: ACH's replacement promotion took the "warm/replacement" path) — the
+non-persistent full-candidate diagnostic remains this project's own
+process-level governance practice for that case, not something
+`promote_bundle()` itself enforces. Every promotion writes one
+`model_promotion` row via the shared `RunLifecycle`, with the full gate
+evidence, provenance, and component/policy versions in `artifacts`.
+
+### Cold-start vs. live evaluation
+
+`aidp fraud-intel evaluate` has two distinct, clearly-labeled modes,
+chosen automatically by whether the channel currently has an
+`OPERATIONAL` bundle: `candidate_training_holdout` (no `OPERATIONAL`
+bundle yet — evaluates the candidate's own immutable training-time
+held-out test-split report) and `live_resolved_alerts` (an `OPERATIONAL`
+bundle exists — evaluates real, scored, resolved alerts, with an optional
+shadow-candidate comparison). A caller cannot force cold-start mode for a
+channel that already has an `OPERATIONAL` bundle; the non-persistent
+full-candidate diagnostic (`score_source_alert()` run in memory, no
+`fraud_alerts`/`alert_evidence` write, no `RunLifecycle`) is this
+project's own real production-code-path answer for that case.
+
+### The read-only dashboard
+
+`src/dashboard/fraud_intel_tab.py` — a "Fraud Intelligence" tab in the
+existing Streamlit dashboard, entirely separate from the legacy v1.1
+tabs. Strictly read-only: it only ever calls
+`create_default_alert_queue_store(database).list_alerts_with_current_state()`/
+`.get_alert()`/`.get_latest_evidence()`/`.list_dispositions()` (a
+Phase-8-added pure getter, alongside the existing two) — never any
+write function. It ranks the current-state queue by
+`current_operational_priority_score` (deterministic tie-break: score
+desc, `current_scored_at` asc, `alert_id` asc), keeps LOW-band alerts
+visible by default, and never displays `scenario_id`/
+`synthetic_scenario_label`/any other synthetic-generator ground truth —
+those fields don't exist on any type this tab reads, so there is nothing
+to accidentally leak. Disposition **capture** remains exclusively
+`aidp alerts disposition` (CLI-only); the dashboard only ever reads
+disposition history.
+
+### POC scope and disclaimers
+
+Every policy file except `online_banking`'s (which predates the field)
+carries `calibration_status: UNVALIDATED_POC_DEFAULT` and a
+`promotion_note` stating thresholds are an untuned placeholder — verify
+the exact wording in `config/fraud_intel/ensemble_policy_<channel>.yaml`
+before quoting it, rather than assuming it's identical across channels.
+Real, Phase-7B-verified per-channel results (synthetic data only):
+Wire's fixed-threshold confusion matrix has 21 legitimate alerts in its
+MEDIUM band (**not** a perfect result); ATM's fixed-threshold recall is
+10.7% (14/131) — capacity-ranked review, not the fixed 0.40 threshold, is
+this POC's intended interpretation for it; Debit Card and P2P achieved
+perfect (1.0/1.0) precision/recall/ROC-AUC/PR-AUC, which most likely
+reflects unusually clean synthetic-generator scenario separability (P2P's
+`P2P_NEW_RECIPIENT_NO_MEMO` rule alone perfectly separates its synthetic
+fraud population) rather than validated real-world model quality; Wire,
+ATM, Debit Card, and P2P produced **zero** HIGH-band alerts in real
+scoring (mathematically reachable given the pinned ensemble weights, but
+never empirically reached); Mobile Deposit is the one channel whose HIGH
+alerts come through a real, firing `MANDATORY_REVIEW`-category rule
+(`MOBILE_DEPOSIT_DUPLICATE_IMAGE_AND_CAR_LAR_MISMATCH`), not the weighted
+score threshold. **None of this constitutes Citizens Bank production or
+regulatory approval, automatic governance, or a claim of real-world
+accuracy** — it is a local, synthetic proof-of-concept only.
+
 ## Real issues hit and fixed during the build
 
 See TROUBLESHOOTING.md for the full detail; summary:

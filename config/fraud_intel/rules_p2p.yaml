@@ -1,0 +1,25 @@
+# P2P channel rules (guide section 10). Fields reference P2PPayload's own
+# fields (including recipient_is_new_flag -- see rules_online_banking.yaml's
+# comment) and the shared Phase 2 feature names.
+channel: p2p
+rule_set_version: v1
+rules:
+  - id: P2P_NEW_RECIPIENT_HIGH_AMOUNT_RAPID_VELOCITY
+    category: MANDATORY_REVIEW
+    when:
+      - {field: recipient_is_new_flag, op: is_true}
+      - {field: amount_minor_units, op: gt, value: 200000}
+      - {field: events_last_1h, op: gte, value: 3}
+    reason_code: P2P_NEW_RECIPIENT_HIGH_AMOUNT_RAPID_VELOCITY
+  - id: P2P_NEW_RECIPIENT_NO_MEMO
+    category: SCORE_CONTRIBUTING
+    when:
+      - {field: recipient_is_new_flag, op: is_true}
+      - {field: memo_present_flag, op: is_false}
+    score_contribution: 0.1
+    reason_code: P2P_NEW_RECIPIENT_NO_MEMO
+  - id: P2P_NIGHT_TRANSACTION
+    category: INFORMATIONAL
+    when:
+      - {field: night_transaction_flag, op: is_true}
+    reason_code: P2P_NIGHT_TRANSACTION
