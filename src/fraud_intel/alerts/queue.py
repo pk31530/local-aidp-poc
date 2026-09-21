@@ -31,6 +31,32 @@ log = get_logger(__name__)
 MAX_NOTES_LENGTH = 2000
 SCORING_UNAVAILABLE_REASON_CODE = "SCORING_UNAVAILABLE"
 
+# Phase 7B corrective pass (stale alert-list read-path fix): the single,
+# canonical "current state" selection rule for one alert's evidence --
+# the most recently scored row, ties broken by the higher evidence_id,
+# with NO bundle filter (the repository's existing, already-shipped
+# contract is "absolute latest evidence", not "current OPERATIONAL bundle
+# evidence" -- see get_latest_evidence()'s pre-existing real-store SQL,
+# unchanged here). Both get_latest_evidence() (single-alert) and
+# list_alerts_with_current_state() (batch, avoids N+1 via one real SQL
+# query with a LATERAL join) interpolate this SAME string, so they cannot
+# silently drift apart the way _list_alerts()/get_latest_evidence() did
+# before this fix -- a structural test asserts both real-store SQL
+# strings contain it.
+LATEST_EVIDENCE_ORDER_SQL = "scored_at DESC, evidence_id DESC"
+
+
+def _latest_evidence_sort_key(evidence: "AlertEvidenceRecord") -> tuple:
+    """Pure form of LATEST_EVIDENCE_ORDER_SQL, for in-memory selection
+    (_FakeAlertQueueStore) -- sort ascending by this key and take the
+    LAST element to get the same row the real SQL's ORDER BY ... LIMIT 1
+    would return. `str(evidence_id)` matches Postgres UUID text ordering
+    closely enough for the tie-break's purpose (distinguishing rows with
+    equal scored_at, never used to compare across unrelated UUIDs for any
+    other reason)."""
+    return (evidence.scored_at, str(evidence.evidence_id))
+
+
 _STATUS_BY_DISPOSITION = {
     "CONFIRMED_FRAUD": "CLOSED",
     "CONFIRMED_LEGITIMATE": "CLOSED",
@@ -103,6 +129,42 @@ class AlertEvidenceRecord(BaseModel):
     scored_at: datetime
 
 
+class AlertListItem(BaseModel):
+    """One row for `aidp alerts list` -- combines the alert's immutable
+    identity/`initial_*` audit fields (Phase 6 decision 2, unchanged) with
+    its CURRENT state, sourced from the latest `AlertEvidenceRecord`
+    (same selection rule as `get_latest_evidence()`:
+    LATEST_EVIDENCE_ORDER_SQL). `current_*` fields are explicitly None,
+    never a fabricated or fallback-to-initial value, for the rare alert
+    that has no evidence row at all (a partial write on the
+    catastrophic-failure path of score_and_record_alert() -- see its own
+    docstring). `initial_*` field NAMES are unchanged from FraudAlertRecord
+    -- already unambiguous, never presented as current."""
+
+    model_config = ConfigDict(frozen=True)
+
+    alert_id: int
+    event_id: uuid.UUID
+    source_alert_id: uuid.UUID
+    source_system: str
+    channel: str
+    customer_id: str
+    account_id: str
+    amount_minor_units: int
+    status: str
+    created_at: datetime
+
+    initial_operational_priority_score: float
+    initial_priority_band: str
+    initial_ensemble_policy_version: str
+
+    current_evidence_id: Optional[uuid.UUID]
+    current_channel_model_bundle_id: Optional[int]
+    current_priority_band: Optional[str]
+    current_operational_priority_score: Optional[float]
+    current_scored_at: Optional[datetime]
+
+
 class AnalystDispositionRecord(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -133,6 +195,15 @@ class AlertQueueStore(Protocol):
     def get_alert(self, alert_id: int) -> FraudAlertRecord: ...
 
     def get_latest_evidence(self, alert_id: int) -> Optional[AlertEvidenceRecord]: ...
+
+    def list_alerts_with_current_state(
+        self,
+        *,
+        channel: Optional[str] = None,
+        status: Optional[str] = None,
+        current_priority_band: Optional[str] = None,
+        limit: int = 100,
+    ) -> list["AlertListItem"]: ...
 
     def record_disposition_and_update_status(
         self, *, alert_id: int, analyst_id: str, disposition: str, notes: Optional[str], new_status: str
@@ -432,12 +503,74 @@ class _PostgresAlertQueueStore:
             with conn:
                 with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                     cur.execute(
-                        "SELECT * FROM alert_evidence WHERE alert_id = %s "
-                        "ORDER BY scored_at DESC, evidence_id DESC LIMIT 1",
+                        f"SELECT * FROM alert_evidence WHERE alert_id = %s "
+                        f"ORDER BY {LATEST_EVIDENCE_ORDER_SQL} LIMIT 1",
                         (alert_id,),
                     )
                     row = cur.fetchone()
                     return AlertEvidenceRecord(**row) if row else None
+        finally:
+            conn.close()
+
+    def list_alerts_with_current_state(
+        self,
+        *,
+        channel: Optional[str] = None,
+        status: Optional[str] = None,
+        current_priority_band: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[AlertListItem]:
+        """One parameterized query, no N+1: a LEFT JOIN LATERAL picks each
+        alert's own latest evidence row via LATEST_EVIDENCE_ORDER_SQL --
+        the SAME ordering get_latest_evidence() uses, so `alerts list` and
+        `alerts show` can never again disagree about what "current" means
+        (Phase 7B corrective pass: this replaced the old _list_alerts(),
+        which read fraud_alerts.initial_priority_band only and never
+        reflected a rescore under a later bundle). LEFT JOIN (not INNER)
+        keeps an alert with zero evidence rows visible, with every
+        current_* field None -- an explicit null representation, never a
+        silent drop or a fabricated fallback to the initial_* values.
+        `current_priority_band` filters on the JOINED (current) band, not
+        `fraud_alerts.initial_priority_band`."""
+        conn = get_connection(self._database)
+        try:
+            with conn:
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    clauses, params = [], []
+                    if channel:
+                        clauses.append("fa.channel = %s")
+                        params.append(channel)
+                    if status:
+                        clauses.append("fa.status = %s")
+                        params.append(status)
+                    if current_priority_band:
+                        clauses.append("le.priority_band = %s")
+                        params.append(current_priority_band)
+                    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+                    cur.execute(
+                        f"""
+                        SELECT fa.*,
+                               le.evidence_id AS current_evidence_id,
+                               le.channel_model_bundle_id AS current_channel_model_bundle_id,
+                               le.priority_band AS current_priority_band,
+                               le.operational_priority_score AS current_operational_priority_score,
+                               le.scored_at AS current_scored_at
+                        FROM fraud_alerts fa
+                        LEFT JOIN LATERAL (
+                            SELECT evidence_id, channel_model_bundle_id, priority_band,
+                                   operational_priority_score, scored_at
+                            FROM alert_evidence ae
+                            WHERE ae.alert_id = fa.alert_id
+                            ORDER BY {LATEST_EVIDENCE_ORDER_SQL}
+                            LIMIT 1
+                        ) le ON true
+                        {where}
+                        ORDER BY fa.created_at DESC, fa.alert_id DESC
+                        LIMIT %s
+                        """,
+                        params + [limit],
+                    )
+                    return [AlertListItem(**row) for row in cur.fetchall()]
         finally:
             conn.close()
 
@@ -529,7 +662,43 @@ class _FakeAlertQueueStore:
         rows = self.evidence_by_alert.get(alert_id, [])
         if not rows:
             return None
-        return sorted(rows, key=lambda r: (r.scored_at, str(r.evidence_id)), reverse=True)[0]
+        return sorted(rows, key=_latest_evidence_sort_key, reverse=True)[0]
+
+    def list_alerts_with_current_state(
+        self,
+        *,
+        channel: Optional[str] = None,
+        status: Optional[str] = None,
+        current_priority_band: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[AlertListItem]:
+        items: list[AlertListItem] = []
+        for alert in self.alerts_by_id.values():
+            if channel is not None and alert.channel != channel:
+                continue
+            if status is not None and alert.status != status:
+                continue
+            latest = self.get_latest_evidence(alert.alert_id)
+            if current_priority_band is not None and (latest is None or latest.priority_band != current_priority_band):
+                continue
+            items.append(
+                AlertListItem(
+                    alert_id=alert.alert_id, event_id=alert.event_id, source_alert_id=alert.source_alert_id,
+                    source_system=alert.source_system, channel=alert.channel, customer_id=alert.customer_id,
+                    account_id=alert.account_id, amount_minor_units=alert.amount_minor_units, status=alert.status,
+                    created_at=alert.created_at,
+                    initial_operational_priority_score=alert.initial_operational_priority_score,
+                    initial_priority_band=alert.initial_priority_band,
+                    initial_ensemble_policy_version=alert.initial_ensemble_policy_version,
+                    current_evidence_id=latest.evidence_id if latest else None,
+                    current_channel_model_bundle_id=latest.channel_model_bundle_id if latest else None,
+                    current_priority_band=latest.priority_band if latest else None,
+                    current_operational_priority_score=latest.operational_priority_score if latest else None,
+                    current_scored_at=latest.scored_at if latest else None,
+                )
+            )
+        items.sort(key=lambda i: (i.created_at, i.alert_id), reverse=True)
+        return items[:limit]
 
     def record_disposition_and_update_status(self, *, alert_id, analyst_id, disposition, notes, new_status) -> AnalystDispositionRecord:
         alert = self.alerts_by_id[alert_id]

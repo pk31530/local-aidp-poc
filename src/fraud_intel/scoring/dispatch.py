@@ -539,8 +539,16 @@ def score_channel(
                     store=alert_queue_store,
                 )
                 processed += 1
+                # Phase 7B corrective pass: `alert.initial_priority_band`
+                # is the alert's FIRST-ever scoring band (Phase 6 decision
+                # 2), frozen even when this call is a rescore under a new
+                # bundle -- reporting it here would silently misrepresent
+                # this run's own just-written evidence (`evidence`, from
+                # THIS score_and_record_alert() call, always populated on
+                # the non-raising path) as still being whatever an
+                # earlier, possibly-retired bundle originally computed.
                 alert_summaries.append(
-                    {"alert_id": alert.alert_id, "status": alert.status, "priority_band": alert.initial_priority_band}
+                    {"alert_id": alert.alert_id, "status": alert.status, "priority_band": evidence.priority_band}
                 )
             except Exception:
                 rejected += 1

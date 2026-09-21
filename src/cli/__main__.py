@@ -703,39 +703,28 @@ def _handle_fraud_intel_labels_assess(args: argparse.Namespace) -> dict:
         raise CLIUserError(str(exc)) from exc
 
 
-def _list_alerts(database: str, *, channel=None, status=None, priority_band=None):
-    import psycopg2.extras
-
-    from src.common.db import get_connection
-    from src.fraud_intel.alerts.queue import FraudAlertRecord
-
-    conn = get_connection(database)
-    try:
-        with conn:
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                clauses, params = [], []
-                if channel:
-                    clauses.append("channel = %s")
-                    params.append(channel)
-                if status:
-                    clauses.append("status = %s")
-                    params.append(status)
-                if priority_band:
-                    clauses.append("initial_priority_band = %s")
-                    params.append(priority_band)
-                where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-                cur.execute(f"SELECT * FROM fraud_alerts {where} ORDER BY created_at DESC LIMIT 100", params)
-                return [FraudAlertRecord(**row) for row in cur.fetchall()]
-    finally:
-        conn.close()
-
-
 def _handle_alerts_list(args: argparse.Namespace) -> dict:
+    """Phase 7B corrective pass: `--priority-band` filters on the alert's
+    CURRENT state (latest AlertEvidenceRecord), not the frozen
+    `initial_priority_band` snapshot -- previously this command's own
+    filter and every returned row's displayed band/score were stuck at
+    whatever the alert's FIRST-ever scoring bundle produced, even after a
+    later bundle rescored it (discovered for real: ACH bundle 4's fresh
+    MEDIUM-band evidence was invisible to `alerts list
+    --priority-band MEDIUM`, which returned 0 rows, because bundle 3 had
+    originally scored every ACH alert LOW). `store.
+    list_alerts_with_current_state()` (src.fraud_intel.alerts.queue) is
+    the single, shared abstraction both `alerts list` and `alerts show`
+    now source "current" from -- see LATEST_EVIDENCE_ORDER_SQL."""
     database = _require_database(args)
-    alerts = _list_alerts(database, channel=args.channel, status=args.status, priority_band=args.priority_band)
-    # Analyst-facing surface: FraudAlertRecord has no scenario_id/synthetic-
+    store = create_default_alert_queue_store(database)
+    items = store.list_alerts_with_current_state(
+        channel=args.channel, status=args.status, current_priority_band=args.priority_band, limit=100
+    )
+    # Analyst-facing surface: AlertListItem has no scenario_id/synthetic-
     # label field at all -- structurally, not just conventionally, safe.
-    return {"alerts": [a.model_dump(mode="json") for a in alerts], "count": len(alerts)}
+    alerts = [item.model_dump(mode="json") for item in items]
+    return {"alerts": alerts, "count": len(alerts)}
 
 
 def _handle_alerts_show(args: argparse.Namespace) -> dict:
@@ -939,7 +928,10 @@ def build_parser() -> argparse.ArgumentParser:
     alerts_list_p = alerts_sub.add_parser("list", parents=[json_parent, database_parent], help="list alerts")
     alerts_list_p.add_argument("--channel", default=None, choices=sorted(FRAUD_INTEL_ALL_CHANNELS))
     alerts_list_p.add_argument("--status", default=None, choices=("OPEN", "IN_REVIEW", "CLOSED"))
-    alerts_list_p.add_argument("--priority-band", dest="priority_band", default=None, choices=("LOW", "MEDIUM", "HIGH"))
+    alerts_list_p.add_argument(
+        "--priority-band", dest="priority_band", default=None, choices=("LOW", "MEDIUM", "HIGH"),
+        help="filters on the alert's CURRENT (latest-evidence) priority band, not its frozen initial band",
+    )
     alerts_list_p.set_defaults(handler=_handle_alerts_list)
 
     alerts_show_p = alerts_sub.add_parser("show", parents=[json_parent, database_parent], help="show one alert with its latest evidence")

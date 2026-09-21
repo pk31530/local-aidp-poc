@@ -12,6 +12,7 @@ import pytest
 
 from src.cli import __main__ as cli_main
 from src.fraud_intel.alerts.queue import (
+    AlertListItem,
     AnalystDispositionRecord,
     FraudAlertRecord,
     InvalidAlertTransitionError,
@@ -47,6 +48,36 @@ def _alert(**overrides) -> FraudAlertRecord:
     )
     base.update(overrides)
     return FraudAlertRecord(**base)
+
+
+def _alert_list_item(**overrides) -> AlertListItem:
+    import uuid
+
+    base = dict(
+        alert_id=1, event_id=uuid.uuid4(), source_alert_id=uuid.uuid4(), source_system="core_fraud_engine",
+        channel="online_banking", customer_id="cust-1", account_id="acct-1", amount_minor_units=1000,
+        status="OPEN", created_at=T0,
+        initial_operational_priority_score=0.9, initial_priority_band="HIGH", initial_ensemble_policy_version="v1",
+        current_evidence_id=uuid.uuid4(), current_channel_model_bundle_id=1,
+        current_priority_band="HIGH", current_operational_priority_score=0.9, current_scored_at=T0,
+    )
+    base.update(overrides)
+    return AlertListItem(**base)
+
+
+class _StubListAlertsStore:
+    """Minimal store stub -- captures list_alerts_with_current_state()'s
+    kwargs and returns a fixed item list, so CLI-layer tests can assert
+    on the exact filter wiring (e.g. --priority-band -> current_priority_band)
+    without going through a full _FakeAlertQueueStore's own filtering."""
+
+    def __init__(self, items):
+        self._items = items
+        self.captured: dict = {}
+
+    def list_alerts_with_current_state(self, *, channel=None, status=None, current_priority_band=None, limit=100):
+        self.captured = dict(channel=channel, status=status, current_priority_band=current_priority_band, limit=limit)
+        return self._items
 
 
 def _bundle(**overrides) -> ChannelModelBundleRecord:
@@ -1432,7 +1463,8 @@ def test_labels_assess_never_trains_or_promotes():
 
 
 def test_alerts_list_output_has_no_scenario_id_or_synthetic_fields(monkeypatch, capsys):
-    monkeypatch.setattr(cli_main, "_list_alerts", lambda database, *, channel, status, priority_band: [_alert()])
+    store = _StubListAlertsStore([_alert_list_item()])
+    monkeypatch.setattr(cli_main, "create_default_alert_queue_store", lambda database: store)
 
     cli_main.main(["alerts", "list", "--database", "aidp_test", "--json"])
 
@@ -1442,20 +1474,45 @@ def test_alerts_list_output_has_no_scenario_id_or_synthetic_fields(monkeypatch, 
     assert "synthetic_scenario_label" not in result["alerts"][0]
 
 
-def test_alerts_list_passes_filters_through(monkeypatch, capsys):
-    captured = {}
-
-    def _fake_list(database, *, channel, status, priority_band):
-        captured.update(database=database, channel=channel, status=status, priority_band=priority_band)
-        return []
-
-    monkeypatch.setattr(cli_main, "_list_alerts", _fake_list)
+def test_alerts_list_passes_filters_through_as_current_priority_band(monkeypatch, capsys):
+    """Phase 7B corrective pass: --priority-band must be wired to
+    `current_priority_band` (the alert's latest-evidence state), never
+    to the store's own frozen `initial_priority_band` -- this is the
+    exact CLI-layer plumbing check for the stale alert-list read-path
+    fix."""
+    store = _StubListAlertsStore([])
+    monkeypatch.setattr(cli_main, "create_default_alert_queue_store", lambda database: store)
 
     cli_main.main(
         ["alerts", "list", "--channel", "online_banking", "--status", "OPEN", "--priority-band", "HIGH", "--database", "aidp_test", "--json"]
     )
 
-    assert captured == {"database": "aidp_test", "channel": "online_banking", "status": "OPEN", "priority_band": "HIGH"}
+    assert store.captured == {"channel": "online_banking", "status": "OPEN", "current_priority_band": "HIGH", "limit": 100}
+
+
+def test_alerts_list_medium_filter_finds_alert_whose_current_band_is_medium_even_though_initial_was_low(monkeypatch, capsys):
+    """CLI-level regression check for the ACH class of bug: an alert
+    created LOW (bundle 3) and rescored MEDIUM (bundle 4) is correctly
+    surfaced by the JSON output with BOTH its frozen initial_* value and
+    its current_* value distinguished. The underlying store-level filter
+    logic (does list_alerts_with_current_state() actually select the
+    MEDIUM row) is covered end-to-end by
+    tests/unit/test_fraud_intel_alert_queue.py; this test covers the CLI
+    output-contract wiring on top of it."""
+    item = _alert_list_item(
+        alert_id=42, initial_priority_band="LOW", initial_operational_priority_score=0.1,
+        current_priority_band="MEDIUM", current_operational_priority_score=0.42,
+    )
+    stub = _StubListAlertsStore([item])
+    monkeypatch.setattr(cli_main, "create_default_alert_queue_store", lambda database: stub)
+
+    cli_main.main(["alerts", "list", "--priority-band", "MEDIUM", "--database", "aidp_test", "--json"])
+    result = json.loads(capsys.readouterr().out)
+    assert result["count"] == 1
+    assert result["alerts"][0]["alert_id"] == 42
+    assert result["alerts"][0]["initial_priority_band"] == "LOW"
+    assert result["alerts"][0]["current_priority_band"] == "MEDIUM"
+    assert stub.captured["current_priority_band"] == "MEDIUM"
 
 
 # ---- alerts show ------------------------------------------------------------------------

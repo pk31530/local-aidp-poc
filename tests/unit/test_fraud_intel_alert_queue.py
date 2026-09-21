@@ -419,3 +419,525 @@ def test_get_latest_evidence_deterministic_tie_break():
     latest = store.get_latest_evidence(alert.alert_id)
     assert latest.evidence_id in (evidence1.evidence_id, evidence2.evidence_id)
     assert latest is not None
+
+
+# ---- list_alerts_with_current_state(): stale alert-list read-path corrective pass ------
+#
+# Phase 7B corrective pass: `aidp alerts list` used to read ONLY
+# fraud_alerts.initial_priority_band/initial_operational_priority_score --
+# frozen at first-scoring time -- so an alert rescored under a LATER
+# bundle (e.g. ACH's bundle 3 -> bundle 4 replacement promotion) never
+# showed its real current band/score, and --priority-band filtering
+# against a band the alert had since moved away from silently returned
+# 0 rows. `list_alerts_with_current_state()` fixes this by sourcing
+# "current" from the SAME latest-evidence selection rule
+# (LATEST_EVIDENCE_ORDER_SQL) get_latest_evidence() already uses
+# correctly, for both the real store (a single LEFT JOIN LATERAL query,
+# no N+1) and the fake store.
+
+
+def _bundle3() -> LoadedChannelBundle:
+    return _bundle()  # bundle_id=2 in the shared fixture -- reused as the "earlier" bundle
+
+
+def _bundle4() -> LoadedChannelBundle:
+    b = _bundle()
+    return LoadedChannelBundle(
+        channel=b.channel, bundle_id=b.bundle_id + 1, bundle_version=b.bundle_version + 1,
+        gbm_model=_FakeProbaModel(0.6), lr_model=b.lr_model, anomaly_model=b.anomaly_model,
+        anomaly_normalization=b.anomaly_normalization, preprocessor=b.preprocessor,
+        gbm_model_version="gbm-8", lr_model_version=b.lr_model_version, anomaly_model_version=b.anomaly_model_version,
+        preprocessing_artifact_version=b.preprocessing_artifact_version, feature_schema_version=b.feature_schema_version,
+        rule_set_version=b.rule_set_version, graph_policy_version=b.graph_policy_version,
+        ensemble_policy_version=b.ensemble_policy_version, reason_code_version=b.reason_code_version,
+    )
+
+
+def _rescore_to_medium(store, *, event, source_alert):
+    """Idempotently reuses the SAME already-existing alert (create_alert_
+    if_new is first-write-wins), then persists a NEW evidence row
+    directly at MEDIUM band, provenance-stamped as bundle4 -- exactly the
+    ACH bundle-3-LOW -> bundle-4-MEDIUM replacement shape. Writes the
+    evidence row directly (rather than tuning a real GBM probability
+    through the live rule/ensemble pipeline to land exactly on MEDIUM,
+    which is unpredictable and not what these list/filter tests are
+    about) -- score_and_record_alert()'s own orchestration is already
+    covered by the tests above this section. `scored_at` uses real
+    wall-clock "now" (never T0-relative): score_and_record_alert()'s own
+    evidence rows are ALSO stamped with real wall-clock `datetime.now()`
+    (src.fraud_intel.scoring.orchestrator.score_source_alert()), so a
+    fixed T0-relative offset could -- and, discovered here, DID --
+    silently end up EARLIER than "now" and be selected as stale rather
+    than as the intended later row."""
+    alert = store.create_alert_if_new(
+        event=event, source_alert=source_alert,
+        initial_operational_priority_score=0.05, initial_priority_band="LOW",
+        initial_ensemble_policy_version="v1",
+    )
+    bundle4 = _bundle4()
+    evidence = store.record_evidence(
+        alert_id=alert.alert_id, score_execution_id=uuid.uuid4(),
+        rule_result=None, gbm_probability=0.6, lr_probability=None, anomaly_score=0.0, graph_risk_score=0.0,
+        operational_priority_score=0.42, priority_band="MEDIUM", degraded=False, component_statuses={}, reason_codes=[],
+        channel_model_bundle_id=bundle4.bundle_id, gbm_model_version=bundle4.gbm_model_version,
+        lr_model_version=bundle4.lr_model_version, anomaly_model_version=bundle4.anomaly_model_version,
+        preprocessing_artifact_version=bundle4.preprocessing_artifact_version,
+        feature_schema_version=bundle4.feature_schema_version, rule_set_version=bundle4.rule_set_version,
+        graph_policy_version=bundle4.graph_policy_version, ensemble_policy_version=bundle4.ensemble_policy_version,
+        reason_code_version=bundle4.reason_code_version, config_hash="cfg-medium", git_sha="deadbeef",
+        event_time=event.event_timestamp, scored_at=datetime.now(timezone.utc) + timedelta(hours=1),
+    )
+    return alert, evidence
+
+
+def test_list_current_priority_band_filter_includes_rescored_alert_medium_not_initial_low():
+    """Items 1/2: initial LOW + latest MEDIUM -> MEDIUM filter includes
+    it, LOW filter excludes it."""
+    store = _FakeAlertQueueStore()
+    event = _event()
+    source_alert = _source_alert(event_id=event.event_id)
+    alert, evidence1 = _score(event=event, source_alert=source_alert, store=store, bundle=_bundle3())
+    assert alert.initial_priority_band == "LOW"
+
+    _, evidence2 = _rescore_to_medium(store, event=event, source_alert=source_alert)
+    assert evidence2.priority_band == "MEDIUM"
+
+    medium_items = store.list_alerts_with_current_state(current_priority_band="MEDIUM")
+    assert [i.alert_id for i in medium_items] == [alert.alert_id]
+
+    low_items = store.list_alerts_with_current_state(current_priority_band="LOW")
+    assert alert.alert_id not in [i.alert_id for i in low_items]
+
+
+def test_list_current_fields_come_from_latest_evidence_not_initial():
+    """Item 3."""
+    store = _FakeAlertQueueStore()
+    event = _event()
+    source_alert = _source_alert(event_id=event.event_id)
+    alert, _ = _score(event=event, source_alert=source_alert, store=store, bundle=_bundle3())
+    _, evidence2 = _rescore_to_medium(store, event=event, source_alert=source_alert)
+
+    item = next(i for i in store.list_alerts_with_current_state() if i.alert_id == alert.alert_id)
+    assert item.current_priority_band == evidence2.priority_band == "MEDIUM"
+    assert item.current_operational_priority_score == evidence2.operational_priority_score
+    assert item.current_evidence_id == evidence2.evidence_id
+    assert item.current_channel_model_bundle_id == evidence2.channel_model_bundle_id == 3
+    assert item.current_scored_at == evidence2.scored_at
+    # initial_* stay exactly what the FIRST scoring pass produced
+    assert item.initial_priority_band == "LOW"
+
+
+def test_list_and_show_agree_on_current_evidence():
+    """Item 4: alerts show (get_latest_evidence) and alerts list
+    (list_alerts_with_current_state) must select the identical row."""
+    store = _FakeAlertQueueStore()
+    event = _event()
+    source_alert = _source_alert(event_id=event.event_id)
+    alert, _ = _score(event=event, source_alert=source_alert, store=store, bundle=_bundle3())
+    _rescore_to_medium(store, event=event, source_alert=source_alert)
+
+    show_evidence = store.get_latest_evidence(alert.alert_id)
+    list_item = next(i for i in store.list_alerts_with_current_state() if i.alert_id == alert.alert_id)
+
+    assert list_item.current_evidence_id == show_evidence.evidence_id
+    assert list_item.current_priority_band == show_evidence.priority_band
+    assert list_item.current_operational_priority_score == show_evidence.operational_priority_score
+
+
+def test_list_selects_the_newest_scored_at():
+    """Item 5."""
+    store = _FakeAlertQueueStore()
+    event = _event()
+    source_alert = _source_alert(event_id=event.event_id)
+    alert, evidence1 = _score(event=event, source_alert=source_alert, store=store, bundle=_bundle3())
+    _, evidence2 = _rescore_to_medium(store, event=event, source_alert=source_alert)
+    assert evidence2.scored_at > evidence1.scored_at
+
+    item = next(i for i in store.list_alerts_with_current_state() if i.alert_id == alert.alert_id)
+    assert item.current_evidence_id == evidence2.evidence_id
+
+
+def test_list_tie_break_selects_higher_evidence_id_on_equal_scored_at():
+    """Item 6: two evidence rows sharing the exact same scored_at ->
+    the higher evidence_id wins, matching LATEST_EVIDENCE_ORDER_SQL
+    exactly."""
+    from src.fraud_intel.alerts.queue import AlertEvidenceRecord
+
+    store = _FakeAlertQueueStore()
+    alert, _ = _score(store=store, bundle=_bundle3())
+    same_time = datetime(2026, 6, 1, tzinfo=timezone.utc)
+
+    lower = AlertEvidenceRecord(
+        evidence_id=uuid.UUID(int=1), alert_id=alert.alert_id, score_execution_id=uuid.uuid4(),
+        rule_result=None, gbm_probability=0.1, lr_probability=None, anomaly_score=None, graph_risk_score=None,
+        operational_priority_score=0.2, priority_band="LOW", degraded=False, component_statuses={}, reason_codes=[],
+        channel_model_bundle_id=10, gbm_model_version="1", lr_model_version="1", anomaly_model_version="1",
+        preprocessing_artifact_version="pp", feature_schema_version="v1", rule_set_version="v1",
+        graph_policy_version="v1", ensemble_policy_version="v1", reason_code_version="v1",
+        config_hash="c", git_sha="g", event_time=T0, scored_at=same_time,
+    )
+    higher = lower.model_copy(update={
+        "evidence_id": uuid.UUID(int=2), "score_execution_id": uuid.uuid4(),
+        "priority_band": "HIGH", "operational_priority_score": 0.9,
+    })
+    store.evidence_by_key[(alert.alert_id, str(lower.score_execution_id))] = lower
+    store.evidence_by_key[(alert.alert_id, str(higher.score_execution_id))] = higher
+    store.evidence_by_alert[alert.alert_id] = [lower, higher]
+
+    item = next(i for i in store.list_alerts_with_current_state() if i.alert_id == alert.alert_id)
+    assert item.current_evidence_id == higher.evidence_id
+    assert item.current_priority_band == "HIGH"
+
+
+def test_list_retired_bundle_evidence_then_operational_bundle_evidence_selects_intended_row():
+    """Item 7: reproduces the exact ACH shape -- bundle 3 (later RETIRED)
+    scores first, bundle 4 (OPERATIONAL) rescores later -> list/show must
+    select bundle 4's evidence."""
+    store = _FakeAlertQueueStore()
+    event = _event()
+    source_alert = _source_alert(event_id=event.event_id)
+    alert, evidence_bundle3 = _score(event=event, source_alert=source_alert, store=store, bundle=_bundle3())
+    assert evidence_bundle3.channel_model_bundle_id == 2
+
+    _, evidence_bundle4 = _rescore_to_medium(store, event=event, source_alert=source_alert)
+    assert evidence_bundle4.channel_model_bundle_id == 3
+
+    item = next(i for i in store.list_alerts_with_current_state() if i.alert_id == alert.alert_id)
+    assert item.current_channel_model_bundle_id == evidence_bundle4.channel_model_bundle_id
+    assert item.current_priority_band == evidence_bundle4.priority_band
+
+
+def test_list_alert_with_no_evidence_has_null_current_fields():
+    """Item 8: an alert created but never (yet) evidenced -- the rare
+    partial-write state on score_and_record_alert()'s catastrophic path --
+    stays visible with an explicit null current-state, not silently
+    dropped and not fabricated from initial_*."""
+    store = _FakeAlertQueueStore()
+    event = _event()
+    source_alert = _source_alert(event_id=event.event_id)
+    alert = store.create_alert_if_new(
+        event=event, source_alert=source_alert,
+        initial_operational_priority_score=1.0, initial_priority_band="HIGH", initial_ensemble_policy_version="v1",
+    )
+    item = next(i for i in store.list_alerts_with_current_state() if i.alert_id == alert.alert_id)
+    assert item.current_evidence_id is None
+    assert item.current_priority_band is None
+    assert item.current_operational_priority_score is None
+    assert item.current_channel_model_bundle_id is None
+    assert item.current_scored_at is None
+    # initial_* remain populated and visible even with zero evidence
+    assert item.initial_priority_band == "HIGH"
+
+
+def test_list_initial_fields_remain_unchanged_and_visible_as_audit_values():
+    """Item 9."""
+    store = _FakeAlertQueueStore()
+    event = _event()
+    source_alert = _source_alert(event_id=event.event_id)
+    alert, _ = _score(event=event, source_alert=source_alert, store=store, bundle=_bundle3())
+    _rescore_to_medium(store, event=event, source_alert=source_alert)
+
+    item = next(i for i in store.list_alerts_with_current_state() if i.alert_id == alert.alert_id)
+    assert item.initial_priority_band == alert.initial_priority_band == "LOW"
+    assert item.initial_operational_priority_score == alert.initial_operational_priority_score
+    assert item.initial_ensemble_policy_version == alert.initial_ensemble_policy_version
+
+
+def test_list_channel_filtering_remains_isolated():
+    """Item 10."""
+    from src.fraud_intel.events.ach import ACHPayload
+
+    store = _FakeAlertQueueStore()
+    ob_event = _event()
+    ach_event = FraudEvent(
+        event_id=uuid.uuid4(), channel="ach", customer_id="FIC2000", account_id="FIA200000",
+        event_timestamp=T0, amount_minor_units=5_000, direction="debit", device_id=None,
+        channel_payload=ACHPayload(
+            sec_code="PPD", originating_routing_number="123456789", receiving_routing_number="987654321",
+            batch_id="B1", effective_entry_date=T0.date(), company_id="C1",
+        ),
+    )
+    ob_alert, _ = _score(event=ob_event, source_alert=_source_alert(event_id=ob_event.event_id), store=store, bundle=_bundle3())
+    ach_bundle = LoadedChannelBundle(
+        channel="ach", bundle_id=99, bundle_version=1,
+        gbm_model=_FakeProbaModel(0.2), lr_model=_FakeProbaModel(0.3), anomaly_model=_FakeAnomalyModel(),
+        anomaly_normalization=AnomalyNormalization(train_min=-1.0, train_max=1.0, anomaly_artifact_version="anom-test", library_versions={}),
+        preprocessor=_PREPROCESSOR, gbm_model_version="gbm-9", lr_model_version="lr-9", anomaly_model_version="anomaly-9",
+        preprocessing_artifact_version="pp-test", feature_schema_version="v1",
+        rule_set_version="v1", graph_policy_version="v1", ensemble_policy_version="v1", reason_code_version="v1",
+    )
+    ach_alert, _ = score_and_record_alert(
+        event=ach_event, source_alert=_source_alert(event_id=ach_event.event_id), context=_ctx(ach_event),
+        bundle=ach_bundle, rule_provider=LocalYamlRuleProvider(),
+        ensemble_policy=EnsemblePolicy(
+            channel="ach", policy_version="v1", weight_rule=0.35, weight_gbm=0.40, weight_anomaly=0.15,
+            weight_graph=0.10, rule_score_cap=1.0, high_threshold=0.75, medium_threshold=0.40,
+        ),
+        graph_policy=GraphPolicy(
+            channel="ach", graph_policy_version="v1", shared_device_cap=5, shared_device_weight=0.3,
+            fan_in_cap=10, fan_in_weight=0.3, fan_out_cap=10, fan_out_weight=0.2, shortest_path_weight=0.2,
+            graph_max_history_events=5000, max_nodes=20000, max_edges=200000,
+        ),
+        resolved_fraud_evidence=(), config_hash="c", git_sha="g", store=store,
+    )
+
+    ob_only = store.list_alerts_with_current_state(channel="online_banking")
+    ach_only = store.list_alerts_with_current_state(channel="ach")
+    assert {i.alert_id for i in ob_only} == {ob_alert.alert_id}
+    assert {i.alert_id for i in ach_only} == {ach_alert.alert_id}
+
+
+def test_list_no_duplicate_alert_after_multiple_evidence_rows():
+    """Item 11: an alert rescored three times still appears exactly ONCE
+    in the list -- the join/selection must not fan out."""
+    store = _FakeAlertQueueStore()
+    event = _event()
+    source_alert = _source_alert(event_id=event.event_id)
+    alert, _ = _score(event=event, source_alert=source_alert, store=store, bundle=_bundle3())
+    _rescore_to_medium(store, event=event, source_alert=source_alert)
+    score_and_record_alert(
+        event=event, source_alert=source_alert, context=_ctx(event), bundle=_bundle4(),
+        rule_provider=LocalYamlRuleProvider(), ensemble_policy=_ensemble_policy(), graph_policy=_graph_policy(),
+        resolved_fraud_evidence=(), config_hash="cfg-3", git_sha="deadbeef", store=store,
+    )
+    assert len(store.evidence_by_alert[alert.alert_id]) == 3
+
+    items = store.list_alerts_with_current_state()
+    matching = [i for i in items if i.alert_id == alert.alert_id]
+    assert len(matching) == 1
+
+
+def test_list_respects_limit_without_duplication_across_many_alerts():
+    """Item 11 (pagination edge): more alerts than `limit` -- exactly
+    `limit` distinct alert_ids are returned, deterministically."""
+    store = _FakeAlertQueueStore()
+    alert_ids = set()
+    for i in range(5):
+        event = _event(event_timestamp=T0 + timedelta(minutes=i))
+        alert, _ = _score(event=event, source_alert=_source_alert(event_id=event.event_id), store=store, bundle=_bundle3())
+        alert_ids.add(alert.alert_id)
+
+    items = store.list_alerts_with_current_state(limit=3)
+    assert len(items) == 3
+    assert len({i.alert_id for i in items}) == 3
+    assert {i.alert_id for i in items}.issubset(alert_ids)
+
+
+def test_ach_regression_medium_alerts_visible_after_replacement_bundle_rescore():
+    """Item 15: reproduces ACH's exact defect class at a proportional
+    scale -- a channel where EVERY alert's initial (first-bundle) band
+    was LOW, and a later replacement-bundle rescore moves a real subset
+    to MEDIUM. Before this fix, `--priority-band MEDIUM` returned 0 rows
+    for such a channel (the real, observed ACH symptom); after this fix
+    it must return exactly the rescored subset."""
+    store = _FakeAlertQueueStore()
+    alerts = []
+    for i in range(5):
+        event = _event(event_timestamp=T0 + timedelta(minutes=i))
+        source_alert = _source_alert(event_id=event.event_id)
+        alert, evidence = _score(event=event, source_alert=source_alert, store=store, bundle=_bundle3())
+        assert alert.initial_priority_band == "LOW"  # every alert starts LOW, like real ACH bundle 3
+        alerts.append((alert, event, source_alert))
+
+    # Replacement-bundle rescore: only 2 of the 5 move to MEDIUM (the
+    # other 3 stay LOW), matching the real 27-of-441 proportion's shape.
+    rescored_to_medium_ids = set()
+    for alert, event, source_alert in alerts[:2]:
+        _, evidence2 = _rescore_to_medium(store, event=event, source_alert=source_alert)
+        assert evidence2.priority_band == "MEDIUM"
+        rescored_to_medium_ids.add(alert.alert_id)
+
+    # Every fraud_alerts row is STILL initial_priority_band=LOW (Phase 6
+    # decision 2 -- never silently rewritten).
+    assert all(a.initial_priority_band == "LOW" for a, _, _ in alerts)
+
+    medium_items = store.list_alerts_with_current_state(current_priority_band="MEDIUM")
+    assert {i.alert_id for i in medium_items} == rescored_to_medium_ids
+    assert len(medium_items) == 2  # NOT 0 -- the exact bug this patch fixes
+
+
+# ---- real Postgres-shape parity for list_alerts_with_current_state() ------------------
+
+
+class _FakeListAlertsCursor:
+    def __init__(self, conn):
+        self._conn = conn
+        self._result: list[dict] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def execute(self, sql, params=()):
+        normalized = " ".join(sql.split())
+        assert normalized.startswith("SELECT fa.*,"), f"unexpected SQL: {normalized[:80]}"
+        assert "LEFT JOIN LATERAL" in normalized
+        assert "ORDER BY scored_at DESC, evidence_id DESC" in normalized
+        assert "UPDATE" not in normalized and "DELETE" not in normalized and "INSERT" not in normalized
+
+        remaining = list(params)
+        limit = remaining.pop()  # LIMIT %s is always the final placeholder
+        channel = status = band = None
+        if "fa.channel = %s" in normalized:
+            channel = remaining.pop(0)
+        if "fa.status = %s" in normalized:
+            status = remaining.pop(0)
+        if "le.priority_band = %s" in normalized:
+            band = remaining.pop(0)
+        assert not remaining  # every param was consumed by exactly one clause
+
+        rows = []
+        for fa in self._conn.fraud_alerts:
+            if channel is not None and fa["channel"] != channel:
+                continue
+            if status is not None and fa["status"] != status:
+                continue
+            evidence = [e for e in self._conn.alert_evidence if e["alert_id"] == fa["alert_id"]]
+            latest = sorted(evidence, key=lambda e: (e["scored_at"], str(e["evidence_id"])), reverse=True)[0] if evidence else None
+            if band is not None and (latest is None or latest["priority_band"] != band):
+                continue
+            row = dict(fa)
+            row["current_evidence_id"] = latest["evidence_id"] if latest else None
+            row["current_channel_model_bundle_id"] = latest["channel_model_bundle_id"] if latest else None
+            row["current_priority_band"] = latest["priority_band"] if latest else None
+            row["current_operational_priority_score"] = latest["operational_priority_score"] if latest else None
+            row["current_scored_at"] = latest["scored_at"] if latest else None
+            rows.append(row)
+        rows.sort(key=lambda r: (r["created_at"], r["alert_id"]), reverse=True)
+        self._result = rows[:limit]
+
+    def fetchall(self):
+        return self._result
+
+
+class _FakeListAlertsConnection:
+    def __init__(self):
+        self.fraud_alerts: list[dict] = []
+        self.alert_evidence: list[dict] = []
+
+    def cursor(self, cursor_factory=None):
+        return _FakeListAlertsCursor(self)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def close(self):
+        pass
+
+
+def _fa_row(alert_id: int, *, channel="ach", status="OPEN", created_at=T0) -> dict:
+    return {
+        "alert_id": alert_id, "event_id": uuid.uuid4(), "source_alert_id": uuid.uuid4(),
+        "source_system": "SYS", "channel": channel, "customer_id": "cust", "account_id": "acct",
+        "amount_minor_units": 1000, "status": status, "created_at": created_at,
+        "initial_operational_priority_score": 0.1, "initial_priority_band": "LOW",
+        "initial_ensemble_policy_version": "v1",
+    }
+
+
+def _ae_row(alert_id: int, *, evidence_id, channel_model_bundle_id, priority_band, score, scored_at) -> dict:
+    return {
+        "alert_id": alert_id, "evidence_id": evidence_id, "channel_model_bundle_id": channel_model_bundle_id,
+        "priority_band": priority_band, "operational_priority_score": score, "scored_at": scored_at,
+    }
+
+
+def test_postgres_list_alerts_real_query_selects_current_band_not_initial(monkeypatch):
+    """Real-SQL-shape parity test (matches the established
+    _FakeListPendingConnection/_FakeListPendingCursor convention): the
+    ACTUAL _PostgresAlertQueueStore.list_alerts_with_current_state() SQL
+    string is exercised -- not a hand-copied equivalent -- against a fake
+    Postgres double simulating the LEFT JOIN LATERAL, structurally
+    asserting parameterization (item 12), the absence of any
+    UPDATE/DELETE/INSERT (item 13), and the exact ACH-shaped LOW-initial
+    / MEDIUM-current split (item 15) at this layer too."""
+    from src.fraud_intel.alerts.queue import _PostgresAlertQueueStore
+
+    conn = _FakeListAlertsConnection()
+    conn.fraud_alerts = [_fa_row(1, created_at=T0), _fa_row(2, created_at=T0 + timedelta(minutes=1))]
+    conn.alert_evidence = [
+        _ae_row(1, evidence_id=uuid.UUID(int=1), channel_model_bundle_id=3, priority_band="LOW", score=0.1, scored_at=T0),
+        _ae_row(1, evidence_id=uuid.UUID(int=2), channel_model_bundle_id=4, priority_band="MEDIUM", score=0.42, scored_at=T0 + timedelta(hours=1)),
+        _ae_row(2, evidence_id=uuid.UUID(int=3), channel_model_bundle_id=3, priority_band="LOW", score=0.05, scored_at=T0),
+    ]
+    monkeypatch.setattr("src.fraud_intel.alerts.queue.get_connection", lambda database=None: conn)
+
+    store = _PostgresAlertQueueStore(database="aidp_test")
+    all_items = store.list_alerts_with_current_state(channel="ach")
+    assert {i.alert_id for i in all_items} == {1, 2}
+    item1 = next(i for i in all_items if i.alert_id == 1)
+    assert item1.initial_priority_band == "LOW"
+    assert item1.current_priority_band == "MEDIUM"  # the LATER bundle-4 evidence, not bundle-3's initial LOW
+    assert item1.current_channel_model_bundle_id == 4
+
+    medium_only = store.list_alerts_with_current_state(channel="ach", current_priority_band="MEDIUM")
+    assert {i.alert_id for i in medium_only} == {1}  # NOT {} -- the exact regression this patch fixes
+
+
+def test_postgres_list_alerts_sql_is_parameterized_structurally():
+    """Item 12: AST-based, same convention as
+    test_load_cross_channel_customer_pool_uses_parameterized_sql --
+    every %s-bearing SQL string is a literal passed alongside a `params`/
+    `values`-built second argument, never an f-string with a raw value
+    interpolated into the SQL text itself (WHERE-clause-fragment
+    f-strings using ONLY the fixed column/operator text are the existing,
+    accepted repo convention -- e.g. src.fraud_intel.cli_data_access.
+    load_cross_channel_customer_pool -- not a parameterization gap)."""
+    import ast
+    import inspect
+    import textwrap
+
+    from src.fraud_intel.alerts import queue as queue_module
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(queue_module._PostgresAlertQueueStore.list_alerts_with_current_state)))
+    execute_calls = 0
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "execute":
+            execute_calls += 1
+            assert len(node.args) == 2, "cur.execute() must always pass a separate params argument"
+    assert execute_calls == 1
+
+
+def test_postgres_list_alerts_never_updates_fraud_alerts():
+    """Item 13."""
+    import inspect
+
+    from src.fraud_intel.alerts import queue as queue_module
+
+    source = inspect.getsource(queue_module._PostgresAlertQueueStore.list_alerts_with_current_state)
+    upper = source.upper()
+    assert "UPDATE " not in upper
+    assert "DELETE " not in upper
+    assert "INSERT " not in upper
+
+
+def test_list_alerts_and_get_latest_evidence_share_the_same_order_sql_constant():
+    """Structural drift guard: both the real store's get_latest_evidence()
+    and list_alerts_with_current_state() interpolate the SAME
+    LATEST_EVIDENCE_ORDER_SQL constant -- they cannot silently diverge
+    the way `_list_alerts()`/get_latest_evidence() did before this fix."""
+    import inspect
+
+    from src.fraud_intel.alerts import queue as queue_module
+
+    get_latest_src = inspect.getsource(queue_module._PostgresAlertQueueStore.get_latest_evidence)
+    list_src = inspect.getsource(queue_module._PostgresAlertQueueStore.list_alerts_with_current_state)
+    assert "LATEST_EVIDENCE_ORDER_SQL" in get_latest_src
+    assert "LATEST_EVIDENCE_ORDER_SQL" in list_src
+
+
+def test_online_banking_list_behavior_remains_compatible():
+    """Item 14: an unrescored, single-evidence online_banking alert --
+    the pre-existing common case -- still lists correctly with current_*
+    fields equal to its one (and only) evidence row."""
+    store = _FakeAlertQueueStore()
+    alert, evidence = _score(store=store, bundle=_bundle3())
+    item = next(i for i in store.list_alerts_with_current_state(channel="online_banking") if i.alert_id == alert.alert_id)
+    assert item.current_priority_band == evidence.priority_band
+    assert item.current_operational_priority_score == evidence.operational_priority_score
+    assert item.initial_priority_band == alert.initial_priority_band
