@@ -41,6 +41,7 @@ from src.fraud_intel.config import ChannelTrainingRunConfig
 from src.fraud_intel.events.base import FraudEvent
 from src.fraud_intel.events.source_alert_context import SourceAlertContext, SyntheticGroundTruthLabel
 from src.fraud_intel.features.core import FeatureComputationContext
+from src.fraud_intel.features.history import select_customer_historical_events, select_customer_historical_source_alerts
 from src.fraud_intel.models.anomaly import fit_anomaly_model
 from src.fraud_intel.models.bundle import ChannelModelBundleStore, create_default_bundle_store
 from src.fraud_intel.models.calibration import SplitManifest, fit_calibrator
@@ -87,6 +88,8 @@ def _build_supervised_population(
     channel_events: Sequence[FraudEvent],
     source_alerts: Sequence[SourceAlertContext],
     synthetic_labels: Sequence[SyntheticGroundTruthLabel],
+    history_events: Optional[Sequence[FraudEvent]] = None,
+    history_source_alerts: Optional[Sequence[SourceAlertContext]] = None,
 ) -> list[dict[str, Any]]:
     """Pure, in-memory. No database, MLflow, or model-fitting code here --
     only the guide section 11 join: source_alerts -> channel_events ->
@@ -95,15 +98,35 @@ def _build_supervised_population(
 
     Returns one dict per supervised training row: {event_id (str),
     event_timestamp, label (bool), **ordered adapter.feature_columns}.
-    Non-alerted events are still used as history via
-    FeatureComputationContext (both historical_events and
-    source_alert_history are built from the FULL channel_events/
-    source_alerts pools) -- they simply never become a row themselves,
-    since the outer loop iterates only event_ids present in source_alerts.
-    """
+
+    Phase 7B corrective pass: TARGET selection remains exactly as before
+    -- restricted to `channel_events`/`source_alerts` (which callers scope
+    to one channel and one generation_run_id, via
+    src.fraud_intel.cli_data_access.load_channel_population()) -- guide
+    section 15's cross-channel history design never applies to WHICH
+    events become supervised rows, only to what history each row's own
+    features are computed FROM. That history is now built via the shared
+    src.fraud_intel.features.history.select_customer_historical_events()/
+    select_customer_historical_source_alerts() -- the same functions
+    src.fraud_intel.scoring.dispatch._PostgresScoringDataAccess.
+    list_pending() and src.fraud_intel.cli_data_access.
+    load_resolved_alert_scoring_contexts() use for real scoring -- over
+    `history_events`/`history_source_alerts` (a caller-supplied,
+    optionally broader, cross-channel candidate pool for the SAME
+    customers). When omitted (the default), `history_events`/
+    `history_source_alerts` fall back to `channel_events`/`source_alerts`
+    themselves -- the exact pre-fix, channel-scoped-only behavior, kept
+    as the default so every existing single-channel test/caller is
+    unaffected; the real CLI training path now supplies a real,
+    cross-channel pool (src.fraud_intel.cli_data_access.
+    load_cross_channel_customer_pool()) explicitly."""
     events_by_id = {event.event_id: event for event in channel_events}
     label_by_event_id = {label.event_id: label for label in synthetic_labels}
     alerted_event_ids = {alert.event_id for alert in source_alerts}
+
+    history_pool = history_events if history_events is not None else channel_events
+    alert_history_pool = history_source_alerts if history_source_alerts is not None else source_alerts
+    event_customer_ids = {event.event_id: event.customer_id for event in history_pool}
 
     rows: list[dict[str, Any]] = []
     for event_id in alerted_event_ids:
@@ -119,15 +142,12 @@ def _build_supervised_population(
         if not _phase4_interim_training_eligible(label):
             continue
 
-        history = tuple(
-            other
-            for other in channel_events
-            if other.event_id != event.event_id and other.event_timestamp < event.event_timestamp
+        history = select_customer_historical_events(
+            history_pool, customer_id=event.customer_id, as_of_time=event.event_timestamp, exclude_event_id=event.event_id,
         )
-        prior_alerts = tuple(
-            alert
-            for alert in source_alerts
-            if alert.event_id != event.event_id and alert.source_alert_created_at < event.event_timestamp
+        prior_alerts = select_customer_historical_source_alerts(
+            alert_history_pool, event_customer_ids=event_customer_ids, customer_id=event.customer_id,
+            as_of_time=event.event_timestamp, exclude_event_id=event.event_id,
         )
 
         ctx = FeatureComputationContext(
@@ -152,11 +172,19 @@ def _build_supervised_population(
 
 
 def _dataset_version(population_rows: Sequence[dict[str, Any]]) -> str:
-    canonical = json.dumps(
-        sorted((row["event_id"], bool(row["label"])) for row in population_rows),
-        sort_keys=True,
-        separators=(",", ":"),
+    """Phase 7B corrective pass: now hashes each row's FULL computed
+    feature vector (every model-input feature), not just its
+    (event_id, label) identity pair -- two populations built from
+    identical target event IDs but DIFFERENT historical feature context
+    (e.g. cross-channel vs. channel-scoped-only history) must never
+    silently share the same hash. `event_id` (always unique per row) is
+    the sort key, so Python's tuple comparison never needs to fall
+    through to comparing the companion dict."""
+    normalized = sorted(
+        (row["event_id"], {k: v for k, v in row.items() if k not in ("event_id", "event_timestamp")})
+        for row in population_rows
     )
+    canonical = json.dumps(normalized, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 
@@ -303,6 +331,8 @@ def train_channel_configured(
     channel_events: Sequence[FraudEvent],
     source_alerts: Sequence[SourceAlertContext],
     synthetic_labels: Sequence[SyntheticGroundTruthLabel],
+    cross_channel_events: Optional[Sequence[FraudEvent]] = None,
+    cross_channel_source_alerts: Optional[Sequence[SourceAlertContext]] = None,
     bundle_store: Optional[ChannelModelBundleStore] = None,
     rule_set_version: Optional[str] = None,
     graph_policy_version: Optional[str] = None,
@@ -326,7 +356,17 @@ def train_channel_configured(
     both the `train` pipeline_runs record AND the candidate bundle row
     are written to, and both are guaranteed to be the SAME database
     (there is exactly one `database` value in this function, used for
-    both)."""
+    both).
+
+    Phase 7B corrective pass: `cross_channel_events`/
+    `cross_channel_source_alerts` are optional -- when supplied (the real
+    CLI training path always supplies them, via src.fraud_intel.
+    cli_data_access.load_cross_channel_customer_pool()), the supervised
+    population's per-row HISTORY (never which events become rows) is built
+    from this broader, cross-channel pool instead of `channel_events`/
+    `source_alerts` alone -- see _build_supervised_population()'s own
+    docstring. Omitted, training reproduces the exact pre-fix, channel-
+    scoped-only history (every existing test's behavior, unchanged)."""
     if not database:
         raise ValueError("database is required and must not be empty -- train_channel_configured() never assumes a default")
 
@@ -351,7 +391,8 @@ def train_channel_configured(
         store = bundle_store if bundle_store is not None else create_default_bundle_store(database)
 
         population_rows = _build_supervised_population(
-            adapter=adapter, channel_events=channel_events, source_alerts=source_alerts, synthetic_labels=synthetic_labels
+            adapter=adapter, channel_events=channel_events, source_alerts=source_alerts, synthetic_labels=synthetic_labels,
+            history_events=cross_channel_events, history_source_alerts=cross_channel_source_alerts,
         )
         if not population_rows:
             raise InsufficientTrainingDataError(

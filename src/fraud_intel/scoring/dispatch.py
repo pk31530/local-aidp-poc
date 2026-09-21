@@ -28,6 +28,7 @@ from src.fraud_intel.ensemble.policy import EnsemblePolicy, load_ensemble_policy
 from src.fraud_intel.events.base import FraudEvent
 from src.fraud_intel.events.source_alert_context import SourceAlertContext
 from src.fraud_intel.features.core import FeatureComputationContext
+from src.fraud_intel.features.history import select_customer_historical_events, select_customer_historical_source_alerts
 from src.fraud_intel.graph.entity_graph import GraphPolicy, ResolvedFraudEntityEvidence, load_graph_policy
 from src.fraud_intel.models.bundle import ChannelModelBundleRecord
 from src.fraud_intel.models.mlflow_naming import registered_model_name
@@ -372,15 +373,25 @@ class _PostgresScoringDataAccess:
                             created_at=row["created_at"],
                         )
 
+                        # Phase 7B corrective pass: SQL pre-filters to this
+                        # customer (ANY channel, matching guide section
+                        # 15's cross-channel design -- each row's OWN
+                        # channel picks its own payload class, never the
+                        # outer one) and to strictly-earlier rows -- a
+                        # cheap, correctness-preserving narrowing, never
+                        # the authority. select_customer_historical_events()/
+                        # select_customer_historical_source_alerts()
+                        # (src.fraud_intel.features.history -- the SAME
+                        # shared functions src.fraud_intel.models.training.
+                        # _build_supervised_population() and
+                        # src.fraud_intel.cli_data_access.
+                        # load_resolved_alert_scoring_contexts() both call)
+                        # own the actual filter/sort/limit/dedupe selection.
                         cur.execute(
-                            "SELECT * FROM channel_events WHERE customer_id = %s AND event_timestamp < %s "
-                            "ORDER BY event_timestamp DESC LIMIT %s",
-                            (event.customer_id, event.event_timestamp, _MAX_HISTORICAL_EVENTS_PER_ALERT),
+                            "SELECT * FROM channel_events WHERE customer_id = %s AND event_timestamp < %s",
+                            (event.customer_id, event.event_timestamp),
                         )
-                        # A customer's cross-channel history can include events from
-                        # channels other than `channel` itself -- each row's OWN
-                        # channel picks its own payload class, never the outer one.
-                        historical_events = tuple(
+                        candidate_events = [
                             FraudEvent(
                                 event_id=h["event_id"], channel=h["channel"], customer_id=h["customer_id"],
                                 account_id=h["account_id"], event_timestamp=h["event_timestamp"],
@@ -390,15 +401,18 @@ class _PostgresScoringDataAccess:
                                 channel_payload=get_channel_adapter(h["channel"]).payload_class(**h["channel_payload"]),
                             )
                             for h in cur.fetchall()
+                        ]
+                        historical_events = select_customer_historical_events(
+                            candidate_events, customer_id=event.customer_id, as_of_time=event.event_timestamp,
+                            exclude_event_id=event.event_id, limit=_MAX_HISTORICAL_EVENTS_PER_ALERT,
                         )
 
                         cur.execute(
                             "SELECT sa2.* FROM source_alerts sa2 JOIN channel_events ce2 ON ce2.event_id = sa2.event_id "
-                            "WHERE ce2.customer_id = %s AND sa2.source_alert_created_at < %s "
-                            "ORDER BY sa2.source_alert_created_at DESC LIMIT %s",
-                            (event.customer_id, event.event_timestamp, _MAX_SOURCE_ALERT_HISTORY_PER_ALERT),
+                            "WHERE ce2.customer_id = %s AND sa2.source_alert_created_at < %s",
+                            (event.customer_id, event.event_timestamp),
                         )
-                        source_alert_history = tuple(
+                        candidate_alerts = [
                             SourceAlertContext(
                                 source_alert_id=h["source_alert_id"], source_system=h["source_system"],
                                 event_id=h["event_id"], source_alert_created_at=h["source_alert_created_at"],
@@ -409,6 +423,12 @@ class _PostgresScoringDataAccess:
                                 created_at=h["created_at"],
                             )
                             for h in cur.fetchall()
+                        ]
+                        event_customer_ids = {e.event_id: e.customer_id for e in candidate_events}
+                        source_alert_history = select_customer_historical_source_alerts(
+                            candidate_alerts, event_customer_ids=event_customer_ids, customer_id=event.customer_id,
+                            as_of_time=event.event_timestamp, exclude_event_id=event.event_id,
+                            limit=_MAX_SOURCE_ALERT_HISTORY_PER_ALERT,
                         )
 
                         context = FeatureComputationContext(

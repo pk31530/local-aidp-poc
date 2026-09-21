@@ -158,7 +158,8 @@ def test_train_loads_population_and_dispatches_to_train_channel_configured(monke
         return [], [], []
 
     def _fake_train_channel_configured(
-        config, *, database, trigger_source, channel_events, source_alerts, synthetic_labels, bundle_store,
+        config, *, database, trigger_source, channel_events, source_alerts, synthetic_labels,
+        cross_channel_events, cross_channel_source_alerts, bundle_store,
         rule_set_version, graph_policy_version, ensemble_policy_version, reason_code_version,
     ):
         captured["config"] = config
@@ -249,7 +250,8 @@ def test_train_accepts_every_phase7a_registered_channel(monkeypatch, capsys, cha
         return [], [], []
 
     def _fake_train_channel_configured(
-        config, *, database, trigger_source, channel_events, source_alerts, synthetic_labels, bundle_store,
+        config, *, database, trigger_source, channel_events, source_alerts, synthetic_labels,
+        cross_channel_events, cross_channel_source_alerts, bundle_store,
         rule_set_version, graph_policy_version, ensemble_policy_version, reason_code_version,
     ):
         return {"bundle_id": 9, "status": "CANDIDATE", "channel": config.channel}

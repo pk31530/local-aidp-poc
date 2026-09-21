@@ -22,6 +22,7 @@ from src.fraud_intel.evaluation.shadow_candidate import CandidateScoringInput
 from src.fraud_intel.events.base import FraudEvent
 from src.fraud_intel.events.source_alert_context import SourceAlertContext, SyntheticGroundTruthLabel
 from src.fraud_intel.features.core import FeatureComputationContext
+from src.fraud_intel.features.history import select_customer_historical_events, select_customer_historical_source_alerts
 from src.fraud_intel.labels.eligibility import AlertLabelBasis, resolve_label_from_disposition
 from src.fraud_intel.generator.ach import generate_ach_events
 from src.fraud_intel.generator.atm import generate_atm_events
@@ -351,6 +352,67 @@ def load_channel_population(
     return events, source_alerts, labels
 
 
+def load_cross_channel_customer_pool(
+    customer_ids: set[str], database: str
+) -> tuple[list[FraudEvent], list[SourceAlertContext]]:
+    """Real Postgres read backing the Phase 7B corrective pass's shared
+    feature-history contract (src.fraud_intel.features.history). Every
+    channel_events/source_alerts row across ALL 7 channels for the given
+    `customer_ids` -- NOT scoped to one channel or one generation_run_id,
+    by design: this is the raw candidate pool
+    select_customer_historical_events()/select_customer_historical_source_alerts()
+    then filter down to the leakage-safe, deterministic, limit-truncated
+    slice for one target event at a time. Used to give
+    train_channel_configured()'s supervised-population construction the
+    same cross-channel history real scoring
+    (src.fraud_intel.scoring.dispatch._PostgresScoringDataAccess.
+    list_pending()) already sees -- discovered missing via a real ACH
+    band-boundary discrepancy (Phase 7B corrective pass). Reviewed as
+    SQL, not exercised by any unit test -- every caller supplies its own
+    cross-channel pool directly in tests, same precedent as every other
+    real Postgres reader in this module."""
+    if not customer_ids:
+        return [], []
+    conn = get_connection(database)
+    try:
+        with conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT * FROM channel_events WHERE customer_id = ANY(%s::text[])", (list(customer_ids),)
+                )
+                event_rows = cur.fetchall()
+                events = [
+                    FraudEvent(
+                        event_id=row["event_id"], channel=row["channel"], customer_id=row["customer_id"],
+                        account_id=row["account_id"], event_timestamp=row["event_timestamp"],
+                        amount_minor_units=row["amount_minor_units"], direction=row["direction"],
+                        device_id=row["device_id"], ip_address=row["ip_address"], scenario_id=row["scenario_id"],
+                        schema_version=row["schema_version"],
+                        channel_payload=get_channel_adapter(row["channel"]).payload_class(**row["channel_payload"]),
+                    )
+                    for row in event_rows
+                ]
+
+                cur.execute(
+                    "SELECT sa.* FROM source_alerts sa JOIN channel_events ce ON ce.event_id = sa.event_id "
+                    "WHERE ce.customer_id = ANY(%s::text[])",
+                    (list(customer_ids),),
+                )
+                source_alerts = [
+                    SourceAlertContext(
+                        source_alert_id=row["source_alert_id"], source_system=row["source_system"], event_id=row["event_id"],
+                        source_alert_created_at=row["source_alert_created_at"], source_rule_ids=row["source_rule_ids"],
+                        source_rule_version=row["source_rule_version"], source_alert_score=row["source_alert_score"],
+                        source_alert_reason_codes=row["source_alert_reason_codes"], generation_run_id=row["generation_run_id"],
+                        dataset_version=row["dataset_version"], created_at=row["created_at"],
+                    )
+                    for row in cur.fetchall()
+                ]
+    finally:
+        conn.close()
+    return events, source_alerts
+
+
 # ---- evaluation data access (Phase 7A corrective pass) --------------------------------
 
 
@@ -562,12 +624,22 @@ def load_resolved_alert_scoring_contexts(
                         created_at=row["created_at"],
                     )
 
+                    # Phase 7B corrective pass: SQL pre-filters to this
+                    # customer (ANY channel, matching guide section 15's
+                    # cross-channel design) and to strictly-earlier rows --
+                    # a cheap, correctness-preserving narrowing, never the
+                    # authority. select_customer_historical_events()/
+                    # select_customer_historical_source_alerts() (the SAME
+                    # shared functions src.fraud_intel.scoring.dispatch.
+                    # _PostgresScoringDataAccess.list_pending() and
+                    # src.fraud_intel.models.training.
+                    # _build_supervised_population() both call) own the
+                    # actual filter/sort/limit/dedupe selection.
                     cur.execute(
-                        "SELECT * FROM channel_events WHERE customer_id = %s AND event_timestamp < %s "
-                        "ORDER BY event_timestamp DESC LIMIT %s",
-                        (event.customer_id, event.event_timestamp, _MAX_HISTORICAL_EVENTS_PER_ALERT),
+                        "SELECT * FROM channel_events WHERE customer_id = %s AND event_timestamp < %s",
+                        (event.customer_id, event.event_timestamp),
                     )
-                    historical_events = tuple(
+                    candidate_events = [
                         FraudEvent(
                             event_id=h["event_id"], channel=h["channel"], customer_id=h["customer_id"],
                             account_id=h["account_id"], event_timestamp=h["event_timestamp"],
@@ -577,15 +649,18 @@ def load_resolved_alert_scoring_contexts(
                             channel_payload=get_channel_adapter(h["channel"]).payload_class(**h["channel_payload"]),
                         )
                         for h in cur.fetchall()
+                    ]
+                    historical_events = select_customer_historical_events(
+                        candidate_events, customer_id=event.customer_id, as_of_time=event.event_timestamp,
+                        exclude_event_id=event.event_id, limit=_MAX_HISTORICAL_EVENTS_PER_ALERT,
                     )
 
                     cur.execute(
                         "SELECT sa2.* FROM source_alerts sa2 JOIN channel_events ce2 ON ce2.event_id = sa2.event_id "
-                        "WHERE ce2.customer_id = %s AND sa2.source_alert_created_at < %s "
-                        "ORDER BY sa2.source_alert_created_at DESC LIMIT %s",
-                        (event.customer_id, event.event_timestamp, _MAX_SOURCE_ALERT_HISTORY_PER_ALERT),
+                        "WHERE ce2.customer_id = %s AND sa2.source_alert_created_at < %s",
+                        (event.customer_id, event.event_timestamp),
                     )
-                    source_alert_history = tuple(
+                    candidate_alerts = [
                         SourceAlertContext(
                             source_alert_id=h["source_alert_id"], source_system=h["source_system"],
                             event_id=h["event_id"], source_alert_created_at=h["source_alert_created_at"],
@@ -595,6 +670,12 @@ def load_resolved_alert_scoring_contexts(
                             created_at=h["created_at"],
                         )
                         for h in cur.fetchall()
+                    ]
+                    event_customer_ids = {e.event_id: e.customer_id for e in candidate_events}
+                    source_alert_history = select_customer_historical_source_alerts(
+                        candidate_alerts, event_customer_ids=event_customer_ids, customer_id=event.customer_id,
+                        as_of_time=event.event_timestamp, exclude_event_id=event.event_id,
+                        limit=_MAX_SOURCE_ALERT_HISTORY_PER_ALERT,
                     )
 
                     context = FeatureComputationContext(

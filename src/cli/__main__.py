@@ -193,6 +193,7 @@ def _handle_fraud_intel_train(args: argparse.Namespace) -> dict:
         GenerationRunDatasetVersionError,
         UnknownGenerationRunError,
         load_channel_population,
+        load_cross_channel_customer_pool,
     )
     from src.fraud_intel.config import ChannelTrainingRunConfig
     from src.fraud_intel.ensemble.policy import load_ensemble_policy
@@ -207,6 +208,15 @@ def _handle_fraud_intel_train(args: argparse.Namespace) -> dict:
         )
     except (UnknownGenerationRunError, GenerationRunChannelMismatchError, GenerationRunDatasetVersionError) as exc:
         raise CLIUserError(str(exc)) from exc
+
+    # Phase 7B corrective pass: give the supervised population's per-row
+    # HISTORY the same cross-channel visibility real scoring already has
+    # (src.fraud_intel.scoring.dispatch._PostgresScoringDataAccess.
+    # list_pending()) -- never widens which events become training rows,
+    # only what each row's own features are computed from. See
+    # src.fraud_intel.features.history's module docstring.
+    customer_ids = {event.customer_id for event in events}
+    cross_channel_events, cross_channel_source_alerts = load_cross_channel_customer_pool(customer_ids, database)
 
     try:
         config = ChannelTrainingRunConfig(channel=args.channel)
@@ -234,6 +244,8 @@ def _handle_fraud_intel_train(args: argparse.Namespace) -> dict:
         channel_events=events,
         source_alerts=source_alerts,
         synthetic_labels=labels,
+        cross_channel_events=cross_channel_events,
+        cross_channel_source_alerts=cross_channel_source_alerts,
         bundle_store=create_default_bundle_store(database),
         rule_set_version=rule_set_version,
         graph_policy_version=graph_policy_version,
