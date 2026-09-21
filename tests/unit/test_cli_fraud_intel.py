@@ -288,9 +288,9 @@ def test_train_policy_version_load_failure_is_a_cli_user_error(monkeypatch, caps
 def test_score_dispatches_to_score_channel(monkeypatch, capsys):
     captured = {}
 
-    def _fake_score_channel(*, channel, lifecycle, data_access, get_operational_bundle, artifact_loader, alert_queue_store):
+    def _fake_score_channel(*, channel, generation_run_id, lifecycle, data_access, get_operational_bundle, artifact_loader, alert_queue_store):
         captured.update(
-            channel=channel, lifecycle=lifecycle, data_access=data_access,
+            channel=channel, generation_run_id=generation_run_id, lifecycle=lifecycle, data_access=data_access,
             get_operational_bundle=get_operational_bundle, artifact_loader=artifact_loader,
             alert_queue_store=alert_queue_store,
         )
@@ -304,14 +304,63 @@ def test_score_dispatches_to_score_channel(monkeypatch, capsys):
     monkeypatch.setattr(cli_main, "create_default_alert_queue_store", lambda database: object())
     monkeypatch.setattr(cli_main, "_get_operational_bundle", lambda channel, database: _bundle())
 
-    cli_main.main(["fraud-intel", "score", "--channel", "online_banking", "--database", "aidp_test", "--json"])
+    cli_main.main(
+        ["fraud-intel", "score", "--channel", "online_banking", "--generation-run-id", "genrun-1",
+         "--database", "aidp_test", "--json"]
+    )
 
     assert captured["channel"] == "online_banking"
+    assert captured["generation_run_id"] == "genrun-1"
     assert captured["data_access"] is fake_data_access
     assert captured["artifact_loader"] is fake_artifact_loader
     assert captured["get_operational_bundle"]("online_banking") == _bundle()
     result = json.loads(capsys.readouterr().out)
     assert result == {"run_id": 1, "channel": "online_banking", "bundle_id": 2, "bundle_version": 1, "records_processed": 3, "records_rejected": 0, "alerts": []}
+
+
+def test_score_missing_generation_run_id_is_a_cli_user_error(monkeypatch, capsys):
+    """Scoring must never silently score every pending alert for a
+    channel across every generation ever run -- --generation-run-id is
+    required, exactly like train's own contract."""
+    monkeypatch.setattr(
+        "src.fraud_intel.scoring.dispatch.score_channel",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("must not be called")),
+    )
+    monkeypatch.setattr(cli_main, "_get_operational_bundle", lambda channel, database: _bundle())
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_main.main(["fraud-intel", "score", "--channel", "online_banking", "--database", "aidp_test", "--json"])
+    assert exc_info.value.code == 2
+    result = json.loads(capsys.readouterr().out)
+    assert result["error"] == "CLIUserError"
+    assert "--generation-run-id" in result["message"]
+
+
+def test_score_lifecycle_and_data_access_share_the_same_explicit_database(monkeypatch, capsys):
+    captured = {}
+
+    def _fake_score_channel(*, channel, generation_run_id, lifecycle, data_access, get_operational_bundle, artifact_loader, alert_queue_store):
+        captured["lifecycle_database"] = lifecycle._store._database if hasattr(lifecycle._store, "_database") else None
+        return {"run_id": 1, "channel": channel, "bundle_id": 2, "bundle_version": 1, "records_processed": 0, "records_rejected": 0, "alerts": []}
+
+    def _fake_create_default_scoring_data_access(database):
+        captured["data_access_database"] = database
+        return object()
+
+    monkeypatch.setattr("src.fraud_intel.scoring.dispatch.score_channel", _fake_score_channel)
+    monkeypatch.setattr("src.fraud_intel.scoring.dispatch.create_default_scoring_data_access", _fake_create_default_scoring_data_access)
+    monkeypatch.setattr("src.fraud_intel.scoring.dispatch.create_default_bundle_artifact_loader", lambda: object())
+    monkeypatch.setattr(cli_main, "create_default_alert_queue_store", lambda database: object())
+    monkeypatch.setattr(cli_main, "_get_operational_bundle", lambda channel, database: _bundle())
+
+    cli_main.main(
+        ["fraud-intel", "score", "--channel", "online_banking", "--generation-run-id", "genrun-1",
+         "--database", "aidp_test", "--json"]
+    )
+
+    assert captured["data_access_database"] == "aidp_test"
+    assert captured["lifecycle_database"] == "aidp_test"
+    assert captured["data_access_database"] == captured["lifecycle_database"]
 
 
 def test_score_accepts_a_non_reference_channel_now_that_all_seven_are_registered(monkeypatch, capsys):
@@ -327,7 +376,9 @@ def test_score_accepts_a_non_reference_channel_now_that_all_seven_are_registered
     monkeypatch.setattr(cli_main, "create_default_alert_queue_store", lambda database: object())
     monkeypatch.setattr(cli_main, "_get_operational_bundle", lambda channel, database: _bundle())
 
-    cli_main.main(["fraud-intel", "score", "--channel", "wire", "--database", "aidp_test", "--json"])
+    cli_main.main(
+        ["fraud-intel", "score", "--channel", "wire", "--generation-run-id", "genrun-1", "--database", "aidp_test", "--json"]
+    )
 
     result = json.loads(capsys.readouterr().out)
     assert result["channel"] == "wire"
@@ -347,6 +398,9 @@ def test_score_unregistered_channel_name_is_rejected_at_the_argparse_level(capsy
 @pytest.mark.parametrize("exc_cls_path", [
     "src.fraud_intel.scoring.dispatch.NoOperationalBundleError",
     "src.fraud_intel.scoring.dispatch.BundlePolicyMismatchError",
+    "src.fraud_intel.cli_data_access.UnknownGenerationRunError",
+    "src.fraud_intel.cli_data_access.GenerationRunChannelMismatchError",
+    "src.fraud_intel.cli_data_access.GenerationRunDatasetVersionError",
 ])
 def test_score_maps_domain_errors_to_cli_user_error(monkeypatch, capsys, exc_cls_path):
     import importlib
@@ -364,7 +418,10 @@ def test_score_maps_domain_errors_to_cli_user_error(monkeypatch, capsys, exc_cls
     monkeypatch.setattr(cli_main, "_get_operational_bundle", lambda channel, database: _bundle())
 
     with pytest.raises(SystemExit) as exc_info:
-        cli_main.main(["fraud-intel", "score", "--channel", "online_banking", "--database", "aidp_test", "--json"])
+        cli_main.main(
+            ["fraud-intel", "score", "--channel", "online_banking", "--generation-run-id", "genrun-1",
+             "--database", "aidp_test", "--json"]
+        )
     assert exc_info.value.code == 2
     assert json.loads(capsys.readouterr().out)["error"] == "CLIUserError"
 
@@ -382,7 +439,10 @@ def test_score_clean_json_stdout_and_logs_go_to_stderr(monkeypatch, capsys):
     monkeypatch.setattr(cli_main, "create_default_alert_queue_store", lambda database: object())
     monkeypatch.setattr(cli_main, "_get_operational_bundle", lambda channel, database: _bundle())
 
-    cli_main.main(["fraud-intel", "score", "--channel", "online_banking", "--database", "aidp_test", "--json"])
+    cli_main.main(
+        ["fraud-intel", "score", "--channel", "online_banking", "--generation-run-id", "genrun-1",
+         "--database", "aidp_test", "--json"]
+    )
 
     captured = capsys.readouterr()
     stdout_lines = [line for line in captured.out.splitlines() if line]

@@ -133,10 +133,14 @@ def _pending_item() -> PendingScoringItem:
 
 
 class _FakeDataAccess:
-    def __init__(self, items):
+    def __init__(self, items, *, dataset_version="dsv-1"):
         self._items = items
+        self._dataset_version = dataset_version
 
-    def list_pending(self, channel):
+    def validate_generation_run(self, channel, generation_run_id):
+        return self._dataset_version
+
+    def list_pending(self, channel, *, generation_run_id, operational_bundle_id):
         return self._items
 
 
@@ -200,6 +204,7 @@ def test_score_channel_end_to_end_with_one_pending_alert(monkeypatch):
 
     result = score_channel(
         channel="online_banking",
+        generation_run_id="genrun-1",
         lifecycle=lifecycle,
         data_access=_FakeDataAccess([item]),
         get_operational_bundle=lambda channel: _bundle_record(),
@@ -220,12 +225,46 @@ def test_score_channel_end_to_end_with_one_pending_alert(monkeypatch):
     assert run.records_rejected == 0
 
 
+def test_score_channel_records_generation_and_dataset_provenance(monkeypatch):
+    """Phase 7B Stage 6 corrective pass: generation_run_id/source_dataset_version
+    (from data_access.validate_generation_run()) and the operational
+    bundle's own pinned versions are recorded both in the returned dict
+    AND in the pipeline_runs artifacts -- not just one or the other."""
+    monkeypatch.setattr("src.fraud_intel.scoring.dispatch.load_and_validate_pinned_policies", _fake_policies)
+    lifecycle, run_store = _lifecycle()
+
+    result = score_channel(
+        channel="online_banking", generation_run_id="genrun-42", lifecycle=lifecycle,
+        data_access=_FakeDataAccess([], dataset_version="dsv-42"),
+        get_operational_bundle=lambda channel: _bundle_record(), artifact_loader=_FakeArtifactLoader(),
+        alert_queue_store=_FakeAlertQueueStore(),
+    )
+
+    assert result["generation_run_id"] == "genrun-42"
+    assert result["source_dataset_version"] == "dsv-42"
+    assert result["bundle_id"] == 2
+    assert result["bundle_version"] == 1
+
+    run = run_store.get(result["run_id"])
+    assert run.artifacts["channel"] == "online_banking"
+    assert run.artifacts["generation_run_id"] == "genrun-42"
+    assert run.artifacts["source_dataset_version"] == "dsv-42"
+    assert run.artifacts["bundle_id"] == 2
+    assert run.artifacts["bundle_version"] == 1
+    assert run.artifacts["rule_set_version"] == "v1"
+    assert run.artifacts["graph_policy_version"] == "v1"
+    assert run.artifacts["ensemble_policy_version"] == "v1"
+    assert run.artifacts["reason_code_version"] == "v1"
+    assert run.artifacts["pending_count"] == 0
+    assert run.dataset_version == "dsv-42"
+
+
 def test_score_channel_with_no_pending_alerts_still_succeeds(monkeypatch):
     monkeypatch.setattr("src.fraud_intel.scoring.dispatch.load_and_validate_pinned_policies", _fake_policies)
     lifecycle, run_store = _lifecycle()
 
     result = score_channel(
-        channel="online_banking", lifecycle=lifecycle, data_access=_FakeDataAccess([]),
+        channel="online_banking", generation_run_id="genrun-1", lifecycle=lifecycle, data_access=_FakeDataAccess([]),
         get_operational_bundle=lambda channel: _bundle_record(), artifact_loader=_FakeArtifactLoader(),
         alert_queue_store=_FakeAlertQueueStore(),
     )
@@ -269,7 +308,7 @@ def test_missing_operational_bundle_fails_the_run_and_reraises():
 
     with pytest.raises(NoOperationalBundleError):
         score_channel(
-            channel="online_banking", lifecycle=lifecycle, data_access=_FakeDataAccess([]),
+            channel="online_banking", generation_run_id="genrun-1", lifecycle=lifecycle, data_access=_FakeDataAccess([]),
             get_operational_bundle=lambda channel: None, artifact_loader=_FakeArtifactLoader(),
             alert_queue_store=_FakeAlertQueueStore(),
         )
@@ -289,7 +328,7 @@ def test_bundle_policy_mismatch_fails_the_run_and_reraises():
 
     with pytest.raises(BundlePolicyMismatchError):
         score_channel(
-            channel="online_banking", lifecycle=lifecycle, data_access=_FakeDataAccess([]),
+            channel="online_banking", generation_run_id="genrun-1", lifecycle=lifecycle, data_access=_FakeDataAccess([]),
             get_operational_bundle=lambda channel: stale_bundle, artifact_loader=_FakeArtifactLoader(),
             alert_queue_store=_FakeAlertQueueStore(),
         )
@@ -305,7 +344,7 @@ def test_artifact_loading_failure_fails_the_run_and_reraises(monkeypatch):
 
     with pytest.raises(RuntimeError, match="simulated MLflow contact failure"):
         score_channel(
-            channel="online_banking", lifecycle=lifecycle, data_access=_FakeDataAccess([]),
+            channel="online_banking", generation_run_id="genrun-1", lifecycle=lifecycle, data_access=_FakeDataAccess([]),
             get_operational_bundle=lambda channel: _bundle_record(), artifact_loader=_FailingArtifactLoader(),
             alert_queue_store=_FakeAlertQueueStore(),
         )
@@ -335,7 +374,7 @@ def test_one_alert_scoring_failure_is_counted_rejected_not_fatal(monkeypatch):
     )
 
     result = score_channel(
-        channel="online_banking", lifecycle=lifecycle, data_access=_FakeDataAccess([bad_item, good_item]),
+        channel="online_banking", generation_run_id="genrun-1", lifecycle=lifecycle, data_access=_FakeDataAccess([bad_item, good_item]),
         get_operational_bundle=lambda channel: _bundle_record(), artifact_loader=_FakeArtifactLoader(),
         alert_queue_store=_FakeAlertQueueStore(),
     )

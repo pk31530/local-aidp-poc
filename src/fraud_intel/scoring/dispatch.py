@@ -82,7 +82,11 @@ class PendingScoringItem:
 
 
 class ScoringDataAccess(Protocol):
-    def list_pending(self, channel: str) -> Sequence[PendingScoringItem]: ...
+    def validate_generation_run(self, channel: str, generation_run_id: str) -> str: ...
+
+    def list_pending(
+        self, channel: str, *, generation_run_id: str, operational_bundle_id: int
+    ) -> Sequence[PendingScoringItem]: ...
 
 
 class BundleArtifactLoader(Protocol):
@@ -225,20 +229,94 @@ def create_default_bundle_artifact_loader() -> BundleArtifactLoader:
 
 
 class _PostgresScoringDataAccess:
-    """Selects source alerts for `channel` that have no fraud_alerts row
-    yet (idempotent-creation-aware: an alert already scored, even once, is
-    never re-selected here -- a deliberate rescore is a separate,
-    not-yet-built operator action, out of this corrective pass's scope),
-    and assembles each one's FeatureComputationContext and resolved-fraud
-    graph evidence from real history. Bounded batch size and lookback
-    windows (module-level `_MAX_*` constants) keep a single dispatch run's
-    query cost predictable; full incremental/paginated batching is later
-    phase scope. Not exercised by any unit test -- reviewed as SQL."""
+    """Selects source alerts for `channel`, scoped to one explicit
+    `generation_run_id`, that have no alert_evidence row yet for the
+    CURRENT operational bundle (idempotent-creation-aware: a deliberate
+    rescore against a NEW bundle is a separate, not-yet-built operator
+    action, out of this corrective pass's scope), and assembles each
+    one's FeatureComputationContext and resolved-fraud graph evidence from
+    real history. Bounded batch size and lookback windows (module-level
+    `_MAX_*` constants) keep a single dispatch run's query cost
+    predictable; full incremental/paginated batching is later phase
+    scope. Not exercised by any unit test -- reviewed as SQL.
+
+    Phase 7B Stage 6 corrective pass: `list_pending()` used to be scoped
+    only by `channel` -- silently able to mix multiple generation runs
+    together (discovered during Stage 6 preflight, before it ever ran for
+    real). `generation_run_id` is now a required parameter, validated
+    (via `validate_generation_run()`) exactly the same way
+    src.fraud_intel.cli_data_access.load_channel_population() already
+    validates it for training -- same three exception types, reused, not
+    redefined. Pending selection was ALSO redefined relative to the
+    CURRENT operational bundle (`operational_bundle_id`), not merely "no
+    fraud_alerts row at all": an alert with a fraud_alerts row but no
+    alert_evidence row for the current bundle (e.g. evidence only exists
+    for an older, now-retired bundle) is still pending -- see
+    `list_pending()`'s own docstring for the exact semantics."""
 
     def __init__(self, database: Optional[str] = None):
         self._database = database
 
-    def list_pending(self, channel: str) -> Sequence[PendingScoringItem]:
+    def validate_generation_run(self, channel: str, generation_run_id: str) -> str:
+        """Returns the single dataset_version this generation_run_id maps
+        to for `channel`. Raises the SAME exception types
+        src.fraud_intel.cli_data_access.load_channel_population() raises
+        for an unknown run_id, a channel mismatch, or more than one
+        dataset_version -- reused, not redefined, so the CLI's exception
+        mapping is identical for `train` and `score`."""
+        import psycopg2.extras
+
+        from src.common.db import get_connection
+        from src.fraud_intel.cli_data_access import (
+            GenerationRunChannelMismatchError,
+            GenerationRunDatasetVersionError,
+            UnknownGenerationRunError,
+        )
+
+        conn = get_connection(self._database)
+        try:
+            with conn:
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    cur.execute(
+                        "SELECT DISTINCT channel FROM channel_events WHERE generation_run_id = %s", (generation_run_id,)
+                    )
+                    existing_channels = {row["channel"] for row in cur.fetchall()}
+                    if not existing_channels:
+                        raise UnknownGenerationRunError(
+                            f"no channel_events rows found for generation_run_id {generation_run_id!r} -- it was "
+                            "never generated, or generation itself failed and rolled back"
+                        )
+                    if existing_channels != {channel}:
+                        raise GenerationRunChannelMismatchError(
+                            f"generation_run_id {generation_run_id!r} belongs to channel(s) "
+                            f"{sorted(existing_channels)!r}, not {channel!r}"
+                        )
+
+                    cur.execute(
+                        "SELECT DISTINCT dataset_version FROM channel_events "
+                        "WHERE channel = %s AND generation_run_id = %s",
+                        (channel, generation_run_id),
+                    )
+                    dataset_versions = [row["dataset_version"] for row in cur.fetchall()]
+                    if len(dataset_versions) != 1:
+                        raise GenerationRunDatasetVersionError(
+                            f"generation_run_id {generation_run_id!r} has {len(dataset_versions)} distinct "
+                            f"dataset_version value(s) for channel {channel!r} -- expected exactly 1"
+                        )
+                    return dataset_versions[0]
+        finally:
+            conn.close()
+
+    def list_pending(
+        self, channel: str, *, generation_run_id: str, operational_bundle_id: int
+    ) -> Sequence[PendingScoringItem]:
+        """Pending = every source alert in `generation_run_id` for which
+        NO alert_evidence row exists tagged with `operational_bundle_id`
+        -- regardless of whether a fraud_alerts row exists at all,
+        regardless of whether OTHER (older-bundle) evidence exists, and
+        regardless of `degraded`: a degraded/catastrophic evidence row
+        for the CURRENT bundle still counts as a completed, auditable
+        scoring attempt and excludes the alert from re-selection."""
         import psycopg2.extras
 
         from src.common.db import get_connection
@@ -259,14 +337,17 @@ class _PostgresScoringDataAccess:
                         FROM source_alerts sa
                         JOIN channel_events ce ON ce.event_id = sa.event_id
                         WHERE ce.channel = %s
+                          AND ce.generation_run_id = %s
                           AND NOT EXISTS (
                               SELECT 1 FROM fraud_alerts fa
+                              JOIN alert_evidence ae ON ae.alert_id = fa.alert_id
                               WHERE fa.source_system = sa.source_system AND fa.source_alert_id = sa.source_alert_id
+                                AND ae.channel_model_bundle_id = %s
                           )
                         ORDER BY sa.source_alert_created_at ASC
                         LIMIT %s
                         """,
-                        (channel, _MAX_PENDING_ALERTS_PER_RUN),
+                        (channel, generation_run_id, operational_bundle_id, _MAX_PENDING_ALERTS_PER_RUN),
                     )
                     pending_rows = cur.fetchall()
                     payload_class = get_channel_adapter(channel).payload_class
@@ -379,6 +460,7 @@ def create_default_scoring_data_access(database: Optional[str] = None) -> Scorin
 def score_channel(
     *,
     channel: str,
+    generation_run_id: str,
     lifecycle: RunLifecycle,
     data_access: ScoringDataAccess,
     get_operational_bundle: GetOperationalBundle,
@@ -387,30 +469,37 @@ def score_channel(
 ) -> dict:
     """One `fraud_score` pipeline run: finds the OPERATIONAL bundle for
     `channel`, loads and validates its pinned artifacts/policies, scores
-    every currently-pending source alert through the existing
-    score_and_record_alert() (idempotent alert/evidence persistence,
-    catastrophic-failure handling all already built -- Phase 6), and
-    records the run's outcome.
+    every currently-pending source alert -- scoped to the one explicit
+    `generation_run_id` (Phase 7B Stage 6 corrective pass: never silently
+    channel-wide) and relative to the CURRENT operational bundle -- through
+    the existing score_and_record_alert() (idempotent alert/evidence
+    persistence, catastrophic-failure handling all already built --
+    Phase 6), and records the run's outcome.
 
     A single alert's scoring failure is recorded (score_and_record_alert()
     already best-effort-persists a catastrophic evidence row for it) and
     counted as rejected, but does not abort the run -- one bad alert must
     not block scoring the rest of a batch. A STRUCTURAL failure (no
-    OPERATIONAL bundle, a stale/mismatched policy, or an artifact-loading
-    failure) aborts the whole run: fail_from_exception() records it and
-    the original exception is always re-raised, never swallowed."""
+    OPERATIONAL bundle, an unknown/mismatched generation_run_id, a
+    stale/mismatched policy, or an artifact-loading failure) aborts the
+    whole run: fail_from_exception() records it and the original
+    exception is always re-raised, never swallowed."""
     run = lifecycle.begin("fraud_score", trigger_source="cli")
     try:
         bundle_record = get_operational_bundle(channel)
         if bundle_record is None:
             raise NoOperationalBundleError(f"no OPERATIONAL bundle for channel {channel!r}")
 
+        source_dataset_version = data_access.validate_generation_run(channel, generation_run_id)
+
         rule_provider, graph_policy, ensemble_policy = load_and_validate_pinned_policies(bundle_record)
         loaded_bundle = artifact_loader.load(bundle_record)
         config_hash = _bundle_config_hash(bundle_record)
         git_sha = get_git_sha()
 
-        pending_items = data_access.list_pending(channel)
+        pending_items = data_access.list_pending(
+            channel, generation_run_id=generation_run_id, operational_bundle_id=bundle_record.bundle_id
+        )
         processed = 0
         rejected = 0
         alert_summaries: list[dict] = []
@@ -449,18 +538,25 @@ def score_channel(
         records_processed=processed,
         records_rejected=rejected,
         model_version=loaded_bundle.gbm_model_version,
+        dataset_version=source_dataset_version,
         artifacts={
+            "channel": channel,
+            "generation_run_id": generation_run_id,
+            "source_dataset_version": source_dataset_version,
             "bundle_id": bundle_record.bundle_id,
             "bundle_version": bundle_record.bundle_version,
             "rule_set_version": bundle_record.rule_set_version,
             "graph_policy_version": bundle_record.graph_policy_version,
             "ensemble_policy_version": bundle_record.ensemble_policy_version,
             "reason_code_version": bundle_record.reason_code_version,
+            "pending_count": len(pending_items),
         },
     )
     return {
         "run_id": run.run_id,
         "channel": channel,
+        "generation_run_id": generation_run_id,
+        "source_dataset_version": source_dataset_version,
         "bundle_id": bundle_record.bundle_id,
         "bundle_version": bundle_record.bundle_version,
         "records_processed": processed,

@@ -243,17 +243,31 @@ def _handle_fraud_intel_train(args: argparse.Namespace) -> dict:
 
 
 def _handle_fraud_intel_score(args: argparse.Namespace) -> dict:
-    """Real dispatch (Phase 6 corrective pass): finds the OPERATIONAL
-    online_banking bundle, loads/validates its pinned artifacts and
-    policies, scores every pending source alert through the existing,
-    already-tested alert queue, and records a real `fraud_score`
-    RunLifecycle run. See src.fraud_intel.scoring.dispatch.score_channel
-    for the full orchestration -- this handler only wires up its
-    collaborators. A channel other than online_banking is rejected by
-    `_require_implemented_channel` below with a CLIUserError, not a
+    """Real dispatch (Phase 6 corrective pass; Phase 7B Stage 6 corrective
+    pass adds required --generation-run-id scoping): finds the
+    OPERATIONAL bundle, loads/validates its pinned artifacts and
+    policies, scores every pending source alert -- scoped to the one
+    explicit generation and relative to the current operational bundle,
+    never silently channel-wide -- through the existing, already-tested
+    alert queue, and records a real `fraud_score` RunLifecycle run. See
+    src.fraud_intel.scoring.dispatch.score_channel for the full
+    orchestration -- this handler only wires up its collaborators. A
+    channel other than one of the seven registered channels is rejected
+    by `_require_implemented_channel` below with a CLIUserError, not a
     NotImplementedError -- it is a supported-later, not a broken, state."""
     database = _require_database(args)
     _require_implemented_channel(args.channel)
+    if not args.generation_run_id:
+        raise CLIUserError(
+            "--generation-run-id is required for scoring -- scoring must never silently score every pending "
+            "alert for a channel across every generation ever run"
+        )
+
+    from src.fraud_intel.cli_data_access import (
+        GenerationRunChannelMismatchError,
+        GenerationRunDatasetVersionError,
+        UnknownGenerationRunError,
+    )
     from src.fraud_intel.scoring.dispatch import (
         BundlePolicyMismatchError,
         NoOperationalBundleError,
@@ -265,13 +279,20 @@ def _handle_fraud_intel_score(args: argparse.Namespace) -> dict:
     try:
         return score_channel(
             channel=args.channel,
+            generation_run_id=args.generation_run_id,
             lifecycle=RunLifecycle(database),
             data_access=create_default_scoring_data_access(database),
             get_operational_bundle=lambda channel: _get_operational_bundle(channel, database),
             artifact_loader=create_default_bundle_artifact_loader(),
             alert_queue_store=create_default_alert_queue_store(database),
         )
-    except (NoOperationalBundleError, BundlePolicyMismatchError) as exc:
+    except (
+        NoOperationalBundleError,
+        BundlePolicyMismatchError,
+        UnknownGenerationRunError,
+        GenerationRunChannelMismatchError,
+        GenerationRunDatasetVersionError,
+    ) as exc:
         raise CLIUserError(str(exc)) from exc
 
 
@@ -742,6 +763,11 @@ def build_parser() -> argparse.ArgumentParser:
     # and produces a clean, JSON-formatted CLIUserError -- not argparse's own
     # unformatted usage error.
     fi_score_p.add_argument("--channel", required=True, choices=sorted(FRAUD_INTEL_ALL_CHANNELS))
+    # Not argparse `required=True` -- validated inside the handler (after
+    # --database), matching train's own --generation-run-id contract: a
+    # missing value is a clean CLIUserError/JSON error, not argparse's own
+    # unformatted usage exit.
+    fi_score_p.add_argument("--generation-run-id", dest="generation_run_id", default=None)
     fi_score_p.set_defaults(handler=_handle_fraud_intel_score)
 
     fi_evaluate_p = fraud_intel_sub.add_parser(
