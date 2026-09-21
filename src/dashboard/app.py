@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import pandas as pd
 import streamlit as st
 
+from src.dashboard import fraud_intel_tab
 from src.dashboard.data import (
     get_active_model,
     get_confusion_matrix,
@@ -28,8 +29,8 @@ from src.dashboard.data import (
 st.set_page_config(page_title="AiDP Fraud Detection", layout="wide")
 st.title("Local AiDP POC — Fraud Detection Dashboard")
 
-tab_exec, tab_live, tab_fraud, tab_model, tab_health = st.tabs(
-    ["Executive Overview", "Live Transaction Feed", "Fraud Analysis", "Model Performance", "Platform Health"]
+tab_exec, tab_live, tab_fraud, tab_model, tab_health, tab_fraud_intel = st.tabs(
+    ["Executive Overview", "Live Transaction Feed", "Fraud Analysis", "Model Performance", "Platform Health", "Fraud Intelligence"]
 )
 
 # ---------------------------------------------------------------------
@@ -156,3 +157,9 @@ with tab_health:
     cols = st.columns(len(health))
     for col, (service, healthy) in zip(cols, health.items()):
         col.metric(service, "🟢 OK" if healthy else "🔴 FAIL")
+
+# ---------------------------------------------------------------------
+# Fraud Intelligence (v1.3, seven-channel) — read-only, aidp_test only
+# ---------------------------------------------------------------------
+with tab_fraud_intel:
+    fraud_intel_tab.render()

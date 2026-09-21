@@ -231,6 +231,184 @@ cd local-aidp-poc
 All demo data (Postgres, MinIO, the MLflow model registry) persists across
 `stop.sh`/`start.sh` — see BUILD_LOG.md Phase 2 for the verified proof.
 
+## v1.3 fraud intelligence
+
+**POC-only.** All seven channels below use synthetic, locally-generated
+data. Nothing in this section constitutes Citizens Bank production or
+regulatory evidence, and none of these commands ever touches `aidp` — every
+one below requires an explicit `--database` (no default), and this
+project's own convention is to always pass `--database aidp_test`.
+
+### Prerequisites: migrations 003/004
+
+Fresh installs get the current `fraud_alerts`/`alert_evidence`/
+`label_assessments`/`channel_model_bundles`/`channel_events`/
+`synthetic_event_labels`/`source_alerts`/`analyst_dispositions` schema
+automatically. An **existing** database predating v1.3 needs migrations
+`003_channel_events_and_labels.sql` and
+`004_fraud_alerts_evidence_and_lifecycle.sql` applied manually — same
+`aidp_test`-first procedure as migration `002` above:
+
+```bash
+docker exec -i aidp-postgres psql -U aidp -d aidp_test -c "SELECT count(*) FROM channel_events;"
+docker exec -i aidp-postgres psql -v ON_ERROR_STOP=1 -U aidp -d aidp_test -f - \
+  < infrastructure/postgres/migrations/003_channel_events_and_labels.sql
+docker exec -i aidp-postgres psql -v ON_ERROR_STOP=1 -U aidp -d aidp_test -f - \
+  < infrastructure/postgres/migrations/004_fraud_alerts_evidence_and_lifecycle.sql
+docker exec -i aidp-postgres psql -U aidp -d aidp_test -c "SELECT count(*) FROM channel_events;"
+```
+
+Only after `aidp_test` is verified, and only with separate explicit
+intent, repeat against `-d aidp`.
+
+### Channels
+
+`ach`, `atm`, `debit_card`, `mobile_deposit`, `online_banking`, `p2p`,
+`wire` — every `--channel` flag below accepts exactly these seven values.
+
+### Generation — `aidp fraud-intel generate`
+
+```bash
+python -m src.cli.__main__ fraud-intel generate \
+  --channel <channel> --count 5000 --seed 42 \
+  --reference-date 2026-09-21 --database aidp_test --json
+```
+
+`--reference-date` is `YYYY-MM-DD`; omit it and it defaults to today (not
+reproducible across days — always pass it explicitly for a repeatable
+demo). `generation_run_id`/`dataset_version` are deterministic SHA-256
+fingerprints of `(channel, count, seed, reference_date,
+GENERATION_SPEC_VERSION)` — re-running the **identical** command is a safe
+no-op retry (`inserted_event_count=0, existing_event_count=<count>`,
+identical IDs), never a duplicate or a new identity. Running the same
+`(channel, seed, count)` with a **different** `reference_date` raises
+`GenerationIdentityConflictError` rather than silently colliding.
+
+### Training — `aidp fraud-intel train`
+
+```bash
+python -m src.cli.__main__ fraud-intel train \
+  --channel <channel> --generation-run-id <genrun-...> --database aidp_test --json
+```
+
+Always requires `--generation-run-id` — training never silently uses
+"whichever generation happens to be in the table." Registers 3 new MLflow
+component versions (GBM, LR-shadow, anomaly) and one new `CANDIDATE`
+`channel_model_bundles` row (never `OPERATIONAL` — promotion is always a
+separate, later, manual step).
+
+### Cold-start / live evaluation — `aidp fraud-intel evaluate`
+
+```bash
+python -m src.cli.__main__ fraud-intel evaluate \
+  --channel <channel> --generation-run-id <genrun-...> \
+  --capacity-mode count --capacity-value 50 --recall-target 0.8 \
+  [--candidate-bundle-version N] \
+  --database aidp_test --json
+```
+
+`--capacity-mode`/`--capacity-value`/`--recall-target` are always required
+regardless of mode. Routing is automatic and unambiguous, chosen by
+whether the channel currently has an `OPERATIONAL` bundle — **not** by
+`--candidate-bundle-version`: no `OPERATIONAL` bundle yet →
+`candidate_training_holdout` (evaluates the candidate's own training-time
+held-out report; `--candidate-bundle-version` is then required); an
+`OPERATIONAL` bundle exists → `live_resolved_alerts` (evaluates real,
+scored, resolved alerts; `--candidate-bundle-version`, if given, adds an
+optional in-memory shadow-candidate comparison — this never scores or
+writes anything for the candidate).
+
+### Promotion — `aidp fraud-intel promote`
+
+```bash
+python -m src.cli.__main__ fraud-intel promote \
+  --channel <channel> --bundle-version <N> --promoted-by <operator-id> \
+  --database aidp_test --json
+```
+
+Always manual, always requires `--promoted-by`. Verifies all nine
+required components/policies against the currently-loaded config, locks
+the channel's full bundle history in one transaction, retires the
+previous `OPERATIONAL` bundle (if any), and promotes the candidate
+atomically. A channel's first-ever promotion additionally, and always
+freshly, recomputes the cold-start promotion gate from the candidate's
+own immutable training report before promoting — never a cached result.
+
+### Scoring — `aidp fraud-intel score`
+
+```bash
+python -m src.cli.__main__ fraud-intel score \
+  --channel <channel> --generation-run-id <genrun-...> --database aidp_test --json
+```
+
+Scores every currently-pending source alert (no `alert_evidence` row yet
+for the channel's current `OPERATIONAL` bundle) for that one
+`generation_run_id`. Re-running the identical command is a safe,
+idempotent retry: `pending_count=0, records_processed=0, alerts=[]` — no
+duplicate `fraud_alerts`/`alert_evidence` row is ever created
+(`ON CONFLICT` on `(source_system, source_alert_id)` and
+`(alert_id, score_execution_id)` respectively).
+
+### Label assessment — `aidp fraud-intel labels assess`
+
+```bash
+python -m src.cli.__main__ fraud-intel labels assess \
+  --channel <channel> --generation-run-id <genrun-...> --database aidp_test --json
+```
+
+Resolves each generation-scoped alert's synthetic ground truth into a
+`label_assessments` row (`RESOLVED_FRAUD`/`RESOLVED_LEGITIMATE`,
+`label_source=SYNTHETIC_GENERATOR`, `source_disposition_id=NULL` for the
+synthetic case). Idempotent retry: `assessments_inserted=0,
+assessments_unchanged=<total>`.
+
+### Read-only model registry — `aidp fraud-intel model show`
+
+```bash
+python -m src.cli.__main__ fraud-intel model show --channel <channel> --database aidp_test --json
+```
+
+### Analyst alert queue — `aidp alerts list` / `aidp alerts show` / `aidp alerts disposition`
+
+```bash
+python -m src.cli.__main__ alerts list \
+  [--channel <channel>] [--status OPEN|IN_REVIEW|CLOSED] \
+  [--priority-band LOW|MEDIUM|HIGH] --database aidp_test --json
+
+python -m src.cli.__main__ alerts show <alert_id> --database aidp_test --json
+
+python -m src.cli.__main__ alerts disposition <alert_id> \
+  --analyst-id <id> --disposition CONFIRMED_FRAUD|CONFIRMED_LEGITIMATE|NEEDS_MORE_INFO|ESCALATED \
+  [--notes "..."] --database aidp_test --json
+```
+
+**Current-state semantics**: `--priority-band` filters on the alert's
+**current** (latest-evidence) band, never the frozen first-scoring
+snapshot — `alerts list`'s output distinguishes `initial_priority_band`/
+`initial_operational_priority_score` (historical, frozen) from
+`current_priority_band`/`current_operational_priority_score`/
+`current_evidence_id`/`current_channel_model_bundle_id`/
+`current_scored_at` (live, sourced from the latest `alert_evidence` row).
+`alerts show` returns the same alert plus its full `latest_evidence` row.
+Disposition capture (`alerts disposition`) is the **only** write path for
+analyst review state anywhere in this subsystem — the dashboard (below)
+never writes one.
+
+### Dashboard — Fraud Intelligence tab
+
+```bash
+./scripts/run_dashboard.sh    # same command as v1.1/v1.2 — one dashboard process, six tabs total
+```
+
+Open http://127.0.0.1:8501 and select the **Fraud Intelligence** tab.
+Entirely read-only: a ranked, filterable current-state alert queue (rank
+by current operational priority score, channel filter, priority-band
+filter, LOW alerts visible by default) and a per-alert detail view (current
+score/band, reason codes, component contributions/statuses, `score_execution_id`,
+pinned bundle/policy provenance, and disposition history — analyst
+disposition capture remains CLI-only, via `aidp alerts disposition` above).
+Reads `aidp_test` only; never `aidp`.
+
 ## Make targets
 
 ```

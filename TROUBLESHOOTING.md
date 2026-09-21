@@ -233,3 +233,248 @@ whose process no longer exists.
 **Fix**: there isn't an automated one yet. Treat a long-`RUNNING` row with
 no corresponding live process as evidence of an abrupt termination, not a
 live run.
+
+## v1.3 fraud intelligence
+
+Real failure modes actually hit while building the seven-channel fraud
+intelligence subsystem — not a hypothetical checklist. All examples are
+against synthetic `aidp_test` data only.
+
+### MLflow not configured before client creation
+
+**Symptom**: an opaque `MlflowException`, or MLflow silently talking to
+its own default tracking URI instead of this project's, the first time a
+new code path calls MLflow directly (first hit: real promotion
+verification).
+
+**Cause**: `mlflow.tracking.MlflowClient()` targets MLflow's process-wide
+default tracking URI unless `configure_mlflow()`
+(`src/common/mlflow_setup.py`) has been called first, in **that same
+process** — importing a module that calls it elsewhere is not enough.
+
+**Fix**: every function that talks to MLflow directly calls
+`configure_mlflow()` itself, every time, rather than assuming some other
+earlier call in the same process already did it (see
+`_MlflowModelVersionVerifier.verify()` for the pattern).
+
+### `FeatureNotSupported: FOR UPDATE is not allowed with aggregate functions`
+
+**Symptom**: `channel_model_bundles.register_candidate()`'s next-version
+computation fails the very first time it runs against a real database
+(never caught by unit tests, which use the in-memory fake store).
+
+**Cause**: `SELECT ... FOR UPDATE` combined with `MAX(bundle_version)` is
+rejected outright by real Postgres — a session-level serialization problem
+needs a session-level lock, not a row lock, and a row lock cannot
+serialize a channel's very first bundle anyway (no row yet exists to
+lock).
+
+**Fix**: `pg_advisory_xact_lock(namespace, hashtext(channel))` — a
+transaction-scoped advisory lock on a `(namespace, channel-hash)` key,
+auto-released at commit/rollback, taken before the `MAX(bundle_version)` +
+`INSERT` in the same transaction.
+
+### Orphaned MLflow model versions after a failed/superseded training attempt
+
+**Symptom**: `client.search_model_versions("name='...'")` shows more
+versions than any current or retired `channel_model_bundles` row
+references (confirmed for real: `online_banking`'s gbm/lr-shadow/anomaly
+version `1` is orphaned — the channel's one real bundle row references
+version `2`).
+
+**Cause**: MLflow model-version registration and `channel_model_bundles`
+row insertion are not one atomic transaction — a training run that
+registers MLflow versions and then fails (or is superseded before its
+candidate is ever promoted) leaves those versions registered with no
+bundle ever pointing at them.
+
+**Fix**: this is expected, not a bug to "clean up" — **never** delete or
+modify an MLflow version to tidy this up; every version remains `READY`
+and immutable. To audit which versions are actually live, cross-reference
+`channel_model_bundles.{gbm,lr,anomaly}_model_version` (both `OPERATIONAL`
+and `RETIRED` rows) against MLflow's registered versions, rather than
+assuming version count == live count.
+
+### Generation identity mismatch / ambiguous dataset
+
+**Symptom**: `GenerationRunChannelMismatchError`, `GenerationRunDatasetVersionError`,
+`UnknownGenerationRunError`, or `GenerationIdentityConflictError` from
+`train`/`score`/`labels assess`/`evaluate`/generation itself.
+
+**Cause**: every one of these is a deliberate refusal to silently mix
+data — an unknown `generation_run_id` never generated (or generation
+failed and rolled back); a `generation_run_id` that spans more than one
+`dataset_version` for the channel; or the same `(channel, seed, count)`
+regenerated under a **different** `reference_date`, which would silently
+collide via `channel_events`' `ON CONFLICT (event_id) DO NOTHING` since
+`event_id`s are deterministic per `(seed, channel)` alone, not per
+`reference_date`.
+
+**Fix**: use the exact `generation_run_id` a real `generate` call
+returned; regenerate with a different `seed` if you deliberately want a
+different `reference_date` for the same channel/count.
+
+### Chronological split / purge-gap failure
+
+**Symptom**: `InsufficientTrainingDataError` from `assign_chronological_split()`
+or the partition-size/class-balance check that follows it.
+
+**Cause**: too few distinct timestamp groups to place both the
+train/calibration and calibration/test boundaries without splitting a
+group, or a partition left with fewer than the minimum rows/only one
+class after the (POC default: zero) purge gap is applied.
+
+**Fix**: generate a larger population (`--count`) for that channel: this
+project's own real training runs use `--count 5000`, which reliably
+produces train/calibration/test splits of roughly 300/65/65 rows for
+every channel actually built.
+
+### Feature-schema mismatch
+
+**Symptom**: a scoring or diagnostic run raises when computing features
+for an event whose channel adapter doesn't match the requested
+`feature_schema_version`, or a preprocessor trained on one feature set is
+applied to a different one.
+
+**Cause**: `feature_schema_version` is pinned per bundle
+(`REQUIRED_OPERATIONAL_COMPONENTS`); promoting a bundle whose pinned
+version no longer matches the channel adapter's current feature columns
+is refused by `verify_bundle_components()`.
+
+**Fix**: retrain the channel after a feature-adapter change — never hand-edit
+`feature_schema_version` on an existing bundle row.
+
+### Bundle compatibility / MLflow run-ID verification failure
+
+**Symptom**: `BundleVerificationFailedError` at promotion time.
+
+**Cause**: `verify_bundle_components()` checks every component version is
+`READY` in MLflow **and**, when the candidate's own training report
+recorded an expected `run_id`, that the registered version actually
+points at that exact run — not merely that a version number exists under
+the right name. Also checks the candidate's pinned rule/graph/ensemble/
+reason-code versions still match the CURRENTLY loaded config files.
+
+**Fix**: never promote a bundle whose pinned policy versions have drifted
+from the live config — retrain (which re-pins the current versions) if a
+policy file legitimately changed since the candidate was trained.
+
+### Cold-start promotion gate failure
+
+**Symptom**: `ColdStartPromotionGateFailedError` — a channel's first-ever
+promotion attempt is refused.
+
+**Cause**: `evaluate_cold_start_promotion_gate()` requires every split
+(train/calibration/test) to have at least 5 rows of each class AND the
+candidate's GBM `pr_auc` to exceed the test split's own fraud prevalence
+— this is a POC demonstration floor on synthetic, held-out data, never a
+production/regulatory threshold, and is always freshly recomputed from the
+candidate's own immutable training report, never a cached value.
+
+**Fix**: this is a genuine evaluation result, not a bug — do not lower the
+threshold or fabricate a pass. Retrain with a larger/different population,
+or accept the channel remains un-promotable in its current form.
+
+### Missing current-bundle evidence
+
+**Symptom**: `missing_current_bundle_evidence_count > 0` in a live
+evaluation's output, or `alerts list`/`alerts show` shows `current_*`
+fields as `null` for an alert that clearly exists.
+
+**Cause**: the alert genuinely has zero `alert_evidence` rows at all for
+its channel's current `OPERATIONAL` bundle — either it was never scored
+under that bundle, or (rare) a catastrophic scoring failure's best-effort
+evidence write also failed.
+
+**Fix**: run `aidp fraud-intel score` for that channel/generation; this is
+an explicit, documented null representation, never silently fabricated as
+LOW or hidden from the queue.
+
+### Degraded scoring
+
+**Symptom**: `alert_evidence.degraded = true` for a real alert, with one
+or more `component_statuses` entries `status=ERROR`.
+
+**Cause**: a component (GBM/anomaly/graph) failed for that one alert —
+per Phase 5 decision 6, a GBM failure floors the band at `HIGH`; an
+anomaly/graph failure floors it at `MEDIUM`. The rules component and
+overall scoring still complete; a degraded row is never dropped or
+retried automatically.
+
+**Fix**: inspect `component_statuses`' `error_code` for the failing
+component; this project's own real Phase 7B run never hit a degraded row
+(0/1,756 across four new channels), so a real one is worth investigating
+as a genuine infrastructure/model issue, not routine noise.
+
+### Stale initial-vs-current evidence confusion
+
+**Symptom**: an analyst-facing view (or a script) shows a rescored
+alert's original band/score instead of its real current one — e.g.
+`--priority-band MEDIUM` returns 0 rows for a channel with real, current
+MEDIUM evidence.
+
+**Cause**: reading `fraud_alerts.initial_priority_band`/
+`initial_operational_priority_score` and presenting it as current state.
+Those fields are frozen at first-scoring time and never updated by a
+later rescore (Phase 6 decision 2) — this exact defect was found for real
+in `aidp alerts list` (fixed by sourcing "current" from the latest
+`alert_evidence` row via `list_alerts_with_current_state()`, the same
+contract `alerts show`/the dashboard use).
+
+**Fix**: always read current state from `get_latest_evidence()`/
+`list_alerts_with_current_state()`, never from `fraud_alerts.initial_*`
+directly; use `initial_*` only where explicitly labeled historical/audit.
+
+### Cross-channel feature-context inconsistency (train/serve skew)
+
+**Symptom**: a real scoring run's persisted bands diverge from a
+pre-promotion non-persistent diagnostic's predicted bands for the exact
+same population and bundle.
+
+**Cause**: training's supervised-population construction was, at one
+point, scoped to build each row's historical feature context from ONE
+channel only, while real scoring's context was already correctly
+cross-channel (customer-scoped across all seven channels, per guide §15)
+— a genuine train/serve skew, found for real on ACH's first full
+promotion cycle.
+
+**Fix**: `src/fraud_intel/features/history.py`'s shared selectors are now
+the single source of both training's and scoring's historical context
+construction — this class of skew is now structurally prevented, not just
+patched for one channel. If it recurs, verify every caller of
+`_build_supervised_population()`/`list_pending()`/
+`load_resolved_alert_scoring_contexts()` still passes the same
+cross-channel pool (`load_cross_channel_customer_pool()`).
+
+### Duplicate / retry behavior
+
+**Symptom**: uncertainty about whether re-running a `generate`/`train`/
+`score`/`labels assess` command is safe.
+
+**Cause/fix**: all four are designed to be safe, idempotent retries —
+`generate` and `score` use real `ON CONFLICT ... DO NOTHING` constraints
+(`(event_id)`; `(source_system, source_alert_id)`;
+`(alert_id, score_execution_id)`); `labels assess` uses an
+advisory-lock-then-compare-then-conditional-insert (`assessments_inserted=0,
+assessments_unchanged=<total>` on a no-op retry); `train` always creates a
+**new** candidate bundle version on every call (never a retry-safe no-op —
+each real training run is a distinct, intentional action).
+
+### Dashboard infrastructure / read failures
+
+**Symptom**: the Fraud Intelligence tab shows an error message instead of
+the queue, or `pytest tests/smoke/test_fraud_intel_dashboard.py` fails to
+connect.
+
+**Cause**: `src/dashboard/fraud_intel_tab.py` targets `aidp_test` only,
+via the same `src.common.db.get_connection("aidp_test")` every fraud-intel
+CLI command uses — if the local stack isn't running
+(`./scripts/start.sh`) or `aidp_test` doesn't have migrations 003/004
+applied, every read fails.
+
+**Fix**: `./scripts/healthcheck.sh` first; confirm `aidp_test` has the
+v1.3 tables (`\d fraud_alerts` via `docker exec ... psql -d aidp_test`).
+The tab's own `load_queue()`/`load_alert_detail()` never raise past a
+caught `st.error(...)` for a genuine data problem — a raw Python
+traceback in the dashboard means an infrastructure/connectivity issue,
+not a data issue.

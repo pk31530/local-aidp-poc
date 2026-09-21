@@ -205,6 +205,8 @@ class AlertQueueStore(Protocol):
         limit: int = 100,
     ) -> list["AlertListItem"]: ...
 
+    def list_dispositions(self, alert_id: int) -> list["AnalystDispositionRecord"]: ...
+
     def record_disposition_and_update_status(
         self, *, alert_id: int, analyst_id: str, disposition: str, notes: Optional[str], new_status: str
     ) -> AnalystDispositionRecord: ...
@@ -574,6 +576,26 @@ class _PostgresAlertQueueStore:
         finally:
             conn.close()
 
+    def list_dispositions(self, alert_id: int) -> list[AnalystDispositionRecord]:
+        """Phase 8 (read-only dashboard): the full analyst disposition
+        history for one alert, oldest first -- never written to by this
+        method. Disposition CAPTURE remains exclusively
+        record_disposition_and_update_status() (CLI-only, per Phase 6
+        decision 4); this is purely an additional getter, mirroring
+        get_alert()/get_latest_evidence()'s existing read-only pattern."""
+        conn = get_connection(self._database)
+        try:
+            with conn:
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    cur.execute(
+                        "SELECT disposition_id, alert_id, analyst_id, disposition, notes, disposed_at "
+                        "FROM analyst_dispositions WHERE alert_id = %s ORDER BY disposed_at ASC, disposition_id ASC",
+                        (alert_id,),
+                    )
+                    return [AnalystDispositionRecord(**row) for row in cur.fetchall()]
+        finally:
+            conn.close()
+
     def record_disposition_and_update_status(self, *, alert_id, analyst_id, disposition, notes, new_status) -> AnalystDispositionRecord:
         conn = get_connection(self._database)
         try:
@@ -699,6 +721,12 @@ class _FakeAlertQueueStore:
             )
         items.sort(key=lambda i: (i.created_at, i.alert_id), reverse=True)
         return items[:limit]
+
+    def list_dispositions(self, alert_id: int) -> list[AnalystDispositionRecord]:
+        return sorted(
+            (d for d in self.dispositions if d.alert_id == alert_id),
+            key=lambda d: (d.disposed_at, d.disposition_id),
+        )
 
     def record_disposition_and_update_status(self, *, alert_id, analyst_id, disposition, notes, new_status) -> AnalystDispositionRecord:
         alert = self.alerts_by_id[alert_id]
