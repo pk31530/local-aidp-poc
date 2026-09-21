@@ -209,6 +209,93 @@ def test_get_latest_assessment_for_unknown_alert_returns_none():
     assert store.get_latest_assessment(999) is None
 
 
+# ---- append_if_changed: idempotent retries, genuine reassessments still append --------
+
+
+def test_append_if_changed_first_assessment_inserts():
+    store = _FakeLabelAssessmentStore()
+    result = store.append_if_changed(**assess_label(alert_id=1, label_source="SYNTHETIC_GENERATOR", basis_timestamp=T0, source_disposition_id=None, resolved_label="RESOLVED_FRAUD", now=T0))
+    assert result.inserted is True
+    assert len(store.rows) == 1
+
+
+def test_append_if_changed_exact_retry_skips():
+    store = _FakeLabelAssessmentStore()
+    fields = assess_label(alert_id=1, label_source="SYNTHETIC_GENERATOR", basis_timestamp=T0, source_disposition_id=None, resolved_label="RESOLVED_FRAUD", now=T0)
+    first = store.append_if_changed(**fields)
+    second = store.append_if_changed(**fields)
+    assert first.inserted is True
+    assert second.inserted is False
+    assert second.record.assessment_id == first.record.assessment_id
+    assert len(store.rows) == 1
+
+
+def test_append_if_changed_changed_disposition_appends():
+    store = _FakeLabelAssessmentStore()
+    store.append_if_changed(**assess_label(alert_id=1, label_source="ANALYST_DISPOSITION", basis_timestamp=T0, source_disposition_id=7, resolved_label="UNRESOLVED", now=T0 + timedelta(days=ANALYST_MATURITY_WINDOW_DAYS, hours=1)))
+    result = store.append_if_changed(**assess_label(alert_id=1, label_source="ANALYST_DISPOSITION", basis_timestamp=T0, source_disposition_id=8, resolved_label="RESOLVED_FRAUD", now=T0 + timedelta(days=ANALYST_MATURITY_WINDOW_DAYS, hours=1)))
+    assert result.inserted is True
+    assert len(store.rows) == 2
+
+
+def test_append_if_changed_changed_policy_version_appends():
+    store = _FakeLabelAssessmentStore()
+    fields = assess_label(alert_id=1, label_source="SYNTHETIC_GENERATOR", basis_timestamp=T0, source_disposition_id=None, resolved_label="RESOLVED_FRAUD", now=T0)
+    store.append_if_changed(**fields)
+    changed = dict(fields, policy_version="v2")
+    result = store.append_if_changed(**changed)
+    assert result.inserted is True
+    assert len(store.rows) == 2
+
+
+def test_append_if_changed_changed_maturity_eligibility_resolved_result_appends():
+    store = _FakeLabelAssessmentStore()
+    # first: immature, unresolved
+    store.append_if_changed(**assess_label(alert_id=1, label_source="ANALYST_DISPOSITION", basis_timestamp=T0, source_disposition_id=7, resolved_label="UNRESOLVED", now=T0 + timedelta(days=1)))
+    # second: same basis, but time has passed -- now mature and resolved
+    result = store.append_if_changed(**assess_label(alert_id=1, label_source="ANALYST_DISPOSITION", basis_timestamp=T0, source_disposition_id=7, resolved_label="RESOLVED_FRAUD", now=T0 + timedelta(days=ANALYST_MATURITY_WINDOW_DAYS, hours=1)))
+    assert result.inserted is True
+    assert len(store.rows) == 2
+    assert store.rows[0].maturity_status == "IMMATURE"
+    assert store.rows[1].maturity_status == "MATURE"
+
+
+def test_append_if_changed_different_alerts_proceed_independently():
+    store = _FakeLabelAssessmentStore()
+    r1 = store.append_if_changed(**assess_label(alert_id=1, label_source="SYNTHETIC_GENERATOR", basis_timestamp=T0, source_disposition_id=None, resolved_label="RESOLVED_FRAUD", now=T0))
+    r2 = store.append_if_changed(**assess_label(alert_id=2, label_source="SYNTHETIC_GENERATOR", basis_timestamp=T0, source_disposition_id=None, resolved_label="RESOLVED_LEGITIMATE", now=T0))
+    assert r1.inserted is True
+    assert r2.inserted is True
+    assert len(store.rows) == 2
+
+
+def test_append_if_changed_449_unchanged_inputs_produce_zero_additional_rows():
+    store = _FakeLabelAssessmentStore()
+    field_sets = [
+        assess_label(alert_id=i, label_source="SYNTHETIC_GENERATOR", basis_timestamp=T0, source_disposition_id=None, resolved_label="RESOLVED_FRAUD" if i % 3 == 0 else "RESOLVED_LEGITIMATE", now=T0)
+        for i in range(1, 450)
+    ]
+    for fields in field_sets:
+        store.append_if_changed(**fields)
+    assert len(store.rows) == 449
+
+    for fields in field_sets:
+        result = store.append_if_changed(**fields)
+        assert result.inserted is False
+    assert len(store.rows) == 449
+
+
+def test_append_if_changed_never_updates_or_deletes_existing_rows():
+    store = _FakeLabelAssessmentStore()
+    fields = assess_label(alert_id=1, label_source="SYNTHETIC_GENERATOR", basis_timestamp=T0, source_disposition_id=None, resolved_label="UNRESOLVED", now=T0)
+    first = store.append_if_changed(**fields)
+    changed = dict(fields, resolved_label="RESOLVED_FRAUD")
+    store.append_if_changed(**changed)
+    # the first row is still present, unmodified, in store.rows
+    assert first.record in store.rows
+    assert first.record.resolved_label == "UNRESOLVED"
+
+
 def test_get_latest_assessment_ignores_other_alerts():
     store = _FakeLabelAssessmentStore()
     store.append_assessment(**assess_label(alert_id=1, label_source="SYNTHETIC_GENERATOR", basis_timestamp=T0, source_disposition_id=None, resolved_label="RESOLVED_FRAUD", now=T0))
@@ -229,26 +316,41 @@ def _bases() -> list[AlertLabelBasis]:
     ]
 
 
+def _loader(channel, generation_run_id):
+    return "dsv-1", _bases()
+
+
 def test_assess_channel_labels_appends_through_its_own_lifecycle_run():
     lifecycle, run_store = _lifecycle()
     store = _FakeLabelAssessmentStore()
 
-    summary = assess_channel_labels(channel="online_banking", lifecycle=lifecycle, load_label_bases=lambda channel: _bases(), store=store, now=T0)
+    summary = assess_channel_labels(
+        channel="online_banking", generation_run_id="genrun-1", lifecycle=lifecycle, load_label_bases=_loader, store=store, now=T0
+    )
 
     assert summary["channel"] == "online_banking"
-    assert summary["alerts_considered"] == 3
-    assert summary["assessments_appended"] == 3
+    assert summary["generation_run_id"] == "genrun-1"
+    assert summary["source_dataset_version"] == "dsv-1"
+    assert summary["bases_evaluated"] == 3
+    assert summary["assessments_inserted"] == 3
+    assert summary["assessments_unchanged"] == 0
     assert len(store.rows) == 3
     run = run_store.get(summary["run_id"])
     assert run.pipeline_name == "label_eligibility"
     assert run.status == "SUCCESS"
+    assert run.dataset_version == "dsv-1"
+    assert run.artifacts["generation_run_id"] == "genrun-1"
+    assert run.artifacts["assessments_inserted"] == 3
+    assert run.artifacts["assessments_unchanged"] == 0
 
 
 def test_assess_channel_labels_counts_mature_immature_eligible_unresolved():
     lifecycle, _ = _lifecycle()
     store = _FakeLabelAssessmentStore()
 
-    summary = assess_channel_labels(channel="online_banking", lifecycle=lifecycle, load_label_bases=lambda channel: _bases(), store=store, now=T0)
+    summary = assess_channel_labels(
+        channel="online_banking", generation_run_id="genrun-1", lifecycle=lifecycle, load_label_bases=_loader, store=store, now=T0
+    )
 
     # alert 1: synthetic, resolved fraud -> MATURE + eligible
     # alert 2: synthetic, resolved legitimate -> MATURE + eligible
@@ -256,33 +358,72 @@ def test_assess_channel_labels_counts_mature_immature_eligible_unresolved():
     assert summary["mature_count"] == 2
     assert summary["immature_count"] == 1
     assert summary["eligible_count"] == 2
+    assert summary["resolved_fraud_count"] == 1
+    assert summary["resolved_legitimate_count"] == 1
     assert summary["unresolved_count"] == 1
 
 
-def test_assess_channel_labels_repeated_runs_preserve_history():
+def test_assess_channel_labels_exact_retry_appends_zero_new_rows():
+    """Phase 7B Stage 7 corrective pass: an accidental retry with an
+    unchanged basis/result must be a no-op, never a duplicate row."""
     lifecycle, _ = _lifecycle()
     store = _FakeLabelAssessmentStore()
 
-    first = assess_channel_labels(channel="online_banking", lifecycle=lifecycle, load_label_bases=lambda channel: _bases(), store=store, now=T0)
-    second = assess_channel_labels(channel="online_banking", lifecycle=lifecycle, load_label_bases=lambda channel: _bases(), store=store, now=T0)
+    first = assess_channel_labels(
+        channel="online_banking", generation_run_id="genrun-1", lifecycle=lifecycle, load_label_bases=_loader, store=store, now=T0
+    )
+    second = assess_channel_labels(
+        channel="online_banking", generation_run_id="genrun-1", lifecycle=lifecycle, load_label_bases=_loader, store=store, now=T0
+    )
 
     assert first["run_id"] != second["run_id"]
-    # every alert now has TWO assessment rows -- nothing was overwritten
-    assert len(store.rows) == 6
+    assert first["assessments_inserted"] == 3
+    assert second["assessments_inserted"] == 0
+    assert second["assessments_unchanged"] == second["bases_evaluated"] == 3
+    # no duplicate rows -- still exactly one row per alert
+    assert len(store.rows) == 3
     for alert_id in (1, 2, 3):
         matching = [r for r in store.rows if r.alert_id == alert_id]
-        assert len(matching) == 2
+        assert len(matching) == 1
+
+
+def test_assess_channel_labels_genuine_reassessment_still_appends():
+    """A changed disposition (alert 3's resolved_label flips from
+    UNRESOLVED to RESOLVED_FRAUD, as if a real analyst confirmation
+    arrived) is a genuine reassessment -- history is still preserved."""
+    lifecycle, _ = _lifecycle()
+    store = _FakeLabelAssessmentStore()
+
+    def _first_loader(channel, generation_run_id):
+        return "dsv-1", _bases()
+
+    def _second_loader(channel, generation_run_id):
+        bases = _bases()
+        bases[2] = AlertLabelBasis(
+            alert_id=3, label_source="ANALYST_DISPOSITION", basis_timestamp=T0, source_disposition_id=7, resolved_label="RESOLVED_FRAUD"
+        )
+        return "dsv-1", bases
+
+    assess_channel_labels(channel="online_banking", generation_run_id="genrun-1", lifecycle=lifecycle, load_label_bases=_first_loader, store=store, now=T0)
+    second = assess_channel_labels(channel="online_banking", generation_run_id="genrun-1", lifecycle=lifecycle, load_label_bases=_second_loader, store=store, now=T0)
+
+    assert second["assessments_inserted"] == 1
+    assert second["assessments_unchanged"] == 2
+    matching_3 = [r for r in store.rows if r.alert_id == 3]
+    assert len(matching_3) == 2
+    assert matching_3[0].resolved_label == "UNRESOLVED"
+    assert matching_3[1].resolved_label == "RESOLVED_FRAUD"
 
 
 def test_assess_channel_labels_structural_load_failure_fails_the_run_and_reraises():
     lifecycle, run_store = _lifecycle()
     store = _FakeLabelAssessmentStore()
 
-    def _raising_loader(channel):
+    def _raising_loader(channel, generation_run_id):
         raise RuntimeError("simulated structural failure")
 
     with pytest.raises(RuntimeError):
-        assess_channel_labels(channel="online_banking", lifecycle=lifecycle, load_label_bases=_raising_loader, store=store, now=T0)
+        assess_channel_labels(channel="online_banking", generation_run_id="genrun-1", lifecycle=lifecycle, load_label_bases=_raising_loader, store=store, now=T0)
 
     assert len(store.rows) == 0
     (run,) = run_store.rows.values()

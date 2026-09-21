@@ -573,22 +573,42 @@ def _handle_fraud_intel_labels_assess(args: argparse.Namespace) -> dict:
     Postgres assessment store into
     src.fraud_intel.labels.eligibility.assess_channel_labels(), which
     owns the actual `label_eligibility` RunLifecycle run, the per-alert
-    assess_label() calls, and the append-only writes -- this handler adds
-    nothing of its own beyond requiring an explicit --database (via
-    `_require_database`, the same as every other fraud-intel command) and
-    an implemented channel."""
+    assess_label() calls, and the idempotent append_if_changed() writes.
+
+    Phase 7B Stage 7 corrective pass: requires --generation-run-id, same
+    contract as train/score's own required-but-not-argparse-required flag
+    (validated here, after --database, so a missing value is a clean
+    CLIUserError/JSON error) -- label assessment must never silently
+    consider every alert ever generated for a channel across every
+    generation."""
     database = _require_database(args)
     _require_implemented_channel(args.channel)
+    if not args.generation_run_id:
+        raise CLIUserError(
+            "--generation-run-id is required for label assessment -- label assessment must never silently "
+            "consider every fraud_alerts row for a channel across every generation ever run"
+        )
 
-    from src.fraud_intel.cli_data_access import load_alert_label_bases
+    from src.fraud_intel.cli_data_access import (
+        GenerationRunChannelMismatchError,
+        GenerationRunDatasetVersionError,
+        UnknownGenerationRunError,
+        load_alert_label_bases,
+    )
     from src.fraud_intel.labels.eligibility import assess_channel_labels, create_default_label_assessment_store
 
-    return assess_channel_labels(
-        channel=args.channel,
-        lifecycle=RunLifecycle(database),
-        load_label_bases=lambda channel: load_alert_label_bases(channel, database),
-        store=create_default_label_assessment_store(database),
-    )
+    try:
+        return assess_channel_labels(
+            channel=args.channel,
+            generation_run_id=args.generation_run_id,
+            lifecycle=RunLifecycle(database),
+            load_label_bases=lambda channel, generation_run_id: load_alert_label_bases(
+                channel, database, generation_run_id=generation_run_id
+            ),
+            store=create_default_label_assessment_store(database),
+        )
+    except (UnknownGenerationRunError, GenerationRunChannelMismatchError, GenerationRunDatasetVersionError) as exc:
+        raise CLIUserError(str(exc)) from exc
 
 
 def _list_alerts(database: str, *, channel=None, status=None, priority_band=None):
@@ -809,6 +829,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="run the versioned label-eligibility policy over a channel's fraud_alerts and append label_assessments",
     )
     fi_labels_assess_p.add_argument("--channel", required=True, choices=sorted(FRAUD_INTEL_ALL_CHANNELS))
+    # Not argparse `required=True` -- validated inside the handler (after
+    # --database), matching train's/score's own --generation-run-id
+    # contract: a missing value is a clean CLIUserError/JSON error, not
+    # argparse's own unformatted usage exit.
+    fi_labels_assess_p.add_argument("--generation-run-id", dest="generation_run_id", default=None)
     fi_labels_assess_p.set_defaults(handler=_handle_fraud_intel_labels_assess)
 
     alerts_p = top.add_parser("alerts", help="analyst alert review commands")

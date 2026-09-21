@@ -508,22 +508,59 @@ def load_resolved_alert_scoring_contexts(channel: str, database: str) -> list[Ca
     return items
 
 
-def load_alert_label_bases(channel: str, database: str) -> list[AlertLabelBasis]:
+def load_alert_label_bases(
+    channel: str, database: str, *, generation_run_id: str
+) -> tuple[str, list[AlertLabelBasis]]:
     """Real Postgres read backing `aidp fraud-intel labels assess`
-    (Phase 7B Stage 0). Reviewed as SQL, not exercised by any unit test --
-    every eligibility/CLI test supplies fixture AlertLabelBasis rows
-    directly. One row per fraud_alerts row in `channel`: its latest
-    analyst_dispositions row when one exists (ANALYST_DISPOSITION,
+    (Phase 7B Stage 0; Stage 7 corrective pass adds required
+    `generation_run_id` scoping). Reviewed as SQL, not exercised by any
+    unit test -- every eligibility/CLI test supplies fixture
+    AlertLabelBasis rows directly. One row per fraud_alerts row in
+    `channel` AND `generation_run_id` (never silently channel-wide across
+    every generation ever run -- same validation contract and exception
+    types as load_channel_population()/_PostgresScoringDataAccess.
+    validate_generation_run() above, reused rather than redefined): its
+    latest analyst_dispositions row when one exists (ANALYST_DISPOSITION,
     basis_timestamp = disposed_at -- the evidentiary basis, never
     event_timestamp, per assess_label()'s own contract), else the
     channel_event's own synthetic_event_labels row (SYNTHETIC_GENERATOR,
     basis_timestamp = event_timestamp -- ground truth is known instantly
     at generation time for synthetic data, so it matures immediately
-    through assess_label()'s SYNTHETIC_IMMEDIATE_MATURITY path)."""
+    through assess_label()'s SYNTHETIC_IMMEDIATE_MATURITY path). Returns
+    the generation's own single dataset_version alongside the bases, for
+    the caller to record as provenance."""
     conn = get_connection(database)
     try:
         with conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT DISTINCT channel FROM channel_events WHERE generation_run_id = %s", (generation_run_id,)
+                )
+                existing_channels = {row["channel"] for row in cur.fetchall()}
+                if not existing_channels:
+                    raise UnknownGenerationRunError(
+                        f"no channel_events rows found for generation_run_id {generation_run_id!r} -- it was never "
+                        "generated, or generation itself failed and rolled back"
+                    )
+                if existing_channels != {channel}:
+                    raise GenerationRunChannelMismatchError(
+                        f"generation_run_id {generation_run_id!r} belongs to channel(s) {sorted(existing_channels)!r}, "
+                        f"not {channel!r}"
+                    )
+
+                cur.execute(
+                    "SELECT DISTINCT dataset_version FROM channel_events "
+                    "WHERE channel = %s AND generation_run_id = %s",
+                    (channel, generation_run_id),
+                )
+                dataset_versions = [row["dataset_version"] for row in cur.fetchall()]
+                if len(dataset_versions) != 1:
+                    raise GenerationRunDatasetVersionError(
+                        f"generation_run_id {generation_run_id!r} has {len(dataset_versions)} distinct "
+                        f"dataset_version value(s) for channel {channel!r} -- expected exactly 1"
+                    )
+                dataset_version = dataset_versions[0]
+
                 cur.execute(
                     """
                     SELECT fa.alert_id, ce.event_timestamp, sel.synthetic_scenario_label,
@@ -535,9 +572,9 @@ def load_alert_label_bases(channel: str, database: str) -> list[AlertLabelBasis]
                         SELECT * FROM analyst_dispositions WHERE alert_id = fa.alert_id
                         ORDER BY disposed_at DESC, disposition_id DESC LIMIT 1
                     ) ad ON true
-                    WHERE fa.channel = %s
+                    WHERE fa.channel = %s AND ce.generation_run_id = %s
                     """,
-                    (channel,),
+                    (channel, generation_run_id),
                 )
                 rows = cur.fetchall()
     finally:
@@ -565,4 +602,4 @@ def load_alert_label_bases(channel: str, database: str) -> list[AlertLabelBasis]
                     resolved_label="RESOLVED_FRAUD" if row["synthetic_scenario_label"] else "RESOLVED_LEGITIMATE",
                 )
             )
-    return bases
+    return dataset_version, bases

@@ -6,6 +6,7 @@ module's own code -- every unit test supplies `_FakeLabelAssessmentStore`.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Literal, Optional, Protocol
 
@@ -16,6 +17,23 @@ from src.control_plane.runs import RunLifecycle
 import psycopg2.extras
 
 LABEL_ELIGIBILITY_POLICY_VERSION = "v1"
+
+# Phase 7B Stage 7 corrective pass: the fixed, AiDP-specific namespace half
+# of a per-alert transaction-scoped advisory lock, serializing
+# append_if_changed() so an exact-retry comparison and its conditional
+# INSERT can never race against a concurrent attempt for the SAME alert.
+# alert_id is BIGINT (fraud_alerts.alert_id is BIGSERIAL), so -- unlike
+# src.fraud_intel.models.bundle._BUNDLE_VERSION_LOCK_NAMESPACE, which locks
+# a hashtext(channel) STRING key via the two-int-key pg_advisory_xact_lock
+# (int, int) overload -- the lock key here is built from the already-
+# numeric, already-unique alert_id directly (no hashtext, no collision
+# risk), packed into the single-bigint pg_advisory_xact_lock(bigint)
+# overload: high 32 bits = this fixed namespace, low 32 bits = alert_id.
+# Arbitrary but MUST stay fixed forever once assigned -- derived once as
+# the low 31 bits of sha256(b"aidp_fraud_intel_label_assessments") purely
+# so the value is reproducible and documented, never recomputed at
+# runtime.
+_LABEL_ASSESSMENT_LOCK_NAMESPACE = 0x6BDC2C5F
 
 SYNTHETIC_IMMEDIATE_MATURITY = "SYNTHETIC_IMMEDIATE_MATURITY"
 MATURITY_WINDOW_ELAPSED = "MATURITY_WINDOW_ELAPSED"
@@ -147,8 +165,34 @@ class LabelAssessmentRecord(BaseModel):
     resolved_label_source: Optional[str]
 
 
+# The complete set of LabelAssessmentRecord fields that define WHY/HOW a
+# label was resolved -- i.e. everything except the two generated,
+# per-insert identity fields (assessment_id, evaluated_at). Computed from
+# the model itself (never a hand-maintained duplicate list) so it can
+# never silently drift out of sync with LabelAssessmentRecord's real
+# fields.
+_LABEL_ASSESSMENT_GENERATED_FIELDS = frozenset({"assessment_id", "evaluated_at"})
+
+
+@dataclass(frozen=True)
+class AppendIfChangedResult:
+    """Outcome of LabelAssessmentStore.append_if_changed(): the row now
+    representing this alert's latest assessment (a freshly inserted one,
+    or -- when the proposed assessment is semantically identical to what
+    is already there -- the pre-existing one, unchanged), plus whether a
+    new row was actually inserted."""
+
+    record: LabelAssessmentRecord
+    inserted: bool
+
+
+def _semantic_fields(fields: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in fields.items() if k not in _LABEL_ASSESSMENT_GENERATED_FIELDS}
+
+
 class LabelAssessmentStore(Protocol):
     def append_assessment(self, **fields: Any) -> LabelAssessmentRecord: ...
+    def append_if_changed(self, **fields: Any) -> AppendIfChangedResult: ...
     def get_latest_assessment(self, alert_id: int) -> Optional[LabelAssessmentRecord]: ...
 
 
@@ -172,6 +216,63 @@ class _PostgresLabelAssessmentStore:
                         list(fields.values()),
                     )
                     return LabelAssessmentRecord(**cur.fetchone())
+        finally:
+            conn.close()
+
+    def append_if_changed(self, **fields: Any) -> AppendIfChangedResult:
+        """Phase 7B Stage 7 corrective pass: `append_assessment()` above is
+        an unconditional INSERT -- calling it twice with an unchanged basis
+        (e.g. an accidental retry of `labels assess`) silently doubles
+        label_assessments forever, since there is no uniqueness constraint
+        at the schema level either. This method makes an EXACT retry a
+        no-op while still preserving genuine append-only history (a
+        changed disposition, policy version, maturity/eligibility/resolved
+        result always still appends a new row -- see this module's
+        docstring and the Stage 7 test suite).
+
+        Lock-then-read-then-write, all on one connection/transaction (same
+        pg_advisory_xact_lock convention as
+        src.fraud_intel.models.bundle._PostgresChannelModelBundleStore.
+        register_candidate() -- released automatically at COMMIT/ROLLBACK,
+        never an explicit unlock): the lock is acquired FIRST, before the
+        latest-row SELECT, so a concurrent append_if_changed() for the
+        SAME alert_id always serializes (one call's compare-then-insert
+        completes, and commits, before the other's SELECT can run);
+        concurrent calls for DIFFERENT alert_ids use different lock keys
+        and proceed independently. Never UPDATEs or DELETEs an existing
+        row -- the only write here is a plain INSERT, exactly like
+        append_assessment()."""
+        conn = get_connection(self._database)
+        try:
+            with conn:
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    cur.execute(
+                        "SELECT pg_advisory_xact_lock((%s::bigint << 32) | (%s::bigint & 4294967295))",
+                        (_LABEL_ASSESSMENT_LOCK_NAMESPACE, fields["alert_id"]),
+                    )
+
+                    cur.execute(
+                        "SELECT * FROM label_assessments WHERE alert_id = %s "
+                        "ORDER BY evaluated_at DESC, assessment_id DESC LIMIT 1",
+                        (fields["alert_id"],),
+                    )
+                    row = cur.fetchone()
+                    latest = LabelAssessmentRecord(**row) if row else None
+
+                    if latest is not None:
+                        existing_semantic = _semantic_fields(latest.model_dump())
+                        proposed_semantic = _semantic_fields(fields)
+                        if existing_semantic == proposed_semantic:
+                            return AppendIfChangedResult(record=latest, inserted=False)
+
+                    columns = list(fields.keys())
+                    placeholders = ", ".join(["%s"] * len(columns))
+                    cur.execute(
+                        f"INSERT INTO label_assessments ({', '.join(columns)}) VALUES ({placeholders}) "
+                        f"RETURNING assessment_id, {', '.join(columns)}, evaluated_at",
+                        list(fields.values()),
+                    )
+                    return AppendIfChangedResult(record=LabelAssessmentRecord(**cur.fetchone()), inserted=True)
         finally:
             conn.close()
 
@@ -206,6 +307,18 @@ class _FakeLabelAssessmentStore:
         self.rows.append(record)  # append-only -- no update/delete path exists anywhere
         return record
 
+    def append_if_changed(self, **fields: Any) -> AppendIfChangedResult:
+        """In-memory mirror of _PostgresLabelAssessmentStore.append_if_changed
+        -- no lock needed (single-threaded fakes), same compare-then-insert
+        semantics."""
+        latest = self.get_latest_assessment(fields["alert_id"])
+        if latest is not None:
+            existing_semantic = _semantic_fields(latest.model_dump())
+            proposed_semantic = _semantic_fields(fields)
+            if existing_semantic == proposed_semantic:
+                return AppendIfChangedResult(record=latest, inserted=False)
+        return AppendIfChangedResult(record=self.append_assessment(**fields), inserted=True)
+
     def get_latest_assessment(self, alert_id: int) -> Optional[LabelAssessmentRecord]:
         matching = [r for r in self.rows if r.alert_id == alert_id]
         if not matching:
@@ -216,12 +329,13 @@ class _FakeLabelAssessmentStore:
 # ---- explicit label-eligibility command orchestration (Phase 7B Stage 0) -----------------
 
 
-LoadAlertLabelBases = Callable[[str], list[AlertLabelBasis]]
+LoadAlertLabelBases = Callable[[str, str], tuple[str, list[AlertLabelBasis]]]
 
 
 def assess_channel_labels(
     *,
     channel: str,
+    generation_run_id: str,
     lifecycle: RunLifecycle,
     load_label_bases: LoadAlertLabelBases,
     store: LabelAssessmentStore,
@@ -231,20 +345,34 @@ def assess_channel_labels(
     command this command is FOR is Stage 0's explicit
     `aidp fraud-intel labels assess`, never scoring itself -- scoring
     creates fraud_alerts/alert_evidence, never a label_assessments row).
-    Every re-run appends a NEW assessment per alert via
-    store.append_assessment() (assess_label() is pure, append-only,
-    never an update) -- so history is always preserved across repeated
-    runs. Never trains or promotes a model; a STRUCTURAL failure (the
-    label-basis load itself failing) aborts the whole run and is recorded
-    via fail_from_exception(), which always re-raises."""
+
+    Phase 7B Stage 7 corrective pass: `generation_run_id` is now a
+    required keyword -- `load_label_bases` must never silently load every
+    row ever generated for a channel (same principle as
+    src.fraud_intel.cli_data_access.load_channel_population()), and now
+    returns the generation's own single dataset_version alongside its
+    bases, recorded below as provenance. Every re-run appends a NEW
+    assessment per alert only when its complete basis/result actually
+    changed, via store.append_if_changed() -- an EXACT retry (identical
+    basis/result) is a no-op, never a duplicate row, while a genuine
+    reassessment (a changed disposition, policy version, or
+    maturity/eligibility/resolved-label transition) always still appends,
+    preserving history exactly as before (assess_label() itself remains
+    pure and append-only). Never trains or promotes a model; a STRUCTURAL
+    failure (the label-basis load itself failing) aborts the whole run
+    and is recorded via fail_from_exception(), which always re-raises."""
     run = lifecycle.begin("label_eligibility", trigger_source="cli")
     effective_now = now if now is not None else datetime.now(timezone.utc)
     try:
-        bases = load_label_bases(channel)
+        source_dataset_version, bases = load_label_bases(channel, generation_run_id)
         mature_count = 0
         immature_count = 0
         eligible_count = 0
         unresolved_count = 0
+        resolved_fraud_count = 0
+        resolved_legitimate_count = 0
+        assessments_inserted = 0
+        assessments_unchanged = 0
         for basis in bases:
             result = assess_label(
                 alert_id=basis.alert_id,
@@ -254,13 +382,22 @@ def assess_channel_labels(
                 resolved_label=basis.resolved_label,
                 now=effective_now,
             )
-            record = store.append_assessment(**result)
+            outcome = store.append_if_changed(**result)
+            record = outcome.record
+            if outcome.inserted:
+                assessments_inserted += 1
+            else:
+                assessments_unchanged += 1
             if record.maturity_status == "MATURE":
                 mature_count += 1
             else:
                 immature_count += 1
             if record.eligibility_result:
                 eligible_count += 1
+            if record.resolved_label == "RESOLVED_FRAUD":
+                resolved_fraud_count += 1
+            elif record.resolved_label == "RESOLVED_LEGITIMATE":
+                resolved_legitimate_count += 1
             if record.resolved_label in (None, "UNRESOLVED"):
                 unresolved_count += 1
     except Exception as exc:
@@ -269,14 +406,35 @@ def assess_channel_labels(
 
     summary = {
         "channel": channel,
+        "generation_run_id": generation_run_id,
+        "source_dataset_version": source_dataset_version,
         "run_id": run.run_id,
         "policy_version": LABEL_ELIGIBILITY_POLICY_VERSION,
-        "alerts_considered": len(bases),
-        "assessments_appended": len(bases),
+        "bases_evaluated": len(bases),
+        "assessments_inserted": assessments_inserted,
+        "assessments_unchanged": assessments_unchanged,
         "mature_count": mature_count,
         "immature_count": immature_count,
         "eligible_count": eligible_count,
+        "resolved_fraud_count": resolved_fraud_count,
+        "resolved_legitimate_count": resolved_legitimate_count,
         "unresolved_count": unresolved_count,
     }
-    lifecycle.succeed(run.run_id, records_processed=len(bases))
+    lifecycle.succeed(
+        run.run_id,
+        records_processed=len(bases),
+        dataset_version=source_dataset_version,
+        artifacts={
+            "channel": channel,
+            "generation_run_id": generation_run_id,
+            "source_dataset_version": source_dataset_version,
+            "bases_evaluated": len(bases),
+            "assessments_inserted": assessments_inserted,
+            "assessments_unchanged": assessments_unchanged,
+            "eligible_count": eligible_count,
+            "resolved_fraud_count": resolved_fraud_count,
+            "resolved_legitimate_count": resolved_legitimate_count,
+            "unresolved_count": unresolved_count,
+        },
+    )
     return summary

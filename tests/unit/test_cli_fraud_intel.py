@@ -1171,21 +1171,70 @@ def test_model_show_no_operational_bundle_is_a_cli_user_error(monkeypatch, capsy
 def test_labels_assess_dispatches_to_assess_channel_labels_with_an_explicit_database(monkeypatch, capsys):
     captured = {}
 
-    def _fake_assess_channel_labels(*, channel, lifecycle, load_label_bases, store, **kwargs):
-        captured.update(channel=channel, lifecycle=lifecycle, load_label_bases=load_label_bases, store=store)
-        return {"channel": channel, "run_id": 1, "alerts_considered": 3, "assessments_appended": 3, "mature_count": 3, "immature_count": 0, "eligible_count": 2, "unresolved_count": 1}
+    def _fake_assess_channel_labels(*, channel, generation_run_id, lifecycle, load_label_bases, store, **kwargs):
+        captured.update(channel=channel, generation_run_id=generation_run_id, lifecycle=lifecycle, load_label_bases=load_label_bases, store=store)
+        return {
+            "channel": channel, "generation_run_id": generation_run_id, "source_dataset_version": "dsv-1", "run_id": 1,
+            "bases_evaluated": 3, "assessments_inserted": 3, "assessments_unchanged": 0, "mature_count": 3,
+            "immature_count": 0, "eligible_count": 2, "resolved_fraud_count": 1, "resolved_legitimate_count": 1,
+            "unresolved_count": 1,
+        }
 
     fake_store = object()
     monkeypatch.setattr("src.fraud_intel.labels.eligibility.assess_channel_labels", _fake_assess_channel_labels)
     monkeypatch.setattr("src.fraud_intel.labels.eligibility.create_default_label_assessment_store", lambda database: fake_store)
-    monkeypatch.setattr("src.fraud_intel.cli_data_access.load_alert_label_bases", lambda channel, database: [])
+    monkeypatch.setattr("src.fraud_intel.cli_data_access.load_alert_label_bases", lambda channel, database, *, generation_run_id: ("dsv-1", []))
 
-    cli_main.main(["fraud-intel", "labels", "assess", "--channel", "online_banking", "--database", "aidp_test", "--json"])
+    cli_main.main(
+        ["fraud-intel", "labels", "assess", "--channel", "online_banking", "--generation-run-id", "genrun-1",
+         "--database", "aidp_test", "--json"]
+    )
 
     assert captured["channel"] == "online_banking"
+    assert captured["generation_run_id"] == "genrun-1"
     assert captured["store"] is fake_store
     result = json.loads(capsys.readouterr().out)
-    assert result == {"channel": "online_banking", "run_id": 1, "alerts_considered": 3, "assessments_appended": 3, "mature_count": 3, "immature_count": 0, "eligible_count": 2, "unresolved_count": 1}
+    assert result["channel"] == "online_banking"
+    assert result["generation_run_id"] == "genrun-1"
+    assert result["bases_evaluated"] == 3
+    assert result["assessments_inserted"] == 3
+    assert result["assessments_unchanged"] == 0
+
+
+def test_labels_assess_requires_generation_run_id(capsys):
+    with pytest.raises(SystemExit) as exc_info:
+        cli_main.main(["fraud-intel", "labels", "assess", "--channel", "online_banking", "--database", "aidp_test", "--json"])
+    assert exc_info.value.code == 2
+    assert json.loads(capsys.readouterr().out)["error"] == "CLIUserError"
+
+
+@pytest.mark.parametrize(
+    "exc_cls_path",
+    [
+        "src.fraud_intel.cli_data_access.UnknownGenerationRunError",
+        "src.fraud_intel.cli_data_access.GenerationRunChannelMismatchError",
+        "src.fraud_intel.cli_data_access.GenerationRunDatasetVersionError",
+    ],
+)
+def test_labels_assess_maps_generation_validation_errors_to_cli_user_error(monkeypatch, capsys, exc_cls_path):
+    import importlib
+
+    module_path, _, cls_name = exc_cls_path.rpartition(".")
+    exc_cls = getattr(importlib.import_module(module_path), cls_name)
+
+    def _raise(**kwargs):
+        raise exc_cls("simulated")
+
+    monkeypatch.setattr("src.fraud_intel.labels.eligibility.assess_channel_labels", _raise)
+    monkeypatch.setattr("src.fraud_intel.labels.eligibility.create_default_label_assessment_store", lambda database: object())
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_main.main(
+            ["fraud-intel", "labels", "assess", "--channel", "online_banking", "--generation-run-id", "genrun-missing",
+             "--database", "aidp_test", "--json"]
+        )
+    assert exc_info.value.code == 2
+    assert json.loads(capsys.readouterr().out)["error"] == "CLIUserError"
 
 
 def test_labels_assess_never_trains_or_promotes():
