@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
+from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
@@ -205,6 +206,54 @@ class GenerationRunDatasetVersionError(ValueError):
     than silently pick one."""
 
 
+def validate_generation_run(channel: str, database: str, generation_run_id: str) -> str:
+    """Returns generation_run_id's single dataset_version for `channel` in
+    real Postgres, or raises UnknownGenerationRunError/
+    GenerationRunChannelMismatchError/GenerationRunDatasetVersionError.
+
+    Phase 7B Stage 8 corrective pass: the one shared implementation of
+    the 3-step generation-identity check this patch's three new call
+    sites (load_resolved_alert_outcomes, load_resolved_alert_scoring_
+    contexts, and the cold-start CLI handler) all need identically.
+    load_channel_population() below and
+    src.fraud_intel.scoring.dispatch._PostgresScoringDataAccess.
+    validate_generation_run() keep their own pre-existing inline copies
+    of this same check unchanged -- out of this patch's scope."""
+    conn = get_connection(database)
+    try:
+        with conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT DISTINCT channel FROM channel_events WHERE generation_run_id = %s", (generation_run_id,)
+                )
+                existing_channels = {row["channel"] for row in cur.fetchall()}
+                if not existing_channels:
+                    raise UnknownGenerationRunError(
+                        f"no channel_events rows found for generation_run_id {generation_run_id!r} -- it was never "
+                        "generated, or generation itself failed and rolled back"
+                    )
+                if existing_channels != {channel}:
+                    raise GenerationRunChannelMismatchError(
+                        f"generation_run_id {generation_run_id!r} belongs to channel(s) {sorted(existing_channels)!r}, "
+                        f"not {channel!r}"
+                    )
+
+                cur.execute(
+                    "SELECT DISTINCT dataset_version FROM channel_events "
+                    "WHERE channel = %s AND generation_run_id = %s",
+                    (channel, generation_run_id),
+                )
+                dataset_versions = [row["dataset_version"] for row in cur.fetchall()]
+                if len(dataset_versions) != 1:
+                    raise GenerationRunDatasetVersionError(
+                        f"generation_run_id {generation_run_id!r} has {len(dataset_versions)} distinct "
+                        f"dataset_version value(s) for channel {channel!r} -- expected exactly 1"
+                    )
+                return dataset_versions[0]
+    finally:
+        conn.close()
+
+
 def load_channel_population(
     channel: str, database: str, *, generation_run_id: str,
 ) -> tuple[list[FraudEvent], list[SourceAlertContext], list[SyntheticGroundTruthLabel]]:
@@ -305,18 +354,58 @@ def load_channel_population(
 # ---- evaluation data access (Phase 7A corrective pass) --------------------------------
 
 
-def load_resolved_alert_outcomes(channel: str, database: str) -> list[AlertOutcome]:
+class IncompleteResolvedPopulationError(RuntimeError):
+    """A resolved & eligible alert (latest label_assessments row has
+    eligibility_result=true and a resolved FRAUD/LEGITIMATE label) has no
+    alert_evidence row for the CURRENT OPERATIONAL bundle -- live
+    evaluation must fail cleanly rather than silently evaluate a partial
+    population (Phase 7B Stage 8 corrective pass)."""
+
+
+@dataclass(frozen=True)
+class ResolvedAlertOutcomePopulation:
+    """load_resolved_alert_outcomes()'s full result: the AlertOutcome rows
+    themselves plus the completeness counts a caller needs to prove the
+    evaluated population is NOT partial before trusting any metric built
+    from it."""
+
+    source_dataset_version: str
+    resolved_eligible_count: int
+    evaluated_count: int
+    missing_current_bundle_evidence_count: int
+    degraded_evidence_count: int
+    outcomes: list[AlertOutcome]
+
+
+def load_resolved_alert_outcomes(
+    channel: str, database: str, *, generation_run_id: str, operational_bundle_id: int
+) -> ResolvedAlertOutcomePopulation:
     """Real Postgres read backing `aidp fraud-intel evaluate`. Reviewed as
     SQL, not exercised by any unit test -- every CLI/evaluation test
     supplies fixture AlertOutcome rows directly. One row per fraud_alerts
-    row that has both a latest alert_evidence row and a latest,
-    ELIGIBLE, RESOLVED label_assessments row -- never an unresolved or
-    ineligible alert. `baseline_priority_score` is recomputed for real
-    from the stored evidence's own rule_result.score_contribution via the
-    SAME compute_operational_priority_score() mechanism used everywhere
-    else in this codebase, weight_gbm=weight_anomaly=weight_graph=0 on the
-    channel's real EnsemblePolicy -- never a separately-implemented
-    formula (guide section 21)."""
+    row that has both a latest, ELIGIBLE, RESOLVED label_assessments row
+    AND belongs to `generation_run_id` (via channel_events) -- never an
+    unresolved, ineligible, or cross-generation alert.
+
+    Phase 7B Stage 8 corrective pass: `generation_run_id` and
+    `operational_bundle_id` are now both required. Evidence is looked up
+    with an explicit `channel_model_bundle_id = operational_bundle_id`
+    filter (a LEFT JOIN, so a resolved & eligible alert with NO evidence
+    under the CURRENT bundle still appears in the raw row set, as a row
+    with NULL evidence, rather than silently disappearing or falling back
+    to an older/candidate bundle's evidence) -- this is what lets this
+    function count `missing_current_bundle_evidence_count` and refuse
+    (via IncompleteResolvedPopulationError) rather than evaluate a partial
+    population. Degraded current-bundle evidence is NOT excluded -- it is
+    a completed, auditable scoring attempt and stays part of the
+    evaluated population (only counted separately, via
+    `degraded_evidence_count`). `baseline_priority_score` is recomputed
+    for real from the stored evidence's own rule_result.score_contribution
+    via the SAME compute_operational_priority_score() mechanism used
+    everywhere else in this codebase, weight_gbm=weight_anomaly=
+    weight_graph=0 on the channel's real EnsemblePolicy -- never a
+    separately-implemented formula (guide section 21)."""
+    dataset_version = validate_generation_run(channel, database, generation_run_id)
     policy = load_ensemble_policy(channel)
     baseline_policy = policy.model_copy(update={"weight_gbm": 0.0, "weight_anomaly": 0.0, "weight_graph": 0.0})
 
@@ -326,27 +415,44 @@ def load_resolved_alert_outcomes(channel: str, database: str) -> list[AlertOutco
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(
                     """
-                    SELECT fa.source_alert_id, fa.channel, ev.rule_result, ev.operational_priority_score,
-                           ev.priority_band, ev.event_time, la.resolved_label
+                    SELECT fa.source_alert_id, fa.channel, la.resolved_label,
+                           ev.evidence_id, ev.rule_result, ev.operational_priority_score,
+                           ev.priority_band, ev.event_time, ev.degraded
                     FROM fraud_alerts fa
-                    JOIN LATERAL (
-                        SELECT * FROM alert_evidence WHERE alert_id = fa.alert_id
-                        ORDER BY scored_at DESC, evidence_id DESC LIMIT 1
-                    ) ev ON true
+                    JOIN channel_events ce ON ce.event_id = fa.event_id
                     JOIN LATERAL (
                         SELECT * FROM label_assessments WHERE alert_id = fa.alert_id
                         ORDER BY evaluated_at DESC, assessment_id DESC LIMIT 1
                     ) la ON true
-                    WHERE fa.channel = %s AND la.eligibility_result = true
+                    LEFT JOIN LATERAL (
+                        SELECT * FROM alert_evidence
+                        WHERE alert_id = fa.alert_id AND channel_model_bundle_id = %s
+                        ORDER BY scored_at DESC, evidence_id DESC LIMIT 1
+                    ) ev ON true
+                    WHERE fa.channel = %s AND ce.generation_run_id = %s
+                      AND la.eligibility_result = true
                       AND la.resolved_label IN ('RESOLVED_FRAUD', 'RESOLVED_LEGITIMATE')
                     """,
-                    (channel,),
+                    (operational_bundle_id, channel, generation_run_id),
                 )
                 rows = cur.fetchall()
     finally:
         conn.close()
 
-    outcomes = []
+    resolved_eligible_count = len(rows)
+    missing_rows = [row for row in rows if row["evidence_id"] is None]
+    missing_current_bundle_evidence_count = len(missing_rows)
+    if missing_current_bundle_evidence_count > 0:
+        sample = missing_rows[0]
+        raise IncompleteResolvedPopulationError(
+            f"{missing_current_bundle_evidence_count} of {resolved_eligible_count} resolved & eligible alert(s) "
+            f"for channel {channel!r} generation_run_id {generation_run_id!r} have no alert_evidence row for the "
+            f"current OPERATIONAL bundle_id {operational_bundle_id!r} (e.g. source_alert_id="
+            f"{sample['source_alert_id']!r}) -- refusing to evaluate a partial population"
+        )
+
+    degraded_evidence_count = sum(1 for row in rows if row["degraded"])
+    outcomes: list[AlertOutcome] = []
     for row in rows:
         rule_score_contribution = (row["rule_result"] or {}).get("score_contribution", 0.0)
         baseline_score = compute_operational_priority_score(
@@ -360,7 +466,14 @@ def load_resolved_alert_outcomes(channel: str, database: str) -> list[AlertOutco
                 priority_band=row["priority_band"], resolved_label=row["resolved_label"],
             )
         )
-    return outcomes
+    return ResolvedAlertOutcomePopulation(
+        source_dataset_version=dataset_version,
+        resolved_eligible_count=resolved_eligible_count,
+        evaluated_count=len(outcomes),
+        missing_current_bundle_evidence_count=missing_current_bundle_evidence_count,
+        degraded_evidence_count=degraded_evidence_count,
+        outcomes=outcomes,
+    )
 
 
 _MAX_HISTORICAL_EVENTS_PER_ALERT = 1000
@@ -368,16 +481,28 @@ _MAX_SOURCE_ALERT_HISTORY_PER_ALERT = 200
 _MAX_RESOLVED_FRAUD_EVIDENCE_ROWS = 500
 
 
-def load_resolved_alert_scoring_contexts(channel: str, database: str) -> list[CandidateScoringInput]:
+def load_resolved_alert_scoring_contexts(
+    channel: str, database: str, *, generation_run_id: str
+) -> tuple[str, list[CandidateScoringInput]]:
     """Real Postgres read backing the OPTIONAL shadow-candidate
     comparison. Reviewed as SQL, not exercised. For every RESOLVED,
-    ELIGIBLE alert in `channel` (the same population
-    load_resolved_alert_outcomes() reads), reconstructs its full
-    event-time scoring context -- event, source_alert,
-    FeatureComputationContext (historical_events/source_alert_history),
-    resolved_fraud_evidence -- the exact same shape and query pattern
+    ELIGIBLE alert in `channel` AND `generation_run_id` (the same
+    channel+generation+resolved+eligible criteria
+    load_resolved_alert_outcomes() applies -- so the two functions'
+    result populations share exactly the same source_alert_ids whenever
+    load_resolved_alert_outcomes() itself succeeds, i.e. whenever every
+    resolved & eligible alert also has current-bundle evidence),
+    reconstructs its full event-time scoring context -- event,
+    source_alert, FeatureComputationContext (historical_events/
+    source_alert_history), resolved_fraud_evidence -- the exact same
+    shape and query pattern
     src.fraud_intel.scoring.dispatch._PostgresScoringDataAccess.list_pending()
     already builds for PENDING alerts, here for ALREADY-resolved ones.
+
+    Phase 7B Stage 8 corrective pass: `generation_run_id` is now
+    required, validated via the same shared validate_generation_run()
+    this module's other generation-scoped loaders use; returns the
+    generation's own dataset_version alongside the contexts.
 
     This function only READS. The candidate bundle is re-scored against
     these contexts in memory, via src.fraud_intel.evaluation.
@@ -388,6 +513,7 @@ def load_resolved_alert_scoring_contexts(channel: str, database: str) -> list[Ca
     removed and replaced by this real, in-memory-scoring-oriented read."""
     from src.fraud_intel.graph.entity_graph import ResolvedFraudEntityEvidence
 
+    dataset_version = validate_generation_run(channel, database, generation_run_id)
     payload_class = get_channel_adapter(channel).payload_class
     conn = get_connection(database)
     try:
@@ -411,10 +537,10 @@ def load_resolved_alert_scoring_contexts(channel: str, database: str) -> list[Ca
                         SELECT * FROM label_assessments WHERE alert_id = fa.alert_id
                         ORDER BY evaluated_at DESC, assessment_id DESC LIMIT 1
                     ) la ON true
-                    WHERE fa.channel = %s AND la.eligibility_result = true
+                    WHERE fa.channel = %s AND ce.generation_run_id = %s AND la.eligibility_result = true
                       AND la.resolved_label IN ('RESOLVED_FRAUD', 'RESOLVED_LEGITIMATE')
                     """,
-                    (channel,),
+                    (channel, generation_run_id),
                 )
                 alert_rows = cur.fetchall()
 
@@ -505,7 +631,7 @@ def load_resolved_alert_scoring_contexts(channel: str, database: str) -> list[Ca
                     )
     finally:
         conn.close()
-    return items
+    return dataset_version, items
 
 
 def load_alert_label_bases(

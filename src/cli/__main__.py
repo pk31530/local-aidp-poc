@@ -296,7 +296,7 @@ def _handle_fraud_intel_score(args: argparse.Namespace) -> dict:
         raise CLIUserError(str(exc)) from exc
 
 
-def _evaluate_candidate_cold_start(args: argparse.Namespace, database: str) -> dict:
+def _evaluate_candidate_cold_start(args: argparse.Namespace, database: str, *, generation_run_id: str) -> dict:
     """No OPERATIONAL bundle exists yet for this channel -- there is
     structurally no live scored population to evaluate against
     (fraud_alerts/alert_evidence/label_assessments are only ever created
@@ -308,7 +308,20 @@ def _evaluate_candidate_cold_start(args: argparse.Namespace, database: str) -> d
     does not match the bundle it is attached to, evaluation fails and
     `promotion_gate_result` is never produced -- promotion remains
     blocked (promote is a separate command requiring its own separate
-    approval regardless, but this function also never calls it)."""
+    approval regardless, but this function also never calls it).
+
+    Phase 7B Stage 8 corrective pass: `generation_run_id` is now
+    required and must match the SAME generation the candidate was
+    trained on -- both the report's own pinned `source_generation_run_id`
+    (a stale/hand-edited report could disagree with its own bundle) and,
+    independently, the real Postgres generation-identity check (via
+    validate_generation_run()) against the report's pinned
+    `source_dataset_version` (a defense against a generation whose
+    dataset_version has since diverged from what the candidate was
+    actually trained on). Fails cleanly, before ever calling the cold-
+    start promotion gate, on either mismatch -- the gate logic itself
+    (evaluate_cold_start_promotion_gate()) is unchanged."""
+    from src.fraud_intel.cli_data_access import validate_generation_run
     from src.fraud_intel.evaluation.cold_start import ColdStartReportError, evaluate_cold_start_promotion_gate, load_and_validate_cold_start_report
 
     promotion_store = create_default_bundle_promotion_store(database)
@@ -322,10 +335,27 @@ def _evaluate_candidate_cold_start(args: argparse.Namespace, database: str) -> d
     except ColdStartReportError as exc:
         raise CLIUserError(str(exc)) from exc
 
+    if report.source_generation_run_id != generation_run_id:
+        raise CLIUserError(
+            f"--generation-run-id {generation_run_id!r} does not match candidate bundle "
+            f"{candidate_bundle.bundle_id!r}'s training generation_run_id "
+            f"{report.source_generation_run_id!r} -- cold-start evaluation must use the SAME generation "
+            "the candidate was trained on"
+        )
+    real_dataset_version = validate_generation_run(args.channel, database, generation_run_id)
+    if real_dataset_version != report.source_dataset_version:
+        raise CLIUserError(
+            f"generation_run_id {generation_run_id!r}'s current dataset_version {real_dataset_version!r} does "
+            f"not match candidate bundle {candidate_bundle.bundle_id!r}'s pinned source_dataset_version "
+            f"{report.source_dataset_version!r}"
+        )
+
     gate = evaluate_cold_start_promotion_gate(report)
 
     return {
         "channel": args.channel,
+        "generation_run_id": generation_run_id,
+        "source_dataset_version": report.source_dataset_version,
         "evaluation_mode": "candidate_training_holdout",
         "operational_bundle": None,
         "operational_evaluation": None,
@@ -357,7 +387,9 @@ def _evaluate_candidate_cold_start(args: argparse.Namespace, database: str) -> d
     }
 
 
-def _evaluate_live(args: argparse.Namespace, database: str, operational_bundle, capacity) -> dict:
+def _evaluate_live(
+    args: argparse.Namespace, database: str, operational_bundle, capacity, *, generation_run_id: str
+) -> dict:
     """An OPERATIONAL bundle exists -- evaluates the real, live,
     source-alerted, RESOLVED population (src.fraud_intel.evaluation.
     cross_channel), with an OPTIONAL shadow-candidate comparison when
@@ -366,11 +398,25 @@ def _evaluate_live(args: argparse.Namespace, database: str, operational_bundle, 
     bundle IN MEMORY, via the pure score_source_alert() path
     (src.fraud_intel.evaluation.shadow_candidate.score_candidate_shadow())
     -- never score_and_record_alert(), never a fraud_alerts/alert_evidence
-    write, never a promotion."""
+    write, never a promotion. No RunLifecycle anywhere in this function --
+    evaluation remains entirely read-only (Phase 7B Stage 8 decision).
+
+    Phase 7B Stage 8 corrective pass: `generation_run_id` and
+    `operational_bundle.bundle_id` are both threaded into
+    load_resolved_alert_outcomes(), which itself fails
+    (IncompleteResolvedPopulationError, caught by the CLI handler) rather
+    than silently evaluating a partial population -- see that function's
+    own docstring. The optional shadow-candidate path is scoped to the
+    SAME generation via load_resolved_alert_scoring_contexts(), so its
+    candidate population shares exactly the operational population's
+    source_alert_ids."""
     from src.fraud_intel.cli_data_access import load_resolved_alert_outcomes
     from src.fraud_intel.evaluation.cross_channel import evaluate_channel
 
-    outcomes = load_resolved_alert_outcomes(args.channel, database)
+    population = load_resolved_alert_outcomes(
+        args.channel, database, generation_run_id=generation_run_id, operational_bundle_id=operational_bundle.bundle_id
+    )
+    outcomes = population.outcomes
     try:
         operational_result = evaluate_channel(args.channel, outcomes, capacity=capacity, recall_target=args.recall_target)
     except ValueError as exc:
@@ -381,6 +427,14 @@ def _evaluate_live(args: argparse.Namespace, database: str, operational_bundle, 
 
     result: dict = {
         "channel": args.channel,
+        "generation_run_id": generation_run_id,
+        "source_dataset_version": population.source_dataset_version,
+        "operational_bundle_id": operational_bundle.bundle_id,
+        "operational_bundle_version": operational_bundle.bundle_version,
+        "resolved_eligible_count": population.resolved_eligible_count,
+        "evaluated_count": population.evaluated_count,
+        "missing_current_bundle_evidence_count": population.missing_current_bundle_evidence_count,
+        "degraded_evidence_count": population.degraded_evidence_count,
         "evaluation_mode": "live_resolved_alerts",
         "operational_bundle": {"bundle_id": operational_bundle.bundle_id, "bundle_version": operational_bundle.bundle_version},
         "operational_evaluation": operational_dump,
@@ -418,7 +472,7 @@ def _evaluate_live(args: argparse.Namespace, database: str, operational_bundle, 
             raise CLIUserError(str(exc)) from exc
         loaded_candidate_bundle = create_default_bundle_artifact_loader().load(candidate_bundle)
 
-        scoring_inputs = load_resolved_alert_scoring_contexts(args.channel, database)
+        _, scoring_inputs = load_resolved_alert_scoring_contexts(args.channel, database, generation_run_id=generation_run_id)
         candidate_scores, candidate_errors = score_candidate_shadow(
             scoring_inputs, bundle=loaded_candidate_bundle, rule_provider=rule_provider,
             ensemble_policy=ensemble_policy, graph_policy=graph_policy,
@@ -450,9 +504,20 @@ def _handle_fraud_intel_evaluate(args: argparse.Namespace) -> dict:
     mode -- no implicit default anywhere (Phase 7A decision 6); the live
     mode uses them directly, the cold-start mode ignores them (its gate
     has no capacity/recall-target concept -- there is no live population
-    to rank)."""
+    to rank).
+
+    Phase 7B Stage 8 corrective pass: --generation-run-id is now
+    required, same contract as train/score/labels assess's own
+    required-but-not-argparse-required flag -- evaluation must never
+    silently evaluate every resolved alert for a channel across every
+    generation ever run."""
     database = _require_database(args)
     _require_implemented_channel(args.channel)
+    if not args.generation_run_id:
+        raise CLIUserError(
+            "--generation-run-id is required for evaluation -- evaluation must never silently evaluate "
+            "every resolved alert for a channel across every generation ever run"
+        )
 
     from src.fraud_intel.evaluation.capacity import CountCapacity, FractionCapacity
 
@@ -473,9 +538,24 @@ def _handle_fraud_intel_evaluate(args: argparse.Namespace) -> dict:
             "nothing to evaluate"
         )
 
-    if operational_bundle is None:
-        return _evaluate_candidate_cold_start(args, database)
-    return _evaluate_live(args, database, operational_bundle, capacity)
+    from src.fraud_intel.cli_data_access import (
+        GenerationRunChannelMismatchError,
+        GenerationRunDatasetVersionError,
+        IncompleteResolvedPopulationError,
+        UnknownGenerationRunError,
+    )
+
+    try:
+        if operational_bundle is None:
+            return _evaluate_candidate_cold_start(args, database, generation_run_id=args.generation_run_id)
+        return _evaluate_live(args, database, operational_bundle, capacity, generation_run_id=args.generation_run_id)
+    except (
+        UnknownGenerationRunError,
+        GenerationRunChannelMismatchError,
+        GenerationRunDatasetVersionError,
+        IncompleteResolvedPopulationError,
+    ) as exc:
+        raise CLIUserError(str(exc)) from exc
 
 
 class _MlflowModelVersionVerifier:
@@ -795,6 +875,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="real per-channel evaluation (operational + rules-only baseline + optional shadow-candidate comparison)",
     )
     fi_evaluate_p.add_argument("--channel", required=True, choices=sorted(FRAUD_INTEL_IMPLEMENTED_CHANNELS))
+    # Not argparse `required=True` -- validated inside the handler (after
+    # --database), matching train's/score's/labels-assess's own
+    # --generation-run-id contract: a missing value is a clean
+    # CLIUserError/JSON error, not argparse's own unformatted usage exit.
+    fi_evaluate_p.add_argument("--generation-run-id", dest="generation_run_id", default=None)
     # No implicit default anywhere (Phase 7A decision 6) -- capacity mode/
     # value and the recall target must always be explicitly supplied.
     fi_evaluate_p.add_argument("--capacity-mode", required=True, choices=("count", "fraction"), dest="capacity_mode")

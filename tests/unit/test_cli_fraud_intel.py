@@ -513,6 +513,9 @@ def test_no_phase7b_required_handler_returns_a_phase_scope_placeholder_dict():
 # ---- fraud-intel evaluate: real Phase 7A evaluation (corrective pass) -----------------
 
 
+GENRUN = "genrun-3e8516ce803e5d82"
+
+
 def _outcome_fixtures():
     import uuid
 
@@ -531,17 +534,42 @@ def _outcome_fixtures():
     ]
 
 
+def _population(outcomes, *, dataset_version="dsv-3e8516ce803e5d82", missing=0, degraded=0):
+    from src.fraud_intel.cli_data_access import ResolvedAlertOutcomePopulation
+
+    return ResolvedAlertOutcomePopulation(
+        source_dataset_version=dataset_version,
+        resolved_eligible_count=len(outcomes) + missing,
+        evaluated_count=len(outcomes),
+        missing_current_bundle_evidence_count=missing,
+        degraded_evidence_count=degraded,
+        outcomes=outcomes,
+    )
+
+
 def test_evaluate_returns_operational_and_baseline_sections_without_a_candidate(monkeypatch, capsys):
     outcomes = _outcome_fixtures()
-    monkeypatch.setattr("src.fraud_intel.cli_data_access.load_resolved_alert_outcomes", lambda channel, database: outcomes)
+    monkeypatch.setattr(
+        "src.fraud_intel.cli_data_access.load_resolved_alert_outcomes",
+        lambda channel, database, *, generation_run_id, operational_bundle_id: _population(outcomes),
+    )
     monkeypatch.setattr(cli_main, "_get_operational_bundle", lambda channel, database: _bundle())
 
     cli_main.main(
-        ["fraud-intel", "evaluate", "--channel", "online_banking", "--capacity-mode", "count", "--capacity-value", "2", "--recall-target", "0.8", "--database", "aidp_test", "--json"]
+        ["fraud-intel", "evaluate", "--channel", "online_banking", "--generation-run-id", GENRUN,
+         "--capacity-mode", "count", "--capacity-value", "2", "--recall-target", "0.8", "--database", "aidp_test", "--json"]
     )
 
     result = json.loads(capsys.readouterr().out)
     assert result["channel"] == "online_banking"
+    assert result["generation_run_id"] == GENRUN
+    assert result["source_dataset_version"] == "dsv-3e8516ce803e5d82"
+    assert result["operational_bundle_id"] == _bundle().bundle_id
+    assert result["operational_bundle_version"] == _bundle().bundle_version
+    assert result["resolved_eligible_count"] == 4
+    assert result["evaluated_count"] == 4
+    assert result["missing_current_bundle_evidence_count"] == 0
+    assert result["degraded_evidence_count"] == 0
     assert result["operational_bundle"] == {"bundle_id": _bundle().bundle_id, "bundle_version": _bundle().bundle_version}
     assert "rules_only_baseline" not in result["operational_evaluation"]  # clearly separated out, not nested
     assert result["rules_only_baseline"]["pr_auc"]["status"] in ("ok", "non_computable_single_class", "non_computable_empty")
@@ -580,8 +608,14 @@ def test_evaluate_includes_shadow_candidate_comparison_when_requested(monkeypatc
         assert bundle == "fake-loaded-candidate-bundle"
         return candidate_scores, []
 
-    monkeypatch.setattr("src.fraud_intel.cli_data_access.load_resolved_alert_outcomes", lambda channel, database: outcomes)
-    monkeypatch.setattr("src.fraud_intel.cli_data_access.load_resolved_alert_scoring_contexts", lambda channel, database: [])
+    monkeypatch.setattr(
+        "src.fraud_intel.cli_data_access.load_resolved_alert_outcomes",
+        lambda channel, database, *, generation_run_id, operational_bundle_id: _population(outcomes),
+    )
+    monkeypatch.setattr(
+        "src.fraud_intel.cli_data_access.load_resolved_alert_scoring_contexts",
+        lambda channel, database, *, generation_run_id: ("dsv-3e8516ce803e5d82", []),
+    )
     monkeypatch.setattr("src.fraud_intel.scoring.dispatch.load_and_validate_pinned_policies", lambda bundle_record: (None, None, None))
     monkeypatch.setattr("src.fraud_intel.scoring.dispatch.create_default_bundle_artifact_loader", lambda: _FakeArtifactLoader())
     monkeypatch.setattr("src.fraud_intel.evaluation.shadow_candidate.score_candidate_shadow", _fake_score_candidate_shadow)
@@ -589,7 +623,8 @@ def test_evaluate_includes_shadow_candidate_comparison_when_requested(monkeypatc
     monkeypatch.setattr(cli_main, "create_default_bundle_promotion_store", lambda database: _FakePromotionStore())
 
     cli_main.main(
-        ["fraud-intel", "evaluate", "--channel", "online_banking", "--capacity-mode", "count", "--capacity-value", "2",
+        ["fraud-intel", "evaluate", "--channel", "online_banking", "--generation-run-id", GENRUN,
+         "--capacity-mode", "count", "--capacity-value", "2",
          "--recall-target", "0.8", "--candidate-bundle-version", "3", "--database", "aidp_test", "--json"]
     )
 
@@ -619,8 +654,14 @@ def test_evaluate_surfaces_candidate_scoring_errors_without_failing_the_command(
     def _fake_score_candidate_shadow(scoring_inputs, *, bundle, rule_provider, ensemble_policy, graph_policy, **kwargs):
         return [], [scoring_error]
 
-    monkeypatch.setattr("src.fraud_intel.cli_data_access.load_resolved_alert_outcomes", lambda channel, database: outcomes)
-    monkeypatch.setattr("src.fraud_intel.cli_data_access.load_resolved_alert_scoring_contexts", lambda channel, database: [])
+    monkeypatch.setattr(
+        "src.fraud_intel.cli_data_access.load_resolved_alert_outcomes",
+        lambda channel, database, *, generation_run_id, operational_bundle_id: _population(outcomes),
+    )
+    monkeypatch.setattr(
+        "src.fraud_intel.cli_data_access.load_resolved_alert_scoring_contexts",
+        lambda channel, database, *, generation_run_id: ("dsv-3e8516ce803e5d82", []),
+    )
     monkeypatch.setattr("src.fraud_intel.scoring.dispatch.load_and_validate_pinned_policies", lambda bundle_record: (None, None, None))
     monkeypatch.setattr("src.fraud_intel.scoring.dispatch.create_default_bundle_artifact_loader", lambda: _FakeArtifactLoader())
     monkeypatch.setattr("src.fraud_intel.evaluation.shadow_candidate.score_candidate_shadow", _fake_score_candidate_shadow)
@@ -628,7 +669,8 @@ def test_evaluate_surfaces_candidate_scoring_errors_without_failing_the_command(
     monkeypatch.setattr(cli_main, "create_default_bundle_promotion_store", lambda database: _FakePromotionStore())
 
     cli_main.main(
-        ["fraud-intel", "evaluate", "--channel", "online_banking", "--capacity-mode", "count", "--capacity-value", "2",
+        ["fraud-intel", "evaluate", "--channel", "online_banking", "--generation-run-id", GENRUN,
+         "--capacity-mode", "count", "--capacity-value", "2",
          "--recall-target", "0.8", "--candidate-bundle-version", "3", "--database", "aidp_test", "--json"]
     )
 
@@ -646,13 +688,17 @@ def test_evaluate_unknown_candidate_bundle_version_is_a_cli_user_error(monkeypat
         def get_bundle(self, channel, bundle_version):
             raise LookupError(f"no bundle version {bundle_version} for channel {channel!r}")
 
-    monkeypatch.setattr("src.fraud_intel.cli_data_access.load_resolved_alert_outcomes", lambda channel, database: outcomes)
+    monkeypatch.setattr(
+        "src.fraud_intel.cli_data_access.load_resolved_alert_outcomes",
+        lambda channel, database, *, generation_run_id, operational_bundle_id: _population(outcomes),
+    )
     monkeypatch.setattr(cli_main, "_get_operational_bundle", lambda channel, database: _bundle())
     monkeypatch.setattr(cli_main, "create_default_bundle_promotion_store", lambda database: _FakePromotionStore())
 
     with pytest.raises(SystemExit) as exc_info:
         cli_main.main(
-            ["fraud-intel", "evaluate", "--channel", "online_banking", "--capacity-mode", "count", "--capacity-value", "2",
+            ["fraud-intel", "evaluate", "--channel", "online_banking", "--generation-run-id", GENRUN,
+             "--capacity-mode", "count", "--capacity-value", "2",
              "--recall-target", "0.8", "--candidate-bundle-version", "999", "--database", "aidp_test", "--json"]
         )
     assert exc_info.value.code == 2
@@ -664,10 +710,28 @@ def test_evaluate_no_operational_bundle_is_a_cli_user_error(monkeypatch, capsys)
 
     with pytest.raises(SystemExit) as exc_info:
         cli_main.main(
-            ["fraud-intel", "evaluate", "--channel", "online_banking", "--capacity-mode", "count", "--capacity-value", "2", "--recall-target", "0.8", "--database", "aidp_test", "--json"]
+            ["fraud-intel", "evaluate", "--channel", "online_banking", "--generation-run-id", GENRUN,
+             "--capacity-mode", "count", "--capacity-value", "2", "--recall-target", "0.8", "--database", "aidp_test", "--json"]
         )
     assert exc_info.value.code == 2
     assert json.loads(capsys.readouterr().out)["error"] == "CLIUserError"
+
+
+def test_evaluate_missing_generation_run_id_is_a_cli_user_error(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "src.fraud_intel.cli_data_access.load_resolved_alert_outcomes",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not be called")),
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_main.main(
+            ["fraud-intel", "evaluate", "--channel", "online_banking", "--capacity-mode", "count", "--capacity-value", "2",
+             "--recall-target", "0.8", "--database", "aidp_test", "--json"]
+        )
+    assert exc_info.value.code == 2
+    result = json.loads(capsys.readouterr().out)
+    assert result["error"] == "CLIUserError"
+    assert "--generation-run-id" in result["message"]
 
 
 def test_evaluate_missing_required_capacity_or_recall_flags_fails_at_argparse_level(capsys):
@@ -677,12 +741,16 @@ def test_evaluate_missing_required_capacity_or_recall_flags_fails_at_argparse_le
 
 
 def test_evaluate_invalid_capacity_value_is_a_cli_user_error(monkeypatch, capsys):
-    monkeypatch.setattr("src.fraud_intel.cli_data_access.load_resolved_alert_outcomes", lambda channel, database: [])
+    monkeypatch.setattr(
+        "src.fraud_intel.cli_data_access.load_resolved_alert_outcomes",
+        lambda channel, database, *, generation_run_id, operational_bundle_id: _population([]),
+    )
     monkeypatch.setattr(cli_main, "_get_operational_bundle", lambda channel, database: _bundle())
 
     with pytest.raises(SystemExit) as exc_info:
         cli_main.main(
-            ["fraud-intel", "evaluate", "--channel", "online_banking", "--capacity-mode", "count", "--capacity-value", "-5",
+            ["fraud-intel", "evaluate", "--channel", "online_banking", "--generation-run-id", GENRUN,
+             "--capacity-mode", "count", "--capacity-value", "-5",
              "--recall-target", "0.8", "--database", "aidp_test", "--json"]
         )
     assert exc_info.value.code == 2
@@ -693,11 +761,15 @@ def test_evaluate_scope_marker_no_longer_present(monkeypatch, capsys):
     """The removed Phase 6 placeholder marker must not reappear anywhere
     in real output."""
     outcomes = _outcome_fixtures()
-    monkeypatch.setattr("src.fraud_intel.cli_data_access.load_resolved_alert_outcomes", lambda channel, database: outcomes)
+    monkeypatch.setattr(
+        "src.fraud_intel.cli_data_access.load_resolved_alert_outcomes",
+        lambda channel, database, *, generation_run_id, operational_bundle_id: _population(outcomes),
+    )
     monkeypatch.setattr(cli_main, "_get_operational_bundle", lambda channel, database: _bundle())
 
     cli_main.main(
-        ["fraud-intel", "evaluate", "--channel", "online_banking", "--capacity-mode", "count", "--capacity-value", "2", "--recall-target", "0.8", "--database", "aidp_test", "--json"]
+        ["fraud-intel", "evaluate", "--channel", "online_banking", "--generation-run-id", GENRUN,
+         "--capacity-mode", "count", "--capacity-value", "2", "--recall-target", "0.8", "--database", "aidp_test", "--json"]
     )
     out = capsys.readouterr().out
     assert "reference_channel_phase6_only" not in out
@@ -752,14 +824,21 @@ def test_evaluate_candidate_only_cold_start_when_no_operational_bundle_exists(mo
 
     monkeypatch.setattr(cli_main, "_get_operational_bundle", lambda channel, database: None)
     monkeypatch.setattr(cli_main, "create_default_bundle_promotion_store", lambda database: _FakePromotionStore())
+    monkeypatch.setattr(
+        "src.fraud_intel.cli_data_access.validate_generation_run",
+        lambda channel, database, generation_run_id: "dsv-3e8516ce803e5d82",
+    )
 
     cli_main.main(
-        ["fraud-intel", "evaluate", "--channel", "online_banking", "--capacity-mode", "count", "--capacity-value", "2",
+        ["fraud-intel", "evaluate", "--channel", "online_banking", "--generation-run-id", GENRUN,
+         "--capacity-mode", "count", "--capacity-value", "2",
          "--recall-target", "0.8", "--candidate-bundle-version", "4", "--database", "aidp_test", "--json"]
     )
 
     result = json.loads(capsys.readouterr().out)
     assert result["evaluation_mode"] == "candidate_training_holdout"
+    assert result["generation_run_id"] == GENRUN
+    assert result["source_dataset_version"] == "dsv-3e8516ce803e5d82"
     assert result["operational_bundle"] is None
     assert result["shadow_candidate_comparison"] is None
     assert result["candidate_bundle"] == {"bundle_id": 9, "bundle_version": 4}
@@ -767,6 +846,56 @@ def test_evaluate_candidate_only_cold_start_when_no_operational_bundle_exists(mo
     assert result["rules_only_baseline"]["test_fraud_prevalence"] == 0.5
     assert result["promotion_gate_result"]["passed"] is True
     assert "NOT live operational evaluation" in result["disclaimer"]
+
+
+def test_evaluate_cold_start_generation_run_id_mismatch_blocks_evaluation(monkeypatch, capsys):
+    """The candidate was trained on a DIFFERENT generation_run_id than the
+    one requested -- must fail cleanly before ever calling the promotion
+    gate."""
+    candidate_bundle = _cold_start_candidate_bundle()
+
+    class _FakePromotionStore:
+        def get_bundle(self, channel, bundle_version):
+            return candidate_bundle
+
+    monkeypatch.setattr(cli_main, "_get_operational_bundle", lambda channel, database: None)
+    monkeypatch.setattr(cli_main, "create_default_bundle_promotion_store", lambda database: _FakePromotionStore())
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_main.main(
+            ["fraud-intel", "evaluate", "--channel", "online_banking", "--generation-run-id", "genrun-DIFFERENT",
+             "--capacity-mode", "count", "--capacity-value", "2",
+             "--recall-target", "0.8", "--candidate-bundle-version", "4", "--database", "aidp_test", "--json"]
+        )
+    assert exc_info.value.code == 2
+    assert json.loads(capsys.readouterr().out)["error"] == "CLIUserError"
+
+
+def test_evaluate_cold_start_source_dataset_version_mismatch_blocks_evaluation(monkeypatch, capsys):
+    """The requested generation_run_id's REAL current dataset_version
+    disagrees with the candidate's pinned source_dataset_version -- must
+    fail cleanly before ever calling the promotion gate."""
+    candidate_bundle = _cold_start_candidate_bundle()
+
+    class _FakePromotionStore:
+        def get_bundle(self, channel, bundle_version):
+            return candidate_bundle
+
+    monkeypatch.setattr(cli_main, "_get_operational_bundle", lambda channel, database: None)
+    monkeypatch.setattr(cli_main, "create_default_bundle_promotion_store", lambda database: _FakePromotionStore())
+    monkeypatch.setattr(
+        "src.fraud_intel.cli_data_access.validate_generation_run",
+        lambda channel, database, generation_run_id: "dsv-DIFFERENT-FROM-REPORT",
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_main.main(
+            ["fraud-intel", "evaluate", "--channel", "online_banking", "--generation-run-id", GENRUN,
+             "--capacity-mode", "count", "--capacity-value", "2",
+             "--recall-target", "0.8", "--candidate-bundle-version", "4", "--database", "aidp_test", "--json"]
+        )
+    assert exc_info.value.code == 2
+    assert json.loads(capsys.readouterr().out)["error"] == "CLIUserError"
 
 
 def test_evaluate_cold_start_report_bundle_mismatch_blocks_evaluation(monkeypatch, capsys):
@@ -788,7 +917,8 @@ def test_evaluate_cold_start_report_bundle_mismatch_blocks_evaluation(monkeypatc
 
     with pytest.raises(SystemExit) as exc_info:
         cli_main.main(
-            ["fraud-intel", "evaluate", "--channel", "online_banking", "--capacity-mode", "count", "--capacity-value", "2",
+            ["fraud-intel", "evaluate", "--channel", "online_banking", "--generation-run-id", GENRUN,
+             "--capacity-mode", "count", "--capacity-value", "2",
              "--recall-target", "0.8", "--candidate-bundle-version", "4", "--database", "aidp_test", "--json"]
         )
     assert exc_info.value.code == 2
@@ -807,7 +937,8 @@ def test_evaluate_cold_start_missing_report_blocks_evaluation(monkeypatch, capsy
 
     with pytest.raises(SystemExit) as exc_info:
         cli_main.main(
-            ["fraud-intel", "evaluate", "--channel", "online_banking", "--capacity-mode", "count", "--capacity-value", "2",
+            ["fraud-intel", "evaluate", "--channel", "online_banking", "--generation-run-id", GENRUN,
+             "--capacity-mode", "count", "--capacity-value", "2",
              "--recall-target", "0.8", "--candidate-bundle-version", "4", "--database", "aidp_test", "--json"]
         )
     assert exc_info.value.code == 2
@@ -835,20 +966,63 @@ def test_evaluate_live_mode_with_no_eligible_resolved_alerts_is_non_computable_n
     clause) -- when none exist yet, evaluation still runs cleanly under
     evaluation_mode=live_resolved_alerts rather than crashing or
     fabricating a result."""
-    monkeypatch.setattr("src.fraud_intel.cli_data_access.load_resolved_alert_outcomes", lambda channel, database: [])
+    monkeypatch.setattr(
+        "src.fraud_intel.cli_data_access.load_resolved_alert_outcomes",
+        lambda channel, database, *, generation_run_id, operational_bundle_id: _population([]),
+    )
     monkeypatch.setattr(cli_main, "_get_operational_bundle", lambda channel, database: _bundle())
 
     cli_main.main(
-        ["fraud-intel", "evaluate", "--channel", "online_banking", "--capacity-mode", "count", "--capacity-value", "2",
+        ["fraud-intel", "evaluate", "--channel", "online_banking", "--generation-run-id", GENRUN,
+         "--capacity-mode", "count", "--capacity-value", "2",
          "--recall-target", "0.8", "--database", "aidp_test", "--json"]
     )
 
     result = json.loads(capsys.readouterr().out)
     assert result["evaluation_mode"] == "live_resolved_alerts"
+    assert result["resolved_eligible_count"] == 0
+    assert result["evaluated_count"] == 0
     assert result["operational_evaluation"]["total_source_alerts"] == 0
     assert result["candidate_bundle"] is None
     assert result["candidate_evaluation"] is None
     assert result["promotion_gate_result"] is None
+
+
+def test_evaluate_incomplete_resolved_population_is_a_cli_user_error(monkeypatch, capsys):
+    """A resolved & eligible alert missing current-bundle evidence must
+    fail cleanly (IncompleteResolvedPopulationError), never silently
+    evaluate the partial population that IS available."""
+    from src.fraud_intel.cli_data_access import IncompleteResolvedPopulationError
+
+    def _raise(*a, **k):
+        raise IncompleteResolvedPopulationError("simulated partial population")
+
+    monkeypatch.setattr("src.fraud_intel.cli_data_access.load_resolved_alert_outcomes", _raise)
+    monkeypatch.setattr(cli_main, "_get_operational_bundle", lambda channel, database: _bundle())
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_main.main(
+            ["fraud-intel", "evaluate", "--channel", "online_banking", "--generation-run-id", GENRUN,
+             "--capacity-mode", "count", "--capacity-value", "2", "--recall-target", "0.8", "--database", "aidp_test", "--json"]
+        )
+    assert exc_info.value.code == 2
+    assert json.loads(capsys.readouterr().out)["error"] == "CLIUserError"
+
+
+def test_evaluate_no_run_lifecycle_or_database_write_is_introduced():
+    """AST-based (Phase 7A convention): neither _evaluate_live nor
+    _evaluate_candidate_cold_start's own source calls RunLifecycle --
+    evaluation remains entirely read-only (Phase 7B Stage 8 decision)."""
+    import ast
+    import inspect
+
+    for fn in (cli_main._evaluate_live, cli_main._evaluate_candidate_cold_start):
+        tree = ast.parse(inspect.getsource(fn))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func = node.func
+                name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+                assert name != "RunLifecycle", f"{fn.__name__} must never call RunLifecycle"
 
 
 # ---- fraud-intel promote ---------------------------------------------------------------
