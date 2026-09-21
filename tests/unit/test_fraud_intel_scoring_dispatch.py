@@ -212,6 +212,7 @@ def test_score_channel_end_to_end_with_one_pending_alert(monkeypatch):
         alert_queue_store=alert_store,
     )
 
+    assert result["pending_count"] == 1
     assert result["records_processed"] == 1
     assert result["records_rejected"] == 0
     assert result["bundle_id"] == 2
@@ -244,6 +245,7 @@ def test_score_channel_records_generation_and_dataset_provenance(monkeypatch):
     assert result["source_dataset_version"] == "dsv-42"
     assert result["bundle_id"] == 2
     assert result["bundle_version"] == 1
+    assert result["pending_count"] == 0
 
     run = run_store.get(result["run_id"])
     assert run.artifacts["channel"] == "online_banking"
@@ -269,9 +271,43 @@ def test_score_channel_with_no_pending_alerts_still_succeeds(monkeypatch):
         alert_queue_store=_FakeAlertQueueStore(),
     )
 
+    assert result["pending_count"] == 0
     assert result["records_processed"] == 0
     assert result["records_rejected"] == 0
     assert run_store.get(result["run_id"]).status == "SUCCESS"
+
+
+def test_zero_pending_rerun_records_all_three_counts_as_zero_in_both_places(monkeypatch):
+    """Combines what test_score_channel_with_no_pending_alerts_still_succeeds
+    and test_score_channel_records_generation_and_dataset_provenance each
+    checked separately: on a zero-pending rerun, the RunRecord's own
+    dedicated records_processed/records_rejected columns AND its
+    artifacts["pending_count"] are all 0 on the SAME successful run --
+    exactly what a real idempotent rerun (Stage 6) would produce once
+    every alert in a generation has already been scored against the
+    current bundle."""
+    monkeypatch.setattr("src.fraud_intel.scoring.dispatch.load_and_validate_pinned_policies", _fake_policies)
+    lifecycle, run_store = _lifecycle()
+
+    result = score_channel(
+        channel="online_banking", generation_run_id="genrun-1", lifecycle=lifecycle, data_access=_FakeDataAccess([]),
+        get_operational_bundle=lambda channel: _bundle_record(), artifact_loader=_FakeArtifactLoader(),
+        alert_queue_store=_FakeAlertQueueStore(),
+    )
+
+    assert result["pending_count"] == 0
+    assert result["records_processed"] == 0
+    assert result["records_rejected"] == 0
+
+    run = run_store.get(result["run_id"])
+    assert run.status == "SUCCESS"
+    assert run.records_processed == 0
+    assert run.records_rejected == 0
+    assert run.artifacts["pending_count"] == 0
+    # records_processed/records_rejected stay in their dedicated columns --
+    # never duplicated into the artifacts JSONB blob.
+    assert "records_processed" not in run.artifacts
+    assert "records_rejected" not in run.artifacts
 
 
 def test_score_channel_creates_no_label_assessment():

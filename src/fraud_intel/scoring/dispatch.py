@@ -559,6 +559,7 @@ def score_channel(
         "source_dataset_version": source_dataset_version,
         "bundle_id": bundle_record.bundle_id,
         "bundle_version": bundle_record.bundle_version,
+        "pending_count": len(pending_items),
         "records_processed": processed,
         "records_rejected": rejected,
         "alerts": alert_summaries,
