@@ -458,17 +458,33 @@ def _handle_fraud_intel_evaluate(args: argparse.Namespace) -> dict:
 
 
 class _MlflowModelVersionVerifier:
-    """Metadata-only -- never loads model weights, mirrors
-    src.common.mlflow_setup's existing pattern. Phase 7B Stage 5: when the
-    caller supplies `expected_run_id` (from the candidate's own
+    """Metadata-only -- never loads model weights, never registers/logs/
+    aliases/tags anything. Phase 7B Stage 5 corrective pass: this
+    verifier must be independently correct -- it calls configure_mlflow()
+    itself, on every single call, rather than relying on some other
+    command in the same process having already done so. Without this,
+    MlflowClient() targets MLflow's own default tracking URI, not this
+    project's configured one -- exactly the bug that made every real
+    promotion attempt fail with an opaque MlflowException, discovered
+    only on the first real promotion verification attempt. Follows the
+    same configure_mlflow()-then-MlflowClient() order
+    src.fraud_intel.scoring.dispatch._MlflowBundleArtifactLoader.load()
+    already uses.
+
+    When the caller supplies `expected_run_id` (from the candidate's own
     evaluation_report_ref), also confirms the registered version points
     at that exact MLflow run -- not merely that the version exists."""
 
     def verify(self, model_name: str, version: str, *, expected_run_id: str | None = None) -> bool:
         import mlflow
 
+        from src.common.mlflow_setup import configure_mlflow
+
+        configure_mlflow()
         client = mlflow.tracking.MlflowClient()
         model_version = client.get_model_version(model_name, version)
+        if model_version.status != "READY":
+            return False
         if expected_run_id is not None and model_version.run_id != expected_run_id:
             return False
         return True

@@ -865,6 +865,223 @@ def test_promote_maps_cold_start_report_error_to_cli_user_error(monkeypatch, cap
     assert json.loads(capsys.readouterr().out)["error"] == "CLIUserError"
 
 
+# ---- _MlflowModelVersionVerifier: Phase 7B Stage 5 configure_mlflow() corrective pass ----
+
+
+class _FakeModelVersion:
+    def __init__(self, *, status="READY", run_id="run-1"):
+        self.status = status
+        self.run_id = run_id
+
+
+def test_verifier_calls_configure_mlflow_before_constructing_mlflow_client(monkeypatch):
+    call_order = []
+    monkeypatch.setattr("src.common.mlflow_setup.configure_mlflow", lambda: call_order.append("configure"))
+
+    class _FakeClient:
+        def __init__(self):
+            call_order.append("client_constructed")
+
+        def get_model_version(self, model_name, version):
+            call_order.append("get_model_version")
+            return _FakeModelVersion(run_id="run-1")
+
+    import mlflow
+
+    monkeypatch.setattr(mlflow.tracking, "MlflowClient", _FakeClient)
+
+    verifier = cli_main._MlflowModelVersionVerifier()
+    result = verifier.verify("some-model", "1", expected_run_id="run-1")
+
+    assert result is True
+    assert call_order == ["configure", "client_constructed", "get_model_version"]
+
+
+def test_verifier_configures_mlflow_on_every_call_never_relying_on_ambient_state(monkeypatch):
+    """Proves the verifier does not skip configuration based on some
+    cached/ambient 'already configured' flag -- every single call
+    independently configures MLflow first, exactly as a genuinely fresh
+    process (no other command has run in it yet) would need."""
+    configure_calls = []
+    monkeypatch.setattr("src.common.mlflow_setup.configure_mlflow", lambda: configure_calls.append(1))
+
+    class _FakeClient:
+        def get_model_version(self, model_name, version):
+            return _FakeModelVersion(run_id="run-1")
+
+    import mlflow
+
+    monkeypatch.setattr(mlflow.tracking, "MlflowClient", _FakeClient)
+
+    verifier = cli_main._MlflowModelVersionVerifier()
+    verifier.verify("some-model", "1", expected_run_id="run-1")
+    verifier.verify("some-model", "1", expected_run_id="run-1")
+
+    assert len(configure_calls) == 2
+
+
+def test_verifier_passes_for_correct_name_version_and_run_id(monkeypatch):
+    monkeypatch.setattr("src.common.mlflow_setup.configure_mlflow", lambda: None)
+
+    class _FakeClient:
+        def get_model_version(self, model_name, version):
+            assert model_name == "fraud-detection-model-fraud-intel-online-banking-gbm"
+            assert version == "2"
+            return _FakeModelVersion(status="READY", run_id="run-gbm-1")
+
+    import mlflow
+
+    monkeypatch.setattr(mlflow.tracking, "MlflowClient", _FakeClient)
+
+    verifier = cli_main._MlflowModelVersionVerifier()
+    assert verifier.verify(
+        "fraud-detection-model-fraud-intel-online-banking-gbm", "2", expected_run_id="run-gbm-1"
+    ) is True
+
+
+@pytest.mark.parametrize(
+    "returned_version,expected_run_id",
+    [
+        (_FakeModelVersion(status="READY", run_id="run-WRONG"), "run-gbm-1"),  # wrong run_id
+        (_FakeModelVersion(status="PENDING_REGISTRATION", run_id="run-gbm-1"), "run-gbm-1"),  # not READY
+    ],
+)
+def test_verifier_fails_for_wrong_run_id_or_non_ready_status(monkeypatch, returned_version, expected_run_id):
+    monkeypatch.setattr("src.common.mlflow_setup.configure_mlflow", lambda: None)
+
+    class _FakeClient:
+        def get_model_version(self, model_name, version):
+            return returned_version
+
+    import mlflow
+
+    monkeypatch.setattr(mlflow.tracking, "MlflowClient", _FakeClient)
+
+    verifier = cli_main._MlflowModelVersionVerifier()
+    assert verifier.verify("some-model", "2", expected_run_id=expected_run_id) is False
+
+
+def test_configure_mlflow_failure_propagates_and_is_caught_as_a_verification_problem(monkeypatch):
+    """A configure_mlflow() failure must not be silently swallowed by the
+    verifier itself -- it propagates up to verify_bundle_components(),
+    which is the layer responsible for turning it into a reported
+    problem (and therefore a refused promotion)."""
+    from src.fraud_intel.models.bundle import _FakeChannelModelBundleStore
+    from src.fraud_intel.models.promotion import verify_bundle_components
+
+    def _raise():
+        raise ConnectionError("simulated MLflow tracking server unreachable")
+
+    monkeypatch.setattr("src.common.mlflow_setup.configure_mlflow", _raise)
+
+    store = _FakeChannelModelBundleStore()
+    bundle = store.register_candidate(
+        channel="online_banking", gbm_model_version="2", lr_model_version="2", anomaly_model_version="2",
+        preprocessing_artifact_version="pp-1", feature_schema_version="v1", rule_set_version="v1",
+        graph_policy_version="v1", ensemble_policy_version="v1", reason_code_version="v1",
+        training_run_id=5, dataset_version="cc49865cde175619", evaluation_report_ref="{}",
+    )
+
+    problems = verify_bundle_components(bundle, model_version_verifier=cli_main._MlflowModelVersionVerifier())
+    assert len(problems) == 3  # gbm, lr-shadow, anomaly all fail the same way
+    for p in problems:
+        assert "verification raised ConnectionError" in p
+
+
+def test_verifier_source_never_registers_aliases_tags_or_loads_model_weights():
+    """AST-based (Phase 7A convention): verify()'s own source never calls
+    anything that would register a model, set an alias/tag, log an
+    artifact, or load model weights -- metadata-only, read-only."""
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(cli_main._MlflowModelVersionVerifier.verify)))
+    forbidden = {
+        "set_registered_model_alias", "set_model_version_tag", "set_registered_model_tag",
+        "transition_model_version_stage", "delete_model_version", "create_model_version",
+        "log_model", "load_model", "register_model",
+    }
+    identifiers = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            identifiers.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            identifiers.add(node.attr)
+    assert not (identifiers & forbidden), f"verify() must stay read-only, found: {identifiers & forbidden}"
+
+
+def test_failed_verification_through_promote_bundle_produces_a_failed_model_promotion_run(monkeypatch):
+    """End-to-end (still no real MLflow/Postgres): promote_bundle() using
+    the REAL _MlflowModelVersionVerifier, whose configure_mlflow() is
+    made to fail -- proves the resulting BundleVerificationFailedError
+    still produces a FAILED model_promotion RunLifecycle record with the
+    original error_type preserved, and never mutates the candidate's
+    status."""
+    from datetime import datetime, timezone as tz
+
+    from src.control_plane.runs import RunLifecycle as RealRunLifecycle
+    from src.control_plane.runs import RunRecord
+    from src.fraud_intel.models import promotion as promotion_module
+    from src.fraud_intel.models.bundle import _FakeChannelModelBundleStore
+    from src.fraud_intel.models.promotion import BundleVerificationFailedError, _FakeBundlePromotionStore, promote_bundle
+
+    class _FakeRunStore:
+        def __init__(self):
+            self.rows: dict[int, dict] = {}
+            self._next_id = 1
+
+        def insert(self, row):
+            run_id = self._next_id
+            self._next_id += 1
+            full = {
+                "run_id": run_id, "trigger_source": None, "git_sha": None, "config_snapshot": None,
+                "config_hash": None, "dataset_version": None, "model_version": None, "error_type": None,
+                "error_message": None, "started_at": datetime.now(tz.utc), "heartbeat_at": None,
+                "completed_at": None, **row,
+            }
+            self.rows[run_id] = full
+            return RunRecord(**full)
+
+        def compare_and_set(self, run_id, allowed_from, updates):
+            current = self.rows.get(run_id)
+            if current is None or current["status"] not in allowed_from:
+                return None
+            current.update(updates)
+            return RunRecord(**current)
+
+        def get(self, run_id):
+            row = self.rows.get(run_id)
+            return RunRecord(**row) if row else None
+
+        def list(self, *, pipeline_name=None, status=None, limit=50):
+            return [RunRecord(**r) for r in list(self.rows.values())[:limit]]
+
+    run_store = _FakeRunStore()
+    monkeypatch.setattr(promotion_module, "RunLifecycle", lambda *a, **k: RealRunLifecycle(store=run_store))
+    monkeypatch.setattr("src.common.mlflow_setup.configure_mlflow", lambda: (_ for _ in ()).throw(ConnectionError("simulated")))
+
+    bundle_store = _FakeChannelModelBundleStore()
+    bundle_store.register_candidate(
+        channel="online_banking", gbm_model_version="2", lr_model_version="2", anomaly_model_version="2",
+        preprocessing_artifact_version="pp-1", feature_schema_version="v1", rule_set_version="v1",
+        graph_policy_version="v1", ensemble_policy_version="v1", reason_code_version="v1",
+        training_run_id=5, dataset_version="cc49865cde175619", evaluation_report_ref="{}",
+    )
+    promotion_store = _FakeBundlePromotionStore(bundle_store)
+
+    with pytest.raises(BundleVerificationFailedError):
+        promote_bundle(
+            channel="online_banking", bundle_version=1, promoted_by="analyst1", database="aidp_test",
+            model_version_verifier=cli_main._MlflowModelVersionVerifier(), store=promotion_store,
+        )
+
+    assert bundle_store.rows[0].status == "CANDIDATE"  # untouched
+    (run,) = run_store.rows.values()
+    assert run["status"] == "FAILED"
+    assert run["error_type"] == "BundleVerificationFailedError"
+
+
 # ---- fraud-intel model show -------------------------------------------------------------
 
 
