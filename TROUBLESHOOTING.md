@@ -295,6 +295,17 @@ and immutable. To audit which versions are actually live, cross-reference
 and `RETIRED` rows) against MLflow's registered versions, rather than
 assuming version count == live count.
 
+**Verified count as of Phase 7B completion**: 27 total registered
+component versions across the seven channels (3 components ×
+7 channels + 6 extra for `ach`/`online_banking`'s superseded/retired
+history) — of which **21** are operationally referenced by the seven
+current `OPERATIONAL` bundles (one `gbm`/`lr-shadow`/`anomaly` version
+each), **3** are referenced by ACH's `RETIRED` bundle 3, and **3** are the
+orphaned `online_banking` v1 components described above. `21` and `27`
+are two different, both-correct counts answering two different
+questions ("what's live right now" vs. "everything ever registered") —
+never conflate them.
+
 ### Generation identity mismatch / ambiguous dataset
 
 **Symptom**: `GenerationRunChannelMismatchError`, `GenerationRunDatasetVersionError`,
