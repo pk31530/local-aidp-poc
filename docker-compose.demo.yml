@@ -1,0 +1,148 @@
+# ============================================================
+# ISOLATED Debit Card demonstration stack.
+#
+# Why a separate file rather than `docker compose -p aidp-demo -f
+# docker-compose.yml`: docker-compose.yml hardcodes container_name for every
+# service (aidp-postgres, aidp-minio, aidp-mlflow, ...) and hardcodes the
+# host ports for MinIO (9000/9001) and MLflow (5001). Container names are
+# global to the Docker daemon, so a second project built from that file
+# collides immediately. Every name, network, volume and host port below is
+# therefore distinct.
+#
+# Scope: Postgres + MinIO + MLflow only. The v1.3 fraud-intelligence
+# lifecycle (generate/train/evaluate/promote/score/labels assess) never
+# touches Kafka, so no Redpanda service is started.
+#
+# Usage:
+#   docker compose -p aidp-demo -f docker-compose.demo.yml \
+#     --env-file .env.demo.example --env-file .env.demo.local up -d
+#
+# All of that is driven by scripts/demo_debit_card_full_lifecycle.sh, which
+# also owns teardown (--cleanup). Never run `docker compose down` in this
+# directory without -p/-f: that would target the SHARED aidp-poc stack.
+# ============================================================
+
+name: aidp-demo
+
+networks:
+  aidp-demo-network:
+    name: aidp-demo-network
+
+volumes:
+  demo_postgres_data:
+  demo_minio_data:
+
+services:
+  # ---------------------------------------------------------------------
+  # ISOLATED PostgreSQL. Holds exactly two non-builtin databases:
+  # aidp_demo (POSTGRES_DB) and mlflow (this stack's MLflow backend store).
+  # It deliberately does NOT create `aidp` or `aidp_test` -- see
+  # infrastructure/demo/postgres-init.sql.
+  # ---------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: aidp-demo-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT}:5432"   # fix H1: bind localhost only
+    volumes:
+      - demo_postgres_data:/var/lib/postgresql/data
+      - ./infrastructure/demo/postgres-init.sql:/docker-entrypoint-initdb.d/00_demo_init.sql:ro
+      # Shared, UNMODIFIED schema, mounted as a subdirectory so the Postgres
+      # entrypoint ignores it for direct execution and only the \i in
+      # 00_demo_init.sql applies it.
+      - ./infrastructure/postgres/lib:/docker-entrypoint-initdb.d/lib:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - aidp-demo-network
+
+  # ---------------------------------------------------------------------
+  # ISOLATED MinIO. A separate server on a separate volume -- the shared
+  # stack's minio_data volume and its mlflow-artifacts bucket are never
+  # opened, read or written by this stack.
+  # ---------------------------------------------------------------------
+  minio:
+    image: quay.io/minio/minio:RELEASE.2024-10-13T13-34-11Z
+    container_name: aidp-demo-minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
+    command: server /data --console-address ":9001"
+    ports:
+      - "127.0.0.1:${DEMO_MINIO_API_PORT}:9000"   # fix H1
+      - "127.0.0.1:${DEMO_MINIO_CONSOLE_PORT}:9001"
+    volumes:
+      - demo_minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - aidp-demo-network
+
+  # One-shot, idempotent: only the MLflow artifact bucket is needed -- the
+  # RAW/CLEAN/CURATED/FEATURES data-lake buckets belong to the v1.1 batch
+  # pipeline, which this demo never runs.
+  createbuckets:
+    image: quay.io/minio/mc:RELEASE.2024-10-08T09-37-26Z
+    container_name: aidp-demo-createbuckets
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      MLFLOW_ARTIFACT_BUCKET: ${MLFLOW_ARTIFACT_BUCKET}
+    entrypoint: >
+      sh -c "
+      mc alias set demo http://minio:9000 $$MINIO_ACCESS_KEY $$MINIO_SECRET_KEY &&
+      mc mb --ignore-existing demo/$$MLFLOW_ARTIFACT_BUCKET
+      "
+    networks:
+      - aidp-demo-network
+
+  # ---------------------------------------------------------------------
+  # ISOLATED MLflow tracking server + model registry. Same image build as
+  # the shared stack (infrastructure/mlflow/Dockerfile, unmodified), but a
+  # different backend store (this cluster's `mlflow` database) and a
+  # different artifact store (this stack's MinIO). Registered-model names
+  # are the same strings in a completely separate registry.
+  # ---------------------------------------------------------------------
+  mlflow:
+    build:
+      context: ./infrastructure/mlflow
+    container_name: aidp-demo-mlflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      createbuckets:
+        condition: service_completed_successfully
+    environment:
+      MLFLOW_BACKEND_STORE_URI: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${MLFLOW_BACKEND_DB}
+      MLFLOW_DEFAULT_ARTIFACT_ROOT: s3://${MLFLOW_ARTIFACT_BUCKET}/
+      AWS_ACCESS_KEY_ID: ${MINIO_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_SECRET_KEY}
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      MLFLOW_S3_IGNORE_TLS: "true"
+    ports:
+      - "127.0.0.1:${DEMO_MLFLOW_PORT}:5000"   # fix C4 + fix H1
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:5000/health')\" || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+      start_period: 15s
+    networks:
+      - aidp-demo-network
