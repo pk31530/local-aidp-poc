@@ -44,14 +44,37 @@ _GENERATORS = {
     "p2p": generate_p2p_events,
 }
 
-# Bump only when a channel generator's own logic changes such that the
-# IDENTICAL (channel, count, seed, reference_date) inputs would now
-# produce different events -- this is folded into the generation identity
-# hash below specifically so that scenario, not the per-event payload
-# schema_version (src.fraud_intel.events.base.FraudEvent.schema_version,
-# which describes the payload shape, not the generator's own behavior)
-# also invalidates old identities.
+# Bump only when EVERY channel generator's behavior changes at once (e.g.
+# a change to src.fraud_intel.generator._shared). For a change confined to
+# ONE channel, use CHANNEL_GENERATOR_VERSION below instead -- bumping this
+# global would needlessly invalidate every other channel's already-issued
+# generation identities.
+#
+# Folded into the generation identity hash below specifically so that a
+# generator-behavior change, not the per-event payload schema_version
+# (src.fraud_intel.events.base.FraudEvent.schema_version, which describes
+# the payload shape, not the generator's own behavior), also invalidates
+# old identities.
 GENERATION_SPEC_VERSION = "v1"
+
+# Per-channel generator behavior version. Add or bump ONE channel's entry
+# when that channel's own generate_<channel>_events() changes such that the
+# IDENTICAL (count, seed, reference_date) inputs now produce DIFFERENT
+# events. A channel ABSENT from this map hashes exactly as it did before
+# this map existed, so adding an entry for one channel provably cannot
+# change any other channel's genrun-/dsv- identifiers (see
+# _generation_identity below, which only adds the key when a version is
+# actually registered).
+#
+# debit_card v2 -- synthetic-label-leakage correction: card_present_flag,
+# cross_border_flag, card_token and amount_minor_units were each assigned
+# deterministically from is_fraud, making card_not_present_flag an exact
+# copy of the label. See src.fraud_intel.generator.debit_card's module
+# docstring. The pre-fix and post-fix populations are methodologically
+# different data and must never share a generation identity.
+CHANNEL_GENERATOR_VERSION: dict[str, str] = {
+    "debit_card": "v2",
+}
 
 
 class GenerationIdentityConflictError(ValueError):
@@ -73,14 +96,21 @@ def _generation_identity(*, channel: str, count: int, seed: int, reference_date:
     the SAME identifiers as whatever is already stored, rather than
     minting a new, never-actually-persisted "phantom" id while every
     insert is silently skipped by ON CONFLICT DO NOTHING."""
-    canonical = json.dumps(
-        {
-            "channel": channel, "count": count, "seed": seed,
-            "reference_date": reference_date.isoformat(),
-            "generation_spec_version": GENERATION_SPEC_VERSION,
-        },
-        sort_keys=True, separators=(",", ":"),
-    )
+    spec: dict[str, Any] = {
+        "channel": channel, "count": count, "seed": seed,
+        "reference_date": reference_date.isoformat(),
+        "generation_spec_version": GENERATION_SPEC_VERSION,
+    }
+    # Only channels with a REGISTERED generator version contribute this
+    # key at all. That is what keeps the change channel-scoped: for every
+    # other channel the canonical form is byte-identical to what it was
+    # before CHANNEL_GENERATOR_VERSION existed, so their already-issued
+    # genrun-/dsv- identifiers are unchanged.
+    channel_generator_version = CHANNEL_GENERATOR_VERSION.get(channel)
+    if channel_generator_version is not None:
+        spec["channel_generator_version"] = channel_generator_version
+
+    canonical = json.dumps(spec, sort_keys=True, separators=(",", ":"))
     spec_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
     return f"genrun-{spec_hash}", f"dsv-{spec_hash}"
 
@@ -172,6 +202,12 @@ def generate_and_write(*, channel: str, count: int, seed: int, database: str, re
 
     return {
         "channel": channel,
+        # Provenance: which generator BEHAVIOR produced these rows. Absent
+        # from CHANNEL_GENERATOR_VERSION means the channel is still on the
+        # original, unversioned generator -- reported explicitly rather
+        # than silently omitted.
+        "channel_generator_version": CHANNEL_GENERATOR_VERSION.get(channel, "v1"),
+        "generation_spec_version": GENERATION_SPEC_VERSION,
         "requested_count": count,
         "inserted_event_count": len(results) - existing_event_count,
         "existing_event_count": existing_event_count,
