@@ -15,3 +15,9 @@ data/models/**
 mlruns/
 *.log
 .ipynb_checkpoints/
+
+# Isolated Debit Card demo stack (scripts/demo_debit_card_full_lifecycle.sh).
+# .env.demo.local holds LOCALLY GENERATED, demo-only credentials and must
+# never be committed. .demo/ holds run state, logs and reports.
+.env.demo.local
+.demo/
